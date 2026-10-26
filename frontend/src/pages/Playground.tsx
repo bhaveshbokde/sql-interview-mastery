@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { ApiError, api } from '../api/client'
 import { useApi, useMutation } from '../api/useApi'
-import { SqlEditor, toCompletionSchema } from '../components/SqlEditor'
+import { SqlEditor } from '../components/SqlEditor'
+import { toCompletionSchema } from '../components/format'
 import { ResultTable } from '../components/ResultTable'
 import { ErrorBox, Loading, QueryErrorBox } from '../components/common'
 import type { QueryResult, TableInfo } from '../api/types'
@@ -85,9 +86,14 @@ export function Playground() {
             value={schema}
             onChange={(e) => setSchema(e.target.value)}
             aria-label="Dataset"
+            title="learning_alt holds the ties, NULLs and empty tables that break naive answers"
           >
             <option value="learning">learning</option>
-            <option value="learning_alt">learning_alt (ties, NULLs, empty tables)</option>
+            {/* The label is short on purpose: a select is sized by its
+                longest option, and the full explanation made the control
+                wider than a phone screen. The explanation lives in the
+                hint below instead, where it can wrap. */}
+            <option value="learning_alt">learning_alt</option>
           </select>
         </div>
       </div>

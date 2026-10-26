@@ -2,7 +2,8 @@ import { useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api } from '../api/client'
 import { useApi, useMutation } from '../api/useApi'
-import { SqlEditor, toCompletionSchema } from '../components/SqlEditor'
+import { SqlEditor } from '../components/SqlEditor'
+import { toCompletionSchema } from '../components/format'
 import { ResultTable } from '../components/ResultTable'
 import { RunnableSql } from '../components/RunnableSql'
 import {
@@ -13,8 +14,8 @@ import {
   Markdown,
   QueryErrorBox,
   Section,
-  formatDate,
 } from '../components/common'
+import { formatDate } from '../components/format'
 import type { Evaluation, Hint, Solution } from '../api/types'
 
 export function ProblemPage() {

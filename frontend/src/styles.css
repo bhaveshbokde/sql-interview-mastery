@@ -155,10 +155,51 @@ h4 { font-size: 0.95rem; margin: 1rem 0 0.35rem; }
 .main.wide { padding: 1.25rem 1.5rem 2rem; }
 .container { max-width: 56rem; }
 
+/*
+ * Below 860px the two columns stack, which puts the whole sidebar above the
+ * page. Left as a vertical list that is over five hundred pixels of
+ * navigation before any content — on a phone every page opened on the menu
+ * and the content was below the fold. So on narrow screens the sidebar
+ * becomes a compact strip of nav pills: the same links, the same DOM, about
+ * a hundred pixels instead of five hundred.
+ *
+ * Not sticky. The sidebar is its own grid row here, so it scrolls away with
+ * the top of the document; `position: sticky` would have nothing to stick
+ * within and would only cost a stacking context.
+ */
 @media (max-width: 860px) {
   .app { grid-template-columns: 1fr; }
-  .sidebar { position: static; height: auto; }
   .main { padding: 1.25rem 1rem 3rem; }
+
+  .sidebar {
+    position: static;
+    height: auto;
+    overflow: visible;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem 0.9rem;
+    padding: 0.65rem 0.9rem;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .brand { width: 100%; padding: 0; font-size: 0.88rem; }
+  .brand small { display: none; }
+
+  /* The group headings only make sense above a vertical list. */
+  .nav-group-label { display: none; }
+
+  .nav { flex-direction: row; flex-wrap: wrap; gap: 0.3rem; }
+  .nav a {
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8rem;
+    border: 1px solid var(--border);
+    background: var(--bg-raised);
+  }
+  .nav a.active { border-color: transparent; }
+
+  .sidebar-note { display: none; }
 }
 
 /* ------------------------------------------------------------ cards ---- */
@@ -258,6 +299,10 @@ input[type='text'], input[type='search'], select, textarea {
   border-radius: var(--radius-s);
   background: var(--bg-raised);
   color: var(--text);
+  /* A select is sized by its longest option, which on a narrow screen is
+     wider than the screen. min-width:0 lets it shrink inside a flex row. */
+  max-width: 100%;
+  min-width: 0;
 }
 
 /* ------------------------------------------------------------ tables --- */
@@ -441,7 +486,17 @@ details.disclosure[open] > summary { margin-bottom: 0.5rem; }
 .nowrap { white-space: nowrap; }
 .stack { display: flex; flex-direction: column; gap: 0.85rem; }
 .row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
-.spread { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+/* Wraps rather than overflowing. A header with a heading on one side and a
+   control on the other is the common shape here, and on a phone the two do
+   not fit on one line — without wrap the control pushes past the viewport
+   and the whole page scrolls sideways. */
+.spread {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  flex-wrap: wrap;
+}
 
 .progress-track {
   height: 6px;
@@ -500,9 +555,26 @@ details.disclosure[open] > summary { margin-bottom: 0.5rem; }
   gap: 1rem;
   align-items: start;
 }
-@media (max-width: 1000px) { .playground { grid-template-columns: 1fr; } }
-
 .schema-browser { font-size: 0.8rem; max-height: 72vh; overflow-y: auto; }
+
+@media (max-width: 1000px) {
+  .playground { grid-template-columns: 1fr; }
+
+  /*
+   * Once the two columns stack, the schema browser sits above the editor.
+   * At its desktop height that is twelve hundred pixels of table list before
+   * the thing you came to the page to use — on a phone the editor was below
+   * the fold and effectively unreachable. Capping it keeps the reference
+   * panel available (it still scrolls, and the Reset button is still in it)
+   * while putting the editor back on the first screen.
+   *
+   * Capping rather than reordering is deliberate: `order` would move the
+   * editor above the aside visually but leave it second in the tab order,
+   * so a keyboard user would still traverse every table first.
+   */
+  .schema-browser { max-height: 11rem; }
+}
+
 .schema-table > summary { font-family: var(--mono); font-size: 0.78rem; padding: 0.15rem 0; }
 .schema-cols { list-style: none; padding: 0 0 0 0.75rem; margin: 0.2rem 0; }
 .schema-cols li { font-family: var(--mono); font-size: 0.72rem; color: var(--text-muted); padding: 0.05rem 0; }

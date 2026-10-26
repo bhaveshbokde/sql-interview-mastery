@@ -15,7 +15,7 @@ if (!window.matchMedia) {
     addEventListener: () => undefined,
     removeEventListener: () => undefined,
     dispatchEvent: () => false,
-  })) as typeof window.matchMedia
+  }))
 }
 
 // Also absent in jsdom and used by CodeMirror's measurement code.
@@ -24,7 +24,7 @@ if (!globalThis.ResizeObserver) {
     observe() {}
     unobserve() {}
     disconnect() {}
-  } as unknown as typeof ResizeObserver
+  }
 }
 
 if (!Range.prototype.getBoundingClientRect) {

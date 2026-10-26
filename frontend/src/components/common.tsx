@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm'
 import type { ReactNode } from 'react'
 import type { QueryError } from '../api/types'
 import { ApiError } from '../api/client'
+import { isProblemId } from './format'
 
 /** Lesson prose is authored in Markdown, with GFM tables. */
 export function Markdown({ children }: { children: string }) {
@@ -174,23 +175,6 @@ export function Section({
 
 /** A link to a lesson or problem by id, used by the `related` lists. */
 export function ContentLink({ id, label }: { id: string; label?: string }) {
-  // Problem ids start with a p-number prefix; lesson ids do not. Deriving the
-  // route from the id avoids a lookup for what is only a link.
-  const isProblem = /^p\d{2}-/.test(id)
-  const to = isProblem ? `/problems/${id}` : `/lessons/${id}`
+  const to = isProblemId(id) ? `/problems/${id}` : `/lessons/${id}`
   return <Link to={to}>{label ?? id}</Link>
-}
-
-export function formatDate(iso: string | null): string {
-  if (!iso) return '—'
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return iso
-  return date.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })
-}
-
-export function formatMinutes(minutes: number): string {
-  if (minutes < 60) return `${minutes} min`
-  const hours = Math.floor(minutes / 60)
-  const rest = minutes % 60
-  return rest === 0 ? `${hours} h` : `${hours} h ${rest} min`
 }

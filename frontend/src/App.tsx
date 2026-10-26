@@ -47,7 +47,9 @@ export function App() {
           </div>
         </div>
 
-        <div style={{ marginTop: 'auto' }} className="tiny faint">
+        {/* Desktop only — see .sidebar-note. On a phone the sidebar becomes a
+            nav strip and this sentence would push the page content down. */}
+        <div style={{ marginTop: 'auto' }} className="tiny faint sidebar-note">
           <p style={{ margin: '0 0.6rem' }}>
             Read-only playground. Every example&apos;s output was recorded by running it.
           </p>

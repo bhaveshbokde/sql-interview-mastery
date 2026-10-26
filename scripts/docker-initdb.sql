@@ -4,11 +4,16 @@
 -- creates for a user-space cluster, so the two startup paths produce the same
 -- database and the application cannot tell them apart.
 --
--- The passwords here come from the Compose environment and default to fixed
--- development values. That is acceptable for a container bound to localhost
--- and is the reason the file says so out loud: these are not secrets, they
--- are placeholders, and a deployment that reached further than a laptop would
--- have to replace them.
+-- The passwords are psql variables, supplied by scripts/docker-initdb.sh from
+-- the Compose environment. They are NOT literals here, and that is the point:
+-- when they were literals they silently disagreed with the values the backend
+-- was configured with. psql's :'name' form quotes and escapes the value, so a
+-- password containing a quote is handled correctly rather than ending the
+-- statement.
+--
+-- This file is mounted OUTSIDE /docker-entrypoint-initdb.d. The entrypoint
+-- runs any .sql it finds there through psql with no variables, which would
+-- fail here -- and should, rather than creating roles with broken passwords.
 --
 -- Note what is NOT here: the grants on the learning schemas. Those belong to
 -- the Flyway migration, because they have to be reapplied whenever a
@@ -17,11 +22,11 @@
 -- ---------------------------------------------------------------- roles --
 create role sqlmastery_app
     with login nosuperuser nocreatedb nocreaterole noreplication inherit
-    password 'compose-app-password';
+    password :'app_password';
 
 create role sqlmastery_learner
     with login nosuperuser nocreatedb nocreaterole noreplication inherit
-    password 'compose-learner-password';
+    password :'learner_password';
 
 -- The learner's safety rails live on the role, not on the application, so
 -- they apply to every connection that role ever makes — including one opened

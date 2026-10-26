@@ -118,10 +118,23 @@ const overview: ProgressOverview = {
   })),
 }
 
+/**
+ * The URL a fetch argument refers to.
+ *
+ * `String(input)` is wrong for a `Request`, which stringifies to
+ * `[object Object]` — the stub would then match no route and every test
+ * would silently receive the fallback body.
+ */
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.href
+  return input.url
+}
+
 /** Routes a stubbed fetch by path, so each test declares only what it needs. */
 function stubFetch(routes: Record<string, unknown>) {
   return vi.fn((input: RequestInfo | URL) => {
-    const url = String(input)
+    const url = requestUrl(input)
     for (const [prefix, body] of Object.entries(routes)) {
       if (url.startsWith(prefix)) {
         return Promise.resolve(
@@ -262,7 +275,7 @@ describe('ProblemPage', () => {
 
   it('reveals hints one at a time', async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
-      const url = String(input)
+      const url = requestUrl(input)
       const body = url.includes('/hints/count')
         ? { total: 3 }
         : url.includes('/hints/1')

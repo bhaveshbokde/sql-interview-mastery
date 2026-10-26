@@ -28,11 +28,18 @@ services:
     container_name: sqlmastery-db
     environment:
       POSTGRES_USER: sqlmastery_admin
-      # Used only to bootstrap the container. The application and learner
-      # roles are created by scripts/provision-db.sh with generated
-      # passwords, and neither of them is this one.
-      POSTGRES_PASSWORD: ${SQLMASTERY_BOOTSTRAP_PASSWORD:-bootstrap-only-change-me}
+      # The superuser of this container. Required, with no default: a
+      # default would mean the stack comes up with a password that is
+      # published in this repository, and "it only listens on localhost" is
+      # a property of the current compose file, not a property anyone
+      # re-reads before changing a ports: line.
+      POSTGRES_PASSWORD: ${SQLMASTERY_BOOTSTRAP_PASSWORD:?copy .env.example to .env and set it}
       POSTGRES_DB: sqlmastery_db
+      # Read by the init script to create the two application roles. The
+      # backend is configured with the same two values below; they have to
+      # agree, which is why both read the same variables.
+      SQLMASTERY_APP_PASSWORD: ${SQLMASTERY_APP_PASSWORD:?copy .env.example to .env and set it}
+      SQLMASTERY_LEARNER_PASSWORD: ${SQLMASTERY_LEARNER_PASSWORD:?copy .env.example to .env and set it}
       # Deterministic collation, so ORDER BY on text sorts the same here as
       # it does for everyone else. Without this the container inherits the
       # host locale and two developers get different lesson output.
@@ -45,7 +52,11 @@ services:
       # Creates the roles and the test database on first start, so the
       # container is usable without running the provisioning script. It is
       # idempotent and is ignored on subsequent starts.
-      - ./scripts/docker-initdb.sql:/docker-entrypoint-initdb.d/10-roles.sql:ro
+      - ./scripts/docker-initdb.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
+      # Deliberately not under docker-entrypoint-initdb.d: the entrypoint
+      # would run it through psql with no variables and create the roles
+      # with unusable passwords. 10-roles.sh runs it with the real values.
+      - ./scripts/docker-initdb.sql:/opt/sqlmastery/initdb.sql:ro
     healthcheck:
       # The app waits for this rather than for the port, because PostgreSQL
       # opens the port before it is ready to accept queries and a backend
@@ -71,9 +82,9 @@ services:
       SQLMASTERY_DB_NAME: sqlmastery_db
       SQLMASTERY_TEST_DB_NAME: sqlmastery_test_db
       SQLMASTERY_APP_USERNAME: sqlmastery_app
-      SQLMASTERY_APP_PASSWORD: ${SQLMASTERY_APP_PASSWORD:-compose-app-password}
+      SQLMASTERY_APP_PASSWORD: ${SQLMASTERY_APP_PASSWORD:?copy .env.example to .env and set it}
       SQLMASTERY_LEARNER_USERNAME: sqlmastery_learner
-      SQLMASTERY_LEARNER_PASSWORD: ${SQLMASTERY_LEARNER_PASSWORD:-compose-learner-password}
+      SQLMASTERY_LEARNER_PASSWORD: ${SQLMASTERY_LEARNER_PASSWORD:?copy .env.example to .env and set it}
       SQLMASTERY_SERVER_PORT: '8085'
       # The frontend container serves on 5173 and the browser talks to it
       # from the host, so the origin the backend sees is the host's.

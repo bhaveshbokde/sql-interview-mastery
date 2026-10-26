@@ -169,8 +169,27 @@ the detail goes to the log.
 `server.error.include-message: never` and `include-stacktrace: never` close the
 same hole for errors Spring handles before the advice does.
 
+The catch-all used to be too broad. It caught Spring's own exceptions as well
+as the application's, so an unknown URL and a truncated JSON body both came
+back as `500 INTERNAL_ERROR` and both were written to the log with a stack
+trace. Nothing had gone wrong on the server in either case. A caller could not
+tell a mistyped path from an outage, and an error log full of other people's
+typos is an error log nobody reads. Those now answer 404, 400, 405 and 415,
+and `ErrorResponseTest` holds the line — including that the 400 does not echo
+the malformed body back, which is the obvious way to reintroduce a leak while
+fixing a status code.
+
 Learner SQL is logged at DEBUG only. It is not secret, but logging every
 keystroke-triggered query at INFO makes the log useless for anything else.
+
+In the Docker deployment nginx adds `Content-Security-Policy`,
+`X-Content-Type-Options` and `Referrer-Policy`. They are declared at server
+level and then **repeated** in the two `location` blocks that set a cache
+header, because nginx's `add_header` does not merge with the enclosing scope,
+it replaces it. Setting one `Cache-Control` on `/index.html` had been quietly
+dropping the entire security set from the one response the policy exists to
+protect. That is an easy thing to reintroduce: any new `location` that calls
+`add_header` has to repeat all three.
 
 ## Secrets
 
@@ -180,9 +199,23 @@ as a command-line argument, so they do not appear in `ps` output or in shell
 history. `.env` is gitignored; `.env.example` holds placeholders and is
 committed.
 
-The Docker Compose defaults are fixed development passwords and the file says
-so. They are not secrets; they are placeholders for a container bound to
-localhost.
+Docker Compose has no password defaults. It used to: the roles were created
+with literals baked into `scripts/docker-initdb.sql` and the same strings
+appeared as `:-` fallbacks in `docker-compose.yml`. The argument for that was
+"they are placeholders for a container bound to localhost", and it was wrong
+twice. The two copies could disagree — setting `SQLMASTERY_APP_PASSWORD`
+changed what the backend connected with but not what the role was created
+with, producing an authentication failure that pointed nowhere near its
+cause. And "it only listens on localhost" is a property of the current
+`ports:` line, not of anything that stays true.
+
+So the three passwords are required with no fallback. Compose refuses to
+interpolate and prints *copy .env.example to .env and set it*. The init
+script receives them as psql variables (`:'app_password'`), which quote and
+escape the value rather than splicing it into the statement text, and it
+refuses to run if the app and learner passwords are the same — the learner
+role is the containment boundary, and sharing its password with the owning
+role removes the boundary.
 
 ## If this were exposed beyond a laptop
 

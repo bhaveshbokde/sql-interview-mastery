@@ -4,3 +4,14 @@ dist
 coverage
 *.log
 .DS_Store
+
+# Browser-test artefacts. Large, regenerated every run, and copying them into
+# the build context slows the image build for no benefit.
+test-results
+playwright-report
+
+# Never let a local environment file into an image layer. There is no
+# frontend/.env today; this is here so that creating one is not also a leak.
+.env
+.env.*
+!.env.example

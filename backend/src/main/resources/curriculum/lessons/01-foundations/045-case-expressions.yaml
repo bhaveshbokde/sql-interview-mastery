@@ -1,0 +1,499 @@
+id: f-case
+moduleId: foundations
+position: 45
+title: CASE expressions
+slug: case-expressions
+difficulty: Beginner
+estimatedMinutes: 20
+summary: >-
+  SQL's conditional. An expression rather than a statement, which is why it can
+  appear anywhere a value can — and why the thing it returns has one type, one
+  NULL rule and one evaluation order that are all worth knowing exactly.
+tags: [case, conditional, coalesce, nullif, expressions]
+
+prerequisites:
+  - f-nulls
+
+objectives:
+  - Write both the simple and the searched form, and say when each applies
+  - Explain why the omitted ELSE returns NULL rather than nothing
+  - Use CASE in ORDER BY and GROUP BY, not only in the select list
+  - Say what determines the result type and when that becomes an error
+  - Recognise when COALESCE, NULLIF or GREATEST says it more clearly
+
+concept: |
+  ## It is an expression, not a statement
+
+  CASE is not an `if`. It does not control which statements run; it **produces
+  a value**. That single fact explains everything else about it: an expression
+  can appear anywhere a value can, so CASE is legal in the select list, in
+  `WHERE`, in `ORDER BY`, in `GROUP BY`, inside an aggregate, inside another
+  CASE, and in a `CHECK` constraint.
+
+  ## Two forms
+
+  **Searched** — each branch is its own boolean condition:
+
+  ```sql
+  case
+      when salary >= 200000 then 'executive'
+      when salary >= 120000 then 'senior'
+      else 'standard'
+  end
+  ```
+
+  **Simple** — one expression compared for equality against each branch:
+
+  ```sql
+  case status
+      when 'completed' then 'done'
+      when 'cancelled' then 'void'
+      else 'in flight'
+  end
+  ```
+
+  The simple form is shorthand for a searched form with `=` in every branch,
+  and that is its whole limitation: it can only test equality. It also cannot
+  match NULL, because `status = NULL` is NULL rather than true — so a simple
+  CASE never takes a branch for a NULL input and falls through to `ELSE`.
+
+  ## Branches are evaluated in order, and the first match wins
+
+  ```sql
+  case
+      when salary >= 120000 then 'senior'
+      when salary >= 200000 then 'executive'   -- unreachable
+      else 'standard'
+  end
+  ```
+
+  Nobody is ever `executive` here, because anyone over 200000 is also over
+  120000 and the first branch already matched. The query runs, the output is
+  plausible, and a whole category disappears. **Order your branches from most
+  specific to least**, and treat an overlapping set of conditions as something
+  to check rather than assume.
+
+  ## The omitted ELSE is NULL, not nothing
+
+  ```sql
+  case when status = 'completed' then 1 end
+  ```
+
+  A row that does not match returns **NULL**. There is no "no value" — an
+  expression always produces something.
+
+  That implicit NULL is load-bearing in one place and a trap in another:
+
+  - `count(case when c then 1 end)` is **correct**, because `count` skips the
+    NULLs produced by the non-matching rows.
+  - `count(case when c then 1 else 0 end)` is **wrong** — it counts every row,
+    because 0 is not NULL.
+
+  With `sum` the relationship inverts: `sum(case when c then 1 else 0 end)` is
+  the correct form. Getting this backwards is a classic interview stumble, and
+  the conditional-aggregation lesson shows how `FILTER` removes the question
+  entirely.
+
+  ## One result type
+
+  Every branch's result must resolve to a single type. PostgreSQL finds the
+  common type where it can — mixing `integer` and `numeric` gives `numeric` —
+  and raises an error where it cannot:
+
+  ```sql
+  case when true then 1 else 'unknown' end   -- ERROR: invalid input syntax
+  ```
+
+  The fix is to decide what the column is and cast, usually to `text`. Note
+  that the error depends on the *types*, not on which branch is taken, so a
+  CASE whose text branch is never reached still fails to run.
+
+  ## When not to use it
+
+  Three common CASE expressions have shorter, clearer spellings:
+
+  | CASE | Say instead |
+  |------|-------------|
+  | `case when x is null then y else x end` | `coalesce(x, y)` |
+  | `case when x = y then null else x end` | `nullif(x, y)` |
+  | `case when a > b then a else b end` | `greatest(a, b)` |
+
+  Each is one function call, and each states the intent rather than the
+  mechanism. `coalesce` in particular short-circuits and takes any number of
+  arguments, which a chain of nested CASEs does not do readably.
+
+syntax:
+  - form: "CASE WHEN condition THEN result [WHEN ...] [ELSE result] END"
+    notes: >-
+      The searched form. Each WHEN is an independent boolean. The first true
+      branch wins; the rest are not evaluated.
+  - form: "CASE expr WHEN value THEN result [WHEN ...] [ELSE result] END"
+    notes: >-
+      The simple form. Equality only, and it never matches a NULL input
+      because `expr = NULL` is NULL rather than true.
+  - form: "CASE ... END  -- with no ELSE"
+    notes: >-
+      Non-matching rows return NULL. That is what makes `count(case when c
+      then 1 end)` work and `count(... else 0 end)` wrong.
+  - form: "ORDER BY CASE WHEN ... THEN 0 ELSE 1 END, other_column"
+    notes: >-
+      A custom sort order. Returning a small integer per group is clearer than
+      returning text, which would sort alphabetically.
+  - form: "GROUP BY CASE WHEN ... END"
+    notes: >-
+      Buckets rows into categories. The same expression has to appear in the
+      select list, or be referred to by its alias — which PostgreSQL permits
+      in GROUP BY as an extension.
+  - form: "COALESCE(a, b) | NULLIF(a, b) | GREATEST(a, b)"
+    notes: The three CASE expressions that already have names.
+
+sampleTables: [employees, orders, customers, products]
+
+examples:
+  - title: Both forms, side by side
+    sql: |
+      select emp_id,
+             first_name || ' ' || last_name as employee,
+             salary,
+             case
+                 when salary >= 200000 then 'executive'
+                 when salary >= 150000 then 'senior'
+                 when salary >= 100000 then 'mid'
+                 else 'junior'
+             end                            as band,
+             case when is_active then 'active' else 'left' end as status_searched,
+             case is_active when true then 'active' else 'left' end as status_simple
+      from employees
+      where dept_id = 10
+      order by salary desc, emp_id
+    walkthrough: |
+      The salary bands run from most specific to least. Reverse the first two
+      branches and the `executive` band becomes unreachable, because everyone
+      over 200000 also clears 150000 — the query would still run and the band
+      would simply never appear.
+
+      The last two columns are the same test written both ways. The simple
+      form reads better for equality against a single expression; the searched
+      form is the one that generalises, and it is what the simple form
+      compiles to.
+
+      Note there is no `ELSE` on the band for a salary below 100000 other than
+      `junior` — the final `else` is the catch-all, and without it an
+      unmatched row would be NULL rather than absent.
+
+  - title: The implicit NULL, and the count trap
+    sql: |
+      select count(*)                                                as all_orders,
+             count(case when status = 'cancelled' then 1 end)        as cancelled_correct,
+             count(case when status = 'cancelled' then 1 else 0 end) as cancelled_wrong,
+             sum(case when status = 'cancelled' then 1 else 0 end)   as cancelled_sum,
+             count(*) filter (where status = 'cancelled')            as cancelled_filter
+      from orders
+    walkthrough: |
+      Three of these columns agree and one does not. `cancelled_wrong` equals
+      `all_orders`, because `count` skips only NULL and the `ELSE 0` supplies
+      a non-NULL value for every row.
+
+      `cancelled_correct` omits the ELSE, so non-matching rows produce NULL
+      and are skipped. `cancelled_sum` adds 1 per match — the correct form
+      for `sum`, where ELSE 0 belongs.
+
+      `cancelled_filter` is the standard-SQL way to say the same thing with no
+      version that quietly means something else. Where `FILTER` is available,
+      prefer it; where it is not — MySQL, SQL Server — the CASE forms are what
+      you fall back to, which is why the distinction is worth holding.
+
+  - title: CASE in ORDER BY, for an order the data does not have
+    sql: |
+      select order_id,
+             status,
+             order_date,
+             case status
+                 when 'processing' then 1
+                 when 'shipped'    then 2
+                 when 'completed'  then 3
+                 when 'cancelled'  then 4
+                 else 99
+             end as sort_rank
+      from orders
+      where order_date >= date '2024-06-01'
+      order by case status
+                   when 'processing' then 1
+                   when 'shipped'    then 2
+                   when 'completed'  then 3
+                   when 'cancelled'  then 4
+                   else 99
+               end,
+               order_date desc,
+               order_id
+    walkthrough: |
+      Status is text, so a plain `ORDER BY status` sorts alphabetically —
+      cancelled, completed, processing, shipped — which is not a workflow
+      order. The CASE maps each status to a position.
+
+      Returning small integers rather than text matters: text would sort
+      alphabetically again and defeat the point.
+
+      The expression is repeated in the select list purely so the ranking is
+      visible here. In real code you would either sort by the alias —
+      PostgreSQL allows a select-list alias in `ORDER BY` — or, if this
+      ordering is used in more than one query, store it as a column on a
+      lookup table and join to it. A sort order duplicated across five
+      queries is four opportunities to disagree.
+
+      The `else 99` is the catch-all for a status nobody has thought of yet.
+      Without it a new status would sort as NULL, which PostgreSQL places
+      last in ascending order — the same place, by luck rather than intent.
+
+  - title: Bucketing with CASE in GROUP BY
+    sql: |
+      select case
+                 when signup_date < date '2023-01-01' then 'before 2023'
+                 when signup_date < date '2024-01-01' then '2023'
+                 else '2024 or later'
+             end                                  as cohort,
+             count(*)                             as customers,
+             count(distinct country)              as countries,
+             min(signup_date)                     as earliest,
+             max(signup_date)                     as latest
+      from customers
+      group by 1
+      order by min(signup_date)
+    walkthrough: |
+      The CASE produces the grouping key, so the groups are ranges rather than
+      distinct values — which is how you aggregate over a continuous column
+      without a lookup table of bands.
+
+      `group by 1` refers to the first select-list item. It is terse and it is
+      fragile in code, because adding a column at the front silently changes
+      the grouping; repeating the whole expression is the safer spelling, and
+      PostgreSQL also accepts the alias `cohort`.
+
+      `order by min(signup_date)` rather than `order by cohort` is the
+      interesting part. The cohort labels are text, so sorting by them would
+      put '2024 or later' before 'before 2023'. Ordering by an aggregate of
+      the underlying date puts the buckets in chronological order, which is
+      the order a reader expects.
+
+edgeCases:
+  - title: A simple CASE never matches NULL
+    body: >-
+      The simple form compares with `=`, and `NULL = NULL` is NULL rather than
+      true, so a NULL input falls through every WHEN to the ELSE. The searched
+      form can test for it, but only with `IS NULL` — a `WHEN x = NULL` branch
+      in a searched CASE is just as unreachable. This is the three-valued
+      logic rule arriving in a place people do not expect it.
+    sql: |
+      select case null when null then 'matched' else 'fell through' end as simple_form,
+             case when null is null then 'matched' else 'fell through' end as searched_is_null,
+             case when null = null then 'matched' else 'fell through' end as searched_equals,
+             case when null then 'true branch' else 'else branch' end as null_condition
+
+  - title: Branches are not all evaluated
+    body: >-
+      CASE short-circuits: once a branch matches, the later THEN expressions
+      are not evaluated. That is what makes it safe to guard a division — the
+      divide-by-zero in the second branch never happens for a row where the
+      first matched. It is also why a CASE cannot be relied on to raise an
+      error for validation, since the branch containing the error may simply
+      not run.
+    sql: |
+      select n,
+             case when n = 0 then 0 else 100 / n end as guarded,
+             case when n <> 0 then 100 / n else 0 end as guarded_other_way
+      from (values (0), (1), (4), (10)) as t(n)
+      order by n
+
+pitfalls:
+  - mistake: Ordering the branches from least specific to most
+    why: >-
+      The first match wins, so a broad condition placed first swallows every
+      narrower one below it. The query runs and a whole category silently
+      never appears in the output.
+    fix: >-
+      Order from most specific to least. Where the conditions genuinely
+      overlap, check the result with a count per branch before trusting it.
+
+  - mistake: "count(case when c then 1 else 0 end)"
+    why: >-
+      `count` ignores only NULL, and `ELSE 0` supplies a non-NULL value for
+      every row — so the answer is the total row count. With `sum` the same
+      `ELSE 0` is correct, which is exactly why the two get confused.
+    fix: >-
+      Drop the ELSE for `count`, keep it for `sum`, or use `count(*) FILTER
+      (WHERE c)`, which has no variant that means something else.
+
+  - mistake: Mixing result types across branches
+    why: >-
+      Every branch has to resolve to one type. A CASE returning a number in
+      one branch and text in another fails at planning time — before any row
+      is read — so it fails even when the text branch would never be taken.
+    fix: >-
+      Decide what the column is and cast every branch to it, usually `::text`
+      for a label or `::numeric` for a figure.
+
+  - mistake: Writing CASE where a function already exists
+    why: >-
+      `case when x is null then y else x end` is four times the length of
+      `coalesce(x, y)` and states the mechanism rather than the intent. It
+      also does not extend to three fallbacks without nesting.
+    fix: >-
+      `coalesce` for a default, `nullif` to guard a division, `greatest` and
+      `least` for a bound. Reach for CASE when none of them fits.
+
+performance: |
+  A CASE in the select list is evaluated once per **returned** row, which is
+  usually negligible. A CASE in `WHERE` is evaluated against every row the
+  filter examines and, more importantly, is **not sargable** — the index holds
+  the column's values and the predicate asks about a derived one, so an index
+  on that column cannot be used.
+
+  ```sql
+  where case when active then salary else 0 end > 100000   -- no index
+  where active and salary > 100000                         -- index usable
+  ```
+
+  Rewriting a CASE in `WHERE` as ordinary boolean logic is almost always
+  possible and almost always worth it.
+
+  A CASE in `GROUP BY` is also non-sargable, but that matters less: grouping
+  reads the rows anyway. What it does prevent is an index supplying the group
+  order, so the planner sorts or hashes instead — an expression index on
+  exactly that CASE restores the option, at the cost of maintaining it.
+
+  Short-circuiting means an expensive expression in a late branch costs
+  nothing for rows that matched earlier. Putting the cheap, common case first
+  is therefore a real if small optimisation, and it usually coincides with the
+  clearest ordering anyway.
+
+interviewQuestions:
+  - question: What is the difference between the simple and the searched CASE?
+    answer: >-
+      The simple form compares one expression for equality against each WHEN
+      value; the searched form evaluates an independent boolean condition per
+      branch. The simple form is shorthand for a searched form using `=`
+      everywhere, so it can only test equality — no ranges, no IS NULL, no
+      compound conditions. It also never matches a NULL input, because
+      `expr = NULL` evaluates to NULL rather than true, so a NULL falls
+      through to the ELSE.
+
+  - question: What does a CASE return when nothing matches and there is no ELSE?
+    answer: >-
+      NULL. An expression always produces a value, and NULL is the value for
+      "no branch applied". That implicit NULL is what makes `count(case when c
+      then 1 end)` count only the matching rows, since count skips NULLs — and
+      it is why adding `ELSE 0` to that same expression breaks it, because
+      zero is not NULL and every row is then counted.
+
+  - question: Can CASE appear outside the select list?
+    answer: >-
+      Yes, anywhere a value can: WHERE, ORDER BY, GROUP BY, HAVING, inside an
+      aggregate, inside another CASE, in a CHECK constraint, in an index
+      definition. ORDER BY is the most useful of those — mapping statuses to
+      small integers gives a workflow order that alphabetical sorting cannot.
+      The one place to be careful is WHERE, where wrapping a column in a CASE
+      makes the predicate non-sargable and the index unusable.
+
+  - question: When would you use COALESCE instead of CASE?
+    answer: >-
+      Whenever the condition is "is this null". `coalesce(a, b, c)` returns the
+      first non-NULL argument, short-circuits, and extends to any number of
+      fallbacks; the CASE equivalent needs nesting and states the mechanism
+      instead of the intent. The same applies to `nullif(x, 0)` for guarding a
+      division and `greatest`/`least` for a bound. CASE is the general tool —
+      reach for it when the specific one does not fit.
+
+exercises:
+  - prompt: >-
+      Classify every product by stock level — 'out of stock' at 0, 'low' below
+      20, 'ok' otherwise — and count how many fall in each band. Columns
+      stock_band, products. Order the bands from out of stock to ok.
+    difficulty: Easy
+    hint: >-
+      Group by the CASE, and order by something that gives the bands a
+      deliberate sequence rather than an alphabetical one — min(units_in_stock)
+      works.
+    solutionSql: |
+      select case
+                 when units_in_stock = 0  then 'out of stock'
+                 when units_in_stock < 20 then 'low'
+                 else 'ok'
+             end                      as stock_band,
+             count(*)                 as products
+      from products
+      group by 1
+      order by min(units_in_stock)
+
+  - prompt: >-
+      For each order status, return the number of orders and the number that
+      shipped, using CASE rather than FILTER. Columns status, orders, shipped.
+      Order by status.
+    difficulty: Medium
+    hint: >-
+      For a count, omit the ELSE so the non-matching rows become NULL and are
+      skipped.
+    solutionSql: |
+      select status,
+             count(*)                                        as orders,
+             count(case when ship_date is not null then 1 end) as shipped
+      from orders
+      group by status
+      order by status
+
+  - prompt: >-
+      List active employees in department 20 sorted so that account executives
+      come first, then sales development reps, then everyone else, and within
+      each group by descending salary. Columns full_name, job_title, salary.
+    difficulty: Medium
+    hint: >-
+      A CASE returning 1, 2, 3 as the first ORDER BY key. Small integers, not
+      text.
+    solutionSql: |
+      select first_name || ' ' || last_name as full_name,
+             job_title,
+             salary
+      from employees
+      where dept_id = 20
+        and is_active
+      order by case job_title
+                   when 'Account Executive'     then 1
+                   when 'Sales Development Rep' then 2
+                   else 3
+               end,
+               salary desc,
+               emp_id
+
+checklist:
+  - CASE is an expression, so it goes anywhere a value can
+  - "Simple form tests equality only, and never matches NULL"
+  - Branches are evaluated in order and the first match wins — order most specific first
+  - An omitted ELSE returns NULL, not nothing
+  - "count(case ... else 0 end) counts every row; sum needs the ELSE 0 that count must not have"
+  - All branches must resolve to one type, checked before any row is read
+  - CASE short-circuits, which is what makes it safe for guarding division
+  - "Prefer COALESCE, NULLIF, GREATEST and LEAST where they fit"
+
+related:
+  - f-nulls
+  - a-conditional-aggregation
+  - f-logical-order
+  - p15-pivot-sales-by-quarter
+
+dialect:
+  standard: >-
+    Both CASE forms, COALESCE and NULLIF are standard SQL, as is the rule that
+    an omitted ELSE yields NULL and that all branches share one result type.
+    COALESCE and NULLIF are in fact defined by the standard as shorthand for
+    particular CASE expressions.
+  postgres: >-
+    Adds GREATEST and LEAST, which ignore NULL arguments rather than
+    propagating them. Allows a select-list alias in GROUP BY and ORDER BY, so
+    a CASE used for bucketing need not be repeated. Type resolution across
+    branches follows PostgreSQL's usual rules and fails at planning time
+    rather than per row.
+  mysql: >-
+    Has both CASE forms and the IF(condition, a, b) shorthand for the
+    two-branch case, which PostgreSQL does not. MySQL's type resolution is far
+    looser — mixing a number and a string across branches coerces rather than
+    erroring — so a CASE that fails to plan on PostgreSQL may silently return
+    something odd on MySQL.

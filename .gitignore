@@ -19,6 +19,33 @@ INTERVIEW-*.md
 *-INTERVIEW.md
 STUDY-*.md
 
+#  Working notes, task plans and implementation diaries. These accumulate
+#  during a build and read like documentation without being any: a half-true
+#  TODO list committed next to a correct README is worse than no list.
+TODO.md
+PLAN.md
+PLANNING.md
+ROADMAP.md
+HANDOFF.md
+PROGRESS.md
+SESSION-*.md
+WIP-*.md
+notes/
+scratch/
+
+#  AI assistant transcripts, prompts and agent state. Nothing here belongs in
+#  a repository: a prompt log is a private working document, and a transcript
+#  can quote any file it was shown — including the ones above.
+.claude/
+.cursor/
+.aider*
+CLAUDE.md
+PROMPT*.md
+PROMPTS/
+*-transcript.md
+*-conversation.md
+ai-notes/
+
 # =============================================================================
 #  Secrets and local environment
 # =============================================================================
@@ -61,6 +88,15 @@ node_modules/
 dist/
 dist-ssr/
 coverage/
+
+#  Playwright output. Screenshots, traces and videos of failed runs, plus the
+#  last-run marker it writes on every invocation. All regenerated; the traces
+#  are large and a trace of a failing test can contain whatever was on screen.
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+playwright/.cache/
 .vite/
 *.local
 vite.config.ts.timestamp-*

@@ -9,7 +9,10 @@ summary: >-
   NULL is not a value, not zero and not an empty string — it is the absence of
   information, and SQL's logic has three truth values because of it. This is the
   topic that produces the most wrong-but-plausible query results in practice.
-tags: [null, three-valued-logic, coalesce, interview-favourite]
+# "null" is quoted deliberately. Unquoted, YAML parses it as the null value,
+# so the lesson about NULL shipped with a literal null in its tag list — which
+# reached the database as a NULL array element and rendered as an empty chip.
+tags: ['null', three-valued-logic, coalesce, interview-favourite]
 
 prerequisites:
   - f-filtering

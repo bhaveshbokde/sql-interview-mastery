@@ -1,6 +1,7 @@
 # Testing
 
-258 tests: 232 on the backend, 26 on the frontend.
+301 tests: 239 on the backend, 38 component and unit tests on the frontend,
+and 24 browser tests that drive the real thing in a real Chrome.
 
 ## Running them
 
@@ -17,8 +18,17 @@ cd backend && ./mvnw test -Dgroups=integration
 # Full verify: checkstyle, tests, JaCoCo report
 cd backend && ./mvnw verify
 
-# Frontend
+# Frontend — unit and component
 cd frontend && npm test
+
+# Frontend — browser tests. Needs the backend and database up.
+cd frontend && npm run test:e2e
+cd frontend && npm run test:e2e:desktop     # one viewport
+cd frontend && npm run test:e2e:ui          # the Playwright inspector
+
+# Frontend — static checks
+cd frontend && npm run lint
+cd frontend && npm run typecheck
 ```
 
 If the integration tests fail at startup with *relation "departments" already
@@ -44,16 +54,17 @@ an empty database* something checked on every run rather than assumed.
 The cost is that those tests need a database, so they are tagged
 `integration` and can be excluded.
 
-Testcontainers is wired into the build for CI, where a Docker daemon is
-available. It is excluded by default because an unreachable daemon socket is
-enough to stop a test run on a developer machine, and the same integration
-tests already cover the database against a local PostgreSQL.
+There is no Testcontainers. It was once declared in the build with a comment
+saying CI ran the tagged tests, and no such test was ever written — the
+dependency and the comment were both removed rather than left to describe
+infrastructure that did not exist. A container would add a Docker daemon as a
+hard requirement without testing anything the local PostgreSQL does not.
 
 ## What the backend tests cover
 
 ### Unit — no database
 
-**`SqlSafetyValidatorTest`** (60 tests). The playground's refusals, one per
+**`SqlSafetyValidatorTest`** (63 tests). The playground's refusals, one per
 case: writes, DDL, multiple statements, data-modifying CTEs, `SELECT INTO`,
 locking clauses, forbidden schemas including inside subqueries and CTEs,
 three-part names, denied functions including nested in an expression, blank
@@ -66,13 +77,13 @@ window functions, `FILTER`, `VALUES`, `LATERAL`, `FETCH ... WITH TIES`. A
 validator that refuses valid SQL is as broken as one that accepts invalid SQL,
 and only the second kind of bug gets reported.
 
-**`JdbcPlaceholdersTest`** (18). That `?` outside a literal is escaped and `?`
+**`JdbcPlaceholdersTest`** (17). That `?` outside a literal is escaped and `?`
 inside one is not — in string literals with doubled quotes, quoted
 identifiers, dollar-quoted blocks, line comments and nested block comments.
 The second property is what turns a correctness fix into a correctness bug if
 it is written as a blanket `replace`.
 
-**`RevisionSchedulerTest`** (26). The SM-2 ladder, the ease adjustment curve,
+**`RevisionSchedulerTest`** (28). The SM-2 ladder, the ease adjustment curve,
 the floor, the cap, lapse handling, and the property most simplified
 implementations lose: a lapse resets the interval and **keeps** the ease
 penalty, so an item that keeps failing both returns immediately and grows more
@@ -90,7 +101,7 @@ that number, so `to_char(salary, 'FM999999')` is not marked wrong — which is
 the most arguable decision in the file and is recorded so that changing it is
 a decision rather than an accident.
 
-**`CurriculumValidatorTest`** (18) and **`CurriculumSqlTest`** (15). That
+**`CurriculumValidatorTest`** (18) and **`CurriculumSqlTest`** (14). That
 incomplete content fails the startup, one missing field at a time; that
 dangling cross-references are caught; that a quiz `answerIndex` out of range
 is caught. And the statement-discovery rules the recorder, the injector and
@@ -125,6 +136,14 @@ kept rather than overwritten, `solved` staying true after a later wrong
 attempt, the revision ladder over HTTP, learner isolation, and that reset is
 scoped to one learner and leaves the curriculum alone.
 
+**`ErrorResponseTest`** (7). What the API says when the request is wrong: an
+unknown path is 404, a truncated body is 400, the wrong method is 405, the
+wrong content type is 415 — and none of them is 500. Each also asserts what
+is *absent* from the body. A handler that fixes a status code but starts
+echoing Jackson's parse message, a package name or a stack frame has traded
+one defect for a worse one, so the test checks the response contains no
+`com.bhavesh`, no `org.springframework`, no `jdbc:postgresql` and no `\tat `.
+
 ## What the frontend tests cover
 
 **`ResultTable.test.tsx`** (9). That a NULL is drawn differently from an empty
@@ -144,6 +163,41 @@ not fetch or display a solution nobody requested; that hints arrive one at a
 time and asking for the first does not reveal the second; that the dashboard
 sparkline draws fourteen bars including the empty days.
 
+**`useApi.test.tsx`** (12). The data-fetching hook, which every page depends
+on and nothing else covered. Loading to data, errors wrapped with context,
+refetch when a dependency changes and *not* when it does not, `reload()`, and
+no state set after unmount. The one that matters most: a slow response that
+has been superseded by a newer request is discarded rather than painted over
+the newer data — the classic race that shows up as a stale table after a fast
+double-click.
+
+## What the browser tests cover
+
+`frontend/e2e/journey.spec.ts`, run by Playwright against a real Chrome, the
+real Vite build, the real API and the real PostgreSQL. The component tests
+stub `fetch`, so they cannot catch a contract drift between the two halves;
+these can.
+
+Twelve tests, run at two viewports — a desktop and a Pixel 7 — because the
+layout is a grid that collapses twice and nothing else checks that it
+collapses well. They walk the learner's path: dashboard, curriculum, module,
+lesson with all fourteen sections, an example run live against the database,
+the playground with valid SQL and typed columns, an invalid query returning a
+teachable `42703` rather than a stack trace, `drop table employees` refused
+with the employee count still 40 afterwards, a problem attempted and hinted
+and solved, a quiz marked, progress surviving a reload, search, a 404 route,
+and no console errors anywhere.
+
+They found two real defects on their first run: a table header whose
+accessible name was `nint8` because JSX had stripped the newline between the
+column name and its type, and a missing favicon logging a console error on
+every page load. Both are the kind of thing a component test cannot see.
+
+They also found the mobile layout. The sidebar stacked above the content as a
+five-hundred-pixel vertical menu, so every page on a phone opened on the
+navigation, and the playground's schema browser pushed the editor off the
+bottom of the screen entirely.
+
 ## What is not tested, and why
 
 **The seed data generator.** `tools/generate_dataset.py` is deterministic and
@@ -157,10 +211,6 @@ the prose runs and that its displayed output is what it produced.
 **The CodeMirror editor itself.** Keystroke-level behaviour of a third-party
 editor is its maintainers' test suite, not this one's. What is tested is the
 page around it.
-
-**Browser rendering.** There is no Playwright or Cypress layer. The component
-tests cover the logic and a human looks at the pages; an end-to-end browser
-suite would be the next thing to add if this grew.
 
 **Concurrency.** The transaction and MVCC behaviour the lessons describe is
 not exercised by a test that opens two sessions. Doing it properly needs a

@@ -33,6 +33,14 @@ export function ResultTable({
               {result.columns.map((column, i) => (
                 <th key={`${column.name}-${i}`} scope="col">
                   {column.name}
+                  {/*
+                    The explicit space matters. JSX strips the newline between
+                    these two children, so without it the accessible name of
+                    the header is "nint8" rather than "n int8" — the gap is
+                    drawn by a CSS margin and exists only visually. A screen
+                    reader, and anything matching on the accessible name,
+                    sees the run-together version.
+                  */}{' '}
                   <span className="col-type">{column.typeName}</span>
                 </th>
               ))}

@@ -61,6 +61,7 @@ public class CurriculumValidator {
             requireText(lesson.slug(), at, "slug", errors);
             requireText(lesson.summary(), at, "summary", errors);
             requireText(lesson.concept(), at, "concept (element 2)", errors);
+            requireStrings(lesson.tags(), at, "tags", errors);
             if (!moduleIds.contains(lesson.moduleId())) {
                 errors.add(at + ": moduleId \"" + lesson.moduleId() + "\" does not exist");
             }
@@ -197,6 +198,30 @@ public class CurriculumValidator {
     private static void requireItems(Collection<?> value, String at, String field, List<String> errors) {
         if (value == null || value.isEmpty()) {
             errors.add(at + ": " + field + " must have at least one entry");
+        }
+    }
+
+    /**
+     * A list whose entries must all be real strings.
+     *
+     * <p>This exists because of a specific YAML trap. {@code tags: [null,
+     * three-valued-logic]} looks like two tags and is one tag and a null —
+     * YAML reads a bare {@code null} as the null value, and the same applies
+     * to {@code yes}, {@code no}, {@code on} and {@code off}. The NULL lesson
+     * shipped exactly that, and the only symptom was a blank chip in the UI.
+     *
+     * <p>Empty is allowed: tags are optional. A null entry is not.
+     */
+    private static void requireStrings(List<String> value, String at, String field, List<String> errors) {
+        if (value == null) {
+            return;
+        }
+        for (int i = 0; i < value.size(); i++) {
+            String entry = value.get(i);
+            if (entry == null || entry.isBlank()) {
+                errors.add(at + ": " + field + "[" + i + "] is null or blank. In YAML a bare "
+                           + "null, yes, no, on or off is a keyword, not a string — quote it.");
+            }
         }
     }
 

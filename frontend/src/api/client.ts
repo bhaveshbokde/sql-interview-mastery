@@ -93,9 +93,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         ...init?.headers,
       },
     })
-  } catch (cause) {
+  } catch {
     // A network failure is the one error whose cause is almost always "the
     // backend is not running", so say that rather than "Failed to fetch".
+    // The underlying cause is deliberately dropped: "TypeError: Failed to
+    // fetch" tells the reader nothing the replacement does not.
     throw new ApiError(
       0,
       'Could not reach the server. Is the backend running on port 8085?',
@@ -115,7 +117,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const message =
       detail?.message ??
       (typeof body === 'object' && body !== null && 'message' in body
-        ? String((body as { message: unknown }).message)
+        ? String(body.message)
         : `Request failed with status ${response.status}`)
     throw new ApiError(response.status, message, detail)
   }

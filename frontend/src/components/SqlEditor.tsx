@@ -83,16 +83,3 @@ export function SqlEditor({
   )
 }
 
-/**
- * Turns the dataset description into the shape CodeMirror's completion
- * expects.
- */
-export function toCompletionSchema(
-  tables: { name: string; columns: { name: string }[] }[],
-): Record<string, string[]> {
-  const out: Record<string, string[]> = {}
-  for (const table of tables) {
-    out[table.name] = table.columns.map((c) => c.name)
-  }
-  return out
-}

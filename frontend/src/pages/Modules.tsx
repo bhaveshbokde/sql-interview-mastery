@@ -1,7 +1,8 @@
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { useApi } from '../api/useApi'
-import { Badge, ErrorBox, Loading, ProgressBar, formatMinutes } from '../components/common'
+import { Badge, ErrorBox, Loading, ProgressBar } from '../components/common'
+import { formatMinutes } from '../components/format'
 import type { LessonProgress, LessonStatus } from '../api/types'
 
 export function Modules() {

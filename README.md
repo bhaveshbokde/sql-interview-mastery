@@ -76,10 +76,10 @@ bash scripts/db.sh stop      # or: docker compose down
 
 | | |
 |---|---|
-| **9 modules, 36 lessons** | foundations, aggregation, joins, intermediate SQL, window functions, schema design, transactions, performance, advanced PostgreSQL |
+| **9 modules, 37 lessons** | foundations, aggregation, joins, intermediate SQL, window functions, schema design, transactions, performance, advanced PostgreSQL |
 | **17 interview problems** | each with hints, a verified solution, alternatives, the wrong answers that look right, and the follow-up questions |
 | **43 quiz questions** | the theory that has an answer and no query to run |
-| **454 runnable statements** | every one executed and recorded against the real dataset |
+| **463 runnable statements** | every one executed and recorded against the real dataset |
 | **17 tables, two datasets** | `learning` for the lessons, `learning_alt` holding the ties, NULLs and empty tables that break naive answers |
 
 Each lesson has fourteen required parts — objectives, concept, syntax, sample
@@ -181,18 +181,19 @@ backend/                 Spring Boot 3.5, Java 21, JDBC (no ORM — the subject 
     db/migration/        Flyway: app schema, learning schemas, views, progress
     db/learning/seed.sql generated, deterministic, re-runnable
     curriculum/          the content, as YAML
-      lessons/           36 lessons across 9 module directories
+      lessons/           37 lessons across 9 module directories
       problems/          17 interview problems
       quiz.yaml          43 multiple-choice questions
       expected-output.json   GENERATED — never edited by hand
-  src/test/java/         232 tests, unit and integration
+  src/test/java/         239 tests, unit and integration
 
 frontend/                React 18, TypeScript, Vite, CodeMirror
   src/api/               typed client and the two hooks the pages use
   src/components/        result grid, SQL editor, runnable snippet, shared bits
   src/pages/             dashboard, curriculum, lesson, playground, problems,
                          problem, quiz, revision, search, progress
-  src/test/              26 tests
+  src/test/              38 unit and component tests
+  e2e/                   24 browser tests (Playwright, desktop and mobile)
 
 scripts/                 db.sh · provision-db.sh · record-sql.sh · reset-test-db.sh
 tools/                   generate_dataset.py — regenerates the seed deterministically
@@ -222,9 +223,17 @@ bash scripts/record-sql.sh                    # re-run and re-record every state
 # Frontend
 cd frontend
 npm run dev                                   # dev server on :5173
-npm test                                      # vitest
+npm test                                      # vitest: unit and component
+npm run lint                                  # eslint, type-aware
+npm run typecheck                             # tsc over app, node and e2e
 npm run build                                 # typecheck and production build
+npm run test:e2e                              # real Chrome, desktop + mobile
 ```
+
+The browser tests need the backend and the database up; they skip with an
+explanatory message rather than failing obscurely when they are not. They
+drive the system Chrome rather than downloading one, so there is no 400 MB
+browser bundle in a repository about SQL.
 
 After editing any SQL in the curriculum, run `scripts/record-sql.sh`. The
 normal startup refuses to boot when a statement has no recorded output, so

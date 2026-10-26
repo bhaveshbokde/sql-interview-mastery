@@ -8,6 +8,23 @@
       name="description"
       content="Interactive SQL learning and interview preparation, from the relational model to advanced PostgreSQL."
     />
+    <!--
+      An inline SVG favicon as a data URI, rather than a file.
+
+      Without one, every page load requests /favicon.ico, gets a 404 and logs
+      a console error — noise that trains you to ignore the console, which is
+      where the real errors appear. A data URI costs no request at all, and it
+      satisfies the strict Content-Security-Policy in nginx.conf, which allows
+      img-src from 'self' and data: only.
+
+      currentColor would not work here: the icon is rendered outside the
+      document, so the two fills are the accent and a neutral that read on
+      both a light and a dark browser chrome.
+    -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f5fd0'/%3E%3Cellipse cx='16' cy='9.5' rx='9' ry='3.6' fill='none' stroke='white' stroke-width='2.2'/%3E%3Cpath d='M7 9.5v13c0 2 4 3.6 9 3.6s9-1.6 9-3.6v-13' fill='none' stroke='white' stroke-width='2.2' stroke-linecap='round'/%3E%3Cpath d='M7 16c0 2 4 3.6 9 3.6s9-1.6 9-3.6' fill='none' stroke='white' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E"
+    />
     <title>SQL Interview Mastery</title>
   </head>
   <body>

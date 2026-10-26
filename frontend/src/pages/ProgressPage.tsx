@@ -9,8 +9,8 @@ import {
   Loading,
   ProgressBar,
   Section,
-  formatDate,
 } from '../components/common'
+import { formatDate } from '../components/format'
 
 export function ProgressPage() {
   const overview = useApi(() => api.progress(), [])

@@ -1,4 +1,3 @@
-/// <reference types="vitest/config" />
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 
@@ -50,5 +49,10 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: ['./src/test/setup.ts'],
     css: false,
+    // Only the component and unit tests under src/. Vitest's default pattern
+    // also matches e2e/*.spec.ts, and those are Playwright specs — collecting
+    // one in Vitest loads a second, incompatible `test` object and the file
+    // fails on its first `test.beforeAll`. Run them with `npm run test:e2e`.
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
   },
 })

@@ -8,8 +8,8 @@ import {
   ProgressBar,
   Section,
   Stat,
-  formatMinutes,
 } from '../components/common'
+import { formatMinutes } from '../components/format'
 import type { ActivityDay } from '../api/types'
 
 export function Dashboard() {

@@ -1384,6 +1384,27 @@
     "durationMs" : 0,
     "schema" : "learning"
   },
+  "23b2c6e564ea2149388984ceb2f6ba55bbeaf90a265305baed75b7c907ae373e" : {
+    "columns" : [ {
+      "name" : "n",
+      "typeName" : "int4",
+      "alignment" : "numeric"
+    }, {
+      "name" : "guarded",
+      "typeName" : "int4",
+      "alignment" : "numeric"
+    }, {
+      "name" : "guarded_other_way",
+      "typeName" : "int4",
+      "alignment" : "numeric"
+    } ],
+    "rows" : [ [ 0, 0, 0 ], [ 1, 100, 100 ], [ 4, 25, 25 ], [ 10, 10, 10 ] ],
+    "rowCount" : 4,
+    "truncated" : false,
+    "rowLimit" : 500,
+    "durationMs" : 0,
+    "schema" : "learning"
+  },
   "23c2562816b59b9ea18d37bebf01630d7b6c094bc73bfca12db55a881e29d151" : {
     "columns" : [ {
       "name" : "as_json",
@@ -2229,6 +2250,31 @@
     } ],
     "rows" : [ [ 301, "2024-05-01", "2024-05-12", 12 ], [ 302, "2024-05-11", "2024-05-11", 1 ], [ 302, "2024-05-20", "2024-05-20", 1 ], [ 302, "2024-05-28", "2024-05-28", 1 ], [ 303, "2024-05-01", "2024-05-04", 4 ], [ 303, "2024-05-08", "2024-05-10", 3 ], [ 303, "2024-05-16", "2024-05-20", 5 ], [ 304, "2024-05-13", "2024-05-13", 1 ], [ 304, "2024-05-21", "2024-05-21", 1 ], [ 305, "2024-05-03", "2024-05-07", 5 ], [ 306, "2024-05-07", "2024-05-07", 1 ], [ 306, "2024-05-11", "2024-05-11", 1 ], [ 306, "2024-05-30", "2024-05-30", 1 ], [ 308, "2024-05-07", "2024-05-07", 1 ], [ 308, "2024-05-10", "2024-05-10", 1 ], [ 308, "2024-05-12", "2024-05-12", 1 ], [ 308, "2024-05-18", "2024-05-18", 1 ], [ 308, "2024-05-28", "2024-05-28", 1 ], [ 310, "2024-05-18", "2024-05-18", 1 ], [ 310, "2024-05-21", "2024-05-21", 1 ], [ 310, "2024-05-26", "2024-05-26", 1 ], [ 310, "2024-05-28", "2024-05-28", 1 ], [ 310, "2024-05-30", "2024-05-30", 1 ], [ 311, "2024-05-09", "2024-05-10", 2 ], [ 314, "2024-05-06", "2024-05-06", 1 ], [ 314, "2024-05-16", "2024-05-16", 1 ], [ 314, "2024-05-22", "2024-05-22", 1 ], [ 314, "2024-05-28", "2024-05-28", 1 ], [ 314, "2024-05-30", "2024-05-30", 1 ], [ 316, "2024-05-02", "2024-05-02", 1 ], [ 316, "2024-05-11", "2024-05-11", 1 ], [ 316, "2024-05-22", "2024-05-22", 1 ], [ 316, "2024-05-25", "2024-05-25", 1 ], [ 316, "2024-05-28", "2024-05-28", 1 ], [ 319, "2024-05-12", "2024-05-13", 2 ], [ 319, "2024-05-17", "2024-05-17", 1 ], [ 319, "2024-05-22", "2024-05-22", 1 ], [ 319, "2024-05-27", "2024-05-27", 1 ] ],
     "rowCount" : 38,
+    "truncated" : false,
+    "rowLimit" : 500,
+    "durationMs" : 0,
+    "schema" : "learning"
+  },
+  "3384fe323c393752e5826b93a7a1e2aafa414467b5d8ad1520004cf6a8f0469f" : {
+    "columns" : [ {
+      "name" : "simple_form",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "searched_is_null",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "searched_equals",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "null_condition",
+      "typeName" : "text",
+      "alignment" : "text"
+    } ],
+    "rows" : [ [ "fell through", "matched", "fell through", "else branch" ] ],
+    "rowCount" : 1,
     "truncated" : false,
     "rowLimit" : 500,
     "durationMs" : 0,
@@ -5354,6 +5400,27 @@
     "durationMs" : 0,
     "schema" : "learning"
   },
+  "73347bd4b7eb31469e82148cf81971f48fc95b18dd3de6e662b0878c3c24c521" : {
+    "columns" : [ {
+      "name" : "status",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "orders",
+      "typeName" : "int8",
+      "alignment" : "numeric"
+    }, {
+      "name" : "shipped",
+      "typeName" : "int8",
+      "alignment" : "numeric"
+    } ],
+    "rows" : [ [ "cancelled", 10, 0 ], [ "completed", 122, 122 ], [ "pending", 9, 0 ], [ "shipped", 10, 10 ] ],
+    "rowCount" : 4,
+    "truncated" : false,
+    "rowLimit" : 500,
+    "durationMs" : 0,
+    "schema" : "learning"
+  },
   "73825050bcecd845c9f7f58808343d8c7f722364b03f8a8bdfa4711d20c975c9" : {
     "columns" : [ {
       "name" : "dept_name",
@@ -5968,6 +6035,31 @@
     } ],
     "rows" : [ [ 1005, "completed", 1655979.30, 827989.65, 2 ], [ 1006, "completed", 57998.00, 28999.00, 2 ], [ 1011, "completed", 329165.03, 164582.51, 2 ] ],
     "rowCount" : 3,
+    "truncated" : false,
+    "rowLimit" : 500,
+    "durationMs" : 0,
+    "schema" : "learning"
+  },
+  "7ee4253c0f37f96d620b4b94871cd2bbaa4bd049e1c7ebc8c73e183ca4f5687f" : {
+    "columns" : [ {
+      "name" : "order_id",
+      "typeName" : "int4",
+      "alignment" : "numeric"
+    }, {
+      "name" : "status",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "order_date",
+      "typeName" : "date",
+      "alignment" : "text"
+    }, {
+      "name" : "sort_rank",
+      "typeName" : "int4",
+      "alignment" : "numeric"
+    } ],
+    "rows" : [ [ 1150, "shipped", "2024-12-04", 2 ], [ 1137, "shipped", "2024-10-20", 2 ], [ 1135, "shipped", "2024-10-15", 2 ], [ 1129, "shipped", "2024-09-10", 2 ], [ 1125, "shipped", "2024-08-11", 2 ], [ 1112, "shipped", "2024-06-07", 2 ], [ 1151, "completed", "2024-12-04", 3 ], [ 1148, "completed", "2024-11-29", 3 ], [ 1149, "completed", "2024-11-29", 3 ], [ 1146, "completed", "2024-11-24", 3 ], [ 1147, "completed", "2024-11-24", 3 ], [ 1145, "completed", "2024-11-19", 3 ], [ 1144, "completed", "2024-11-14", 3 ], [ 1142, "completed", "2024-11-09", 3 ], [ 1143, "completed", "2024-11-09", 3 ], [ 1140, "completed", "2024-11-04", 3 ], [ 1141, "completed", "2024-11-04", 3 ], [ 1138, "completed", "2024-10-30", 3 ], [ 1136, "completed", "2024-10-20", 3 ], [ 1133, "completed", "2024-10-05", 3 ], [ 1134, "completed", "2024-10-05", 3 ], [ 1131, "completed", "2024-09-15", 3 ], [ 1130, "completed", "2024-09-10", 3 ], [ 1128, "completed", "2024-08-26", 3 ], [ 1127, "completed", "2024-08-21", 3 ], [ 1126, "completed", "2024-08-16", 3 ], [ 1122, "completed", "2024-08-06", 3 ], [ 1121, "completed", "2024-08-01", 3 ], [ 1120, "completed", "2024-07-27", 3 ], [ 1119, "completed", "2024-07-22", 3 ], [ 1118, "completed", "2024-07-17", 3 ], [ 1116, "completed", "2024-07-12", 3 ], [ 1117, "completed", "2024-07-12", 3 ], [ 1114, "completed", "2024-07-07", 3 ], [ 1115, "completed", "2024-07-07", 3 ], [ 1113, "completed", "2024-06-07", 3 ], [ 1111, "completed", "2024-06-02", 3 ], [ 1132, "cancelled", "2024-09-25", 4 ], [ 1124, "cancelled", "2024-08-11", 4 ], [ 1139, "pending", "2024-10-30", 99 ], [ 1123, "pending", "2024-08-06", 99 ] ],
+    "rowCount" : 41,
     "truncated" : false,
     "rowLimit" : 500,
     "durationMs" : 0,
@@ -6639,6 +6731,23 @@
     "durationMs" : 0,
     "schema" : "learning"
   },
+  "8f46b6e72d61a6b2eac2d1f8bdfdf32f3c7113707aa6a80bb700fc78f4b7401e" : {
+    "columns" : [ {
+      "name" : "stock_band",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "products",
+      "typeName" : "int8",
+      "alignment" : "numeric"
+    } ],
+    "rows" : [ [ "out of stock", 1 ], [ "low", 9 ], [ "ok", 15 ] ],
+    "rowCount" : 3,
+    "truncated" : false,
+    "rowLimit" : 500,
+    "durationMs" : 0,
+    "schema" : "learning"
+  },
   "8f8d35d82ce0d27807f175aa7eb068747fffa7fa5af7a259c8208b4b7049406b" : {
     "columns" : [ {
       "name" : "product_id",
@@ -6830,6 +6939,39 @@
     } ],
     "rows" : [ [ 42, 32000.000 ] ],
     "rowCount" : 1,
+    "truncated" : false,
+    "rowLimit" : 500,
+    "durationMs" : 0,
+    "schema" : "learning"
+  },
+  "91a948c545e34359f3a3ea7f202b1ed7aa1b550bcd319fd0bf2eeca2e410e734" : {
+    "columns" : [ {
+      "name" : "emp_id",
+      "typeName" : "int4",
+      "alignment" : "numeric"
+    }, {
+      "name" : "employee",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "salary",
+      "typeName" : "numeric",
+      "alignment" : "numeric"
+    }, {
+      "name" : "band",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "status_searched",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "status_simple",
+      "typeName" : "text",
+      "alignment" : "text"
+    } ],
+    "rows" : [ [ 2, "Vikram Shetty", 245000.00, "executive", "active", "active" ], [ 8, "Priya Nair", 198000.00, "senior", "active", "active" ], [ 9, "Arjun Deshpande", 186000.00, "senior", "active", "active" ], [ 10, "Fatima Sheikh", 184000.00, "senior", "active", "active" ], [ 35, "Yusuf Khan", 167000.00, "senior", "active", "active" ], [ 36, "Ayesha Patel", 162000.00, "senior", "active", "active" ], [ 14, "Rohit Varma", 148000.00, "mid", "active", "active" ], [ 15, "Ananya Pillai", 148000.00, "mid", "active", "active" ], [ 17, "Leela Krishnan", 143000.00, "mid", "active", "active" ], [ 16, "Tarun Bhatt", 121000.00, "mid", "active", "active" ], [ 18, "Zoya Ahmed", 118000.00, "mid", "active", "active" ], [ 19, "Nikhil Joshi", 112000.00, "mid", "active", "active" ], [ 20, "Harpreet Singh", 89000.00, "junior", "active", "active" ] ],
+    "rowCount" : 13,
     "truncated" : false,
     "rowLimit" : 500,
     "durationMs" : 0,
@@ -8456,6 +8598,27 @@
     "durationMs" : 0,
     "schema" : "learning"
   },
+  "bda2b1a37c9a8aa95686a06160104f7c0e1e258987610039e55d2e02ee091c34" : {
+    "columns" : [ {
+      "name" : "full_name",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "job_title",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "salary",
+      "typeName" : "numeric",
+      "alignment" : "numeric"
+    } ],
+    "rows" : [ [ "Gaurav Malhotra", "Account Executive", 134000.00 ], [ "Shruti Desai", "Account Executive", 129000.00 ], [ "Dev Chauhan", "Account Executive", 126000.00 ], [ "Arnav Chatterjee", "Sales Development Rep", 82000.00 ], [ "Pooja Reddy", "Sales Development Rep", 79000.00 ], [ "Daniel Fernandes", "Enterprise Account Lead", 251000.00 ], [ "Neha Kulkarni", "VP Sales", 238000.00 ] ],
+    "rowCount" : 7,
+    "truncated" : false,
+    "rowLimit" : 500,
+    "durationMs" : 0,
+    "schema" : "learning"
+  },
   "be1c014740441a43111727d5bd681b0f355bb219aaa69e9f07fa2b0d012d81e0" : {
     "columns" : [ {
       "name" : "company_name",
@@ -9273,6 +9436,35 @@
     "durationMs" : 0,
     "schema" : "learning_alt"
   },
+  "d22802083043423f6751bab377bfd1d3c3f9b5349ed83a25d0515c2c941114a2" : {
+    "columns" : [ {
+      "name" : "all_orders",
+      "typeName" : "int8",
+      "alignment" : "numeric"
+    }, {
+      "name" : "cancelled_correct",
+      "typeName" : "int8",
+      "alignment" : "numeric"
+    }, {
+      "name" : "cancelled_wrong",
+      "typeName" : "int8",
+      "alignment" : "numeric"
+    }, {
+      "name" : "cancelled_sum",
+      "typeName" : "int8",
+      "alignment" : "numeric"
+    }, {
+      "name" : "cancelled_filter",
+      "typeName" : "int8",
+      "alignment" : "numeric"
+    } ],
+    "rows" : [ [ 151, 10, 151, 10, 10 ] ],
+    "rowCount" : 1,
+    "truncated" : false,
+    "rowLimit" : 500,
+    "durationMs" : 0,
+    "schema" : "learning"
+  },
   "d321113ceafa93e3ea3c76a7701a9990fbd3002f53befb16a326835151a398e1" : {
     "columns" : [ {
       "name" : "salary",
@@ -9855,6 +10047,35 @@
     } ],
     "rows" : [ [ "Vikram Shetty", 245000.00, 245000.00, 0.00 ], [ "Priya Nair", 198000.00, 245000.00, 47000.00 ], [ "Arjun Deshpande", 186000.00, 245000.00, 59000.00 ], [ "Fatima Sheikh", 184000.00, 245000.00, 61000.00 ], [ "Yusuf Khan", 167000.00, 245000.00, 78000.00 ], [ "Ayesha Patel", 162000.00, 245000.00, 83000.00 ], [ "Rohit Varma", 148000.00, 245000.00, 97000.00 ], [ "Ananya Pillai", 148000.00, 245000.00, 97000.00 ], [ "Leela Krishnan", 143000.00, 245000.00, 102000.00 ], [ "Tarun Bhatt", 121000.00, 245000.00, 124000.00 ], [ "Zoya Ahmed", 118000.00, 245000.00, 127000.00 ], [ "Nikhil Joshi", 112000.00, 245000.00, 133000.00 ], [ "Harpreet Singh", 89000.00, 245000.00, 156000.00 ] ],
     "rowCount" : 13,
+    "truncated" : false,
+    "rowLimit" : 500,
+    "durationMs" : 0,
+    "schema" : "learning"
+  },
+  "e46958a61c09e1166e58726d040eaf00b9bf0db19bc4ed265328e8f50760812a" : {
+    "columns" : [ {
+      "name" : "cohort",
+      "typeName" : "text",
+      "alignment" : "text"
+    }, {
+      "name" : "customers",
+      "typeName" : "int8",
+      "alignment" : "numeric"
+    }, {
+      "name" : "countries",
+      "typeName" : "int8",
+      "alignment" : "numeric"
+    }, {
+      "name" : "earliest",
+      "typeName" : "date",
+      "alignment" : "text"
+    }, {
+      "name" : "latest",
+      "typeName" : "date",
+      "alignment" : "text"
+    } ],
+    "rows" : [ [ "before 2023", 5, 4, "2022-04-11", "2022-11-02" ], [ "2023", 10, 9, "2023-01-20", "2023-11-27" ], [ "2024 or later", 7, 5, "2024-01-15", "2024-07-01" ] ],
+    "rowCount" : 3,
     "truncated" : false,
     "rowLimit" : 500,
     "durationMs" : 0,
