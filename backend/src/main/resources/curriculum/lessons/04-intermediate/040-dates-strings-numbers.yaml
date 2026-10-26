@@ -1,0 +1,446 @@
+id: i-datetime-string
+moduleId: intermediate
+position: 40
+title: Date, string and number functions
+slug: dates-strings-numbers
+difficulty: Intermediate
+estimatedMinutes: 25
+summary: >-
+  The function library real queries are mostly made of: date_trunc and extract,
+  interval arithmetic, the string functions worth knowing, and the rounding
+  rules that produce "the totals do not add up" tickets.
+tags: [functions, dates, strings, intervals, rounding, formatting]
+
+prerequisites:
+  - f-data-types
+
+objectives:
+  - Bucket timestamps by day, week, month or quarter with date_trunc
+  - Do arithmetic with intervals and explain what date minus date returns
+  - Format a date for display and parse one from text
+  - Use the common string functions, including the regex family
+  - Choose a rounding function deliberately and know what each does at .5
+
+concept: |
+  ## Dates: truncate, extract, and arithmetic
+
+  Two functions cover most date work and they return different types, which is
+  the thing to internalise:
+
+  - **`date_trunc('month', ts)`** rounds a timestamp **down** to the start of a
+    period and returns a **timestamp**. Use it to bucket for grouping.
+  - **`extract(month from ts)`** pulls out one **number**. Use it when you want
+    the number itself.
+
+  `date_trunc` preserves the type, so `date_trunc('month', order_date) =
+  '2024-03-01'` can be rewritten by the planner into a range over an index.
+  `extract(month from order_date) = 3` cannot, and it also lumps March 2023 in
+  with March 2024.
+
+  Arithmetic is type-driven:
+
+  | Expression | Result |
+  |------------|--------|
+  | `date - date` | **integer** number of days |
+  | `timestamp - timestamp` | **interval** |
+  | `date + integer` | date, n days later |
+  | `timestamp + interval '1 month'` | timestamp |
+  | `age(a, b)` | interval in years/months/days, calendar-aware |
+
+  `date - date` giving a plain integer is a PostgreSQL convenience worth
+  remembering — no `extract(day from ...)` needed.
+
+  Interval arithmetic is **calendar-aware and not commutative in effect**:
+  `'2024-01-31' + interval '1 month'` is 29 February 2024, because month
+  addition clamps to the end of the target month. Adding a month and then
+  subtracting one does not always return you to where you started.
+
+  ## Formatting and parsing
+
+  `to_char(value, format)` formats; `to_date` and `to_timestamp` parse. The
+  format strings are PostgreSQL's own:
+
+  ```sql
+  to_char(order_date, 'YYYY-MM-DD')      -- 2024-03-10
+  to_char(order_date, 'Mon YYYY')        -- Mar 2024
+  to_char(revenue, 'FM999,999,990.00')   -- 1,234.50
+  ```
+
+  Format for display only. Storing or comparing formatted dates as text means
+  sorting lexicographically, which works for `YYYY-MM-DD` and breaks for
+  everything else.
+
+  ## Strings
+
+  The ones worth knowing by heart: `length`, `upper`, `lower`, `initcap`,
+  `trim`/`ltrim`/`rtrim`, `lpad`/`rpad`, `substring`, `position`, `replace`,
+  `split_part`, `left`, `right`, `concat_ws`, `repeat`, `reverse`.
+
+  Two are more useful than their obscurity suggests:
+
+  - **`split_part(str, delim, n)`** — the nth field. The clean way to take a
+    domain out of an email address.
+  - **`concat_ws(sep, a, b, c)`** — joins with a separator and **skips NULLs**,
+    unlike `||`, which propagates them.
+
+  The regex family — `~`, `~*`, `regexp_replace`, `regexp_match`,
+  `regexp_split_to_array` — is there when `LIKE` is not enough. It is
+  powerful, slow relative to `LIKE`, and unable to use a plain B-tree index.
+
+  ## Numbers and rounding
+
+  `round`, `trunc`, `ceil`, `floor`, `abs`, `mod`, `power`, `sqrt`,
+  `greatest`, `least`.
+
+  The rounding detail that causes real disputes: PostgreSQL's `round` on
+  **numeric** rounds half **away from zero** (0.5 → 1, −0.5 → −1), while on
+  **double precision** it uses the IEEE 754 round-half-to-even rule (0.5 → 0,
+  1.5 → 2). Two columns of the same data in different types round differently,
+  and the totals disagree by a rupee.
+
+  `round(x, n)` with a scale argument only exists for `numeric`. On a double
+  you must cast first, which is itself a hint that you should have used
+  `numeric`.
+
+syntax:
+  - form: "date_trunc('unit', timestamp)"
+    notes: >-
+      Units include second, minute, hour, day, week, month, quarter, year.
+      Returns a timestamp, so it keeps the type.
+  - form: "extract(field from source)"
+    notes: >-
+      Returns a number. `dow` is 0–6 with Sunday 0; `isodow` is 1–7 with Monday
+      1. Mixing them up shifts a weekly report by a day.
+  - form: "to_char(value, 'format')"
+    notes: >-
+      Display formatting. `FM` suppresses padding. Never use the output as a
+      sort key.
+  - form: "split_part(string, delimiter, n)"
+    notes: The nth field, 1-based. Returns an empty string, not NULL, if absent.
+  - form: "concat_ws(separator, a, b, ...)"
+    notes: Skips NULL arguments entirely, unlike the `||` operator.
+  - form: "round(numeric, scale) | trunc | ceil | floor"
+    notes: >-
+      The two-argument round requires numeric. Rounding of exact halves differs
+      between numeric and double precision.
+
+sampleTables: [orders, employees, customers, daily_sales, contacts, products]
+
+examples:
+  - title: Bucketing with date_trunc, and why not extract
+    sql: |
+      select date_trunc('month', order_date)::date       as month,
+             to_char(date_trunc('month', order_date), 'Mon YYYY') as label,
+             count(*)                                     as orders,
+             count(*) filter (where status = 'completed') as completed,
+             min(order_date)                              as first_order,
+             max(order_date)                              as last_order
+      from orders
+      where order_date >= date '2023-01-01'
+        and order_date <  date '2023-07-01'
+      group by date_trunc('month', order_date)
+      order by 1
+    walkthrough: |
+      `date_trunc('month', order_date)` maps every date in a month to that
+      month's first day, which is exactly what a `GROUP BY` needs. The `::date`
+      cast drops the zero time component so the column displays cleanly.
+
+      `extract(month from order_date)` would also group, and would put January
+      2023 and January 2024 in the same bucket — correct only if that is what
+      you wanted, and a silent error otherwise. It also returns a number with no
+      year, so the result cannot be sorted chronologically across years.
+
+      The `WHERE` is a half-open range on the raw column, so an index on
+      `order_date` can serve it. Filtering on `date_trunc(...)` instead would
+      not, which is the second reason to truncate in the GROUP BY and filter on
+      the raw column.
+
+  - title: Interval arithmetic and the month-end clamp
+    sql: |
+      select date '2024-01-31' + interval '1 month'               as jan31_plus_month,
+             date '2024-03-31' - interval '1 month'               as mar31_minus_month,
+             (date '2024-01-31' + interval '1 month')
+               - interval '1 month'                               as not_a_round_trip,
+             date '2024-03-10' - date '2024-01-31'                as days_between,
+             age(date '2024-03-10', date '2015-03-02')            as age_interval,
+             extract(year from age(date '2024-03-10', date '2015-03-02')) as whole_years,
+             date_trunc('week', date '2024-03-10')::date          as week_start
+    walkthrough: |
+      31 January plus one month is 29 February 2024 — month addition clamps to
+      the last valid day. Subtract a month from that and you get 29 January,
+      not 31: the operation is not reversible, which is a genuine source of
+      off-by-one-day bugs in billing code.
+
+      `date - date` is a plain integer count of days, which is the PostgreSQL
+      convenience worth remembering. `timestamp - timestamp` would give an
+      interval instead.
+
+      `date_trunc('week', ...)` uses **Monday** as the start of the week, per
+      ISO 8601. If your reporting week starts on Sunday, this is the function
+      that quietly disagrees with the spreadsheet, and the fix is to shift by a
+      day before truncating.
+
+  - title: String functions on real data
+    sql: |
+      select c.contact_id,
+             c.email,
+             split_part(c.email, '@', 1)                  as local_part,
+             split_part(c.email, '@', 2)                  as domain,
+             initcap(c.full_name)                         as tidied_name,
+             length(c.full_name)                          as name_length,
+             left(c.full_name, 1) || '.'                  as initial,
+             concat_ws(' | ', c.full_name, nullif(c.email, ''), null) as joined_skipping_nulls,
+             c.full_name || ' <' || c.email || '>'        as rfc_style
+      from contacts c
+      order by c.contact_id
+      limit 8
+    walkthrough: |
+      `split_part(email, '@', 2)` is the clean way to get the domain. It returns
+      an empty string rather than NULL when the field does not exist, which is
+      worth knowing before you test for NULL and find nothing.
+
+      `concat_ws` skips the trailing NULL argument entirely — no stray
+      separator, no NULL swallowing the whole string. Compare with the last
+      column, which uses `||`: if any part were NULL the entire result would
+      be NULL. That difference is the single most common reason an assembled
+      display string comes out blank.
+
+  - title: Rounding, and where the rupee goes
+    sql: |
+      select round(2.5::numeric)                    as numeric_half_up,
+             round(3.5::numeric)                    as numeric_half_up_odd,
+             round(2.5::double precision)           as float_half_even,
+             round(3.5::double precision)           as float_half_even_odd,
+             trunc(2.9::numeric)                    as truncated,
+             ceil(2.1::numeric)                     as ceiling,
+             floor(-2.1::numeric)                   as floor_negative,
+             round(-2.5::numeric)                   as negative_half,
+             mod(17, 5)                             as remainder,
+             round(1234.5678::numeric, 2)           as two_places
+    walkthrough: |
+      `round(2.5)` is 3 on numeric and 2 on double precision. Both are correct
+      implementations of different, documented rules — half away from zero for
+      numeric, half to even for IEEE floats — and the discrepancy is exactly
+      how a report and a spreadsheet come to disagree by small amounts that
+      nobody can trace.
+
+      `floor(-2.1)` is −3, not −2: floor goes towards negative infinity while
+      `trunc` goes towards zero. For negative numbers they differ, and
+      financial code that uses the wrong one is off by one in one direction
+      only, which makes it hard to spot.
+
+      The practical rule: pick `numeric` for money, round once at the point of
+      display, and never round intermediate values in a chain of calculations.
+
+edgeCases:
+  - title: dow and isodow disagree about Sunday
+    body: >-
+      `extract(dow from ...)` numbers Sunday as 0 and Saturday as 6.
+      `extract(isodow from ...)` numbers Monday as 1 and Sunday as 7. A weekly
+      report built with one and filtered with the other is shifted by a day,
+      which looks like a data problem rather than a function problem.
+    sql: |
+      select d::date                       as day,
+             to_char(d, 'Dy')              as name,
+             extract(dow from d)           as dow,
+             extract(isodow from d)        as isodow,
+             date_trunc('week', d)::date   as iso_week_start
+      from generate_series(date '2024-03-10', date '2024-03-16', interval '1 day') as g(d)
+      order by d
+
+  - title: to_char pads, FM does not
+    body: >-
+      Without the FM prefix, numeric format strings pad with spaces to a fixed
+      width and month names pad to nine characters. That is useful for
+      fixed-width output and surprising in a web page, where the padding shows
+      up as leading whitespace that no amount of CSS explains.
+    sql: |
+      select to_char(1234.5, '999,999.00')     as padded,
+             to_char(1234.5, 'FM999,999.00')   as unpadded,
+             to_char(date '2024-03-10', 'Month DD, YYYY')   as padded_month,
+             to_char(date '2024-03-10', 'FMMonth DD, YYYY') as unpadded_month,
+             length(to_char(date '2024-03-10', 'Month'))    as padded_length
+
+pitfalls:
+  - mistake: Filtering on a function of a date column
+    why: >-
+      `where extract(year from order_date) = 2024` and `where
+      date(created_at) = '2024-03-10'` both read naturally and both prevent an
+      index on the column from being used.
+    fix: >-
+      Rewrite as a half-open range on the raw column. Truncate in the GROUP BY,
+      filter on the column.
+
+  - mistake: Using BETWEEN with timestamps for a whole day
+    why: >-
+      Covered in the filtering lesson and worth repeating because it recurs
+      here: BETWEEN is inclusive, so the upper bound is midnight and the rest
+      of the day is lost.
+    fix: >-
+      `>= start AND < start + interval '1 day'`.
+
+  - mistake: Assuming date_trunc('week') starts on Sunday
+    why: >-
+      PostgreSQL follows ISO 8601, where the week starts on Monday. Many
+      business calendars start on Sunday, and the mismatch moves every weekly
+      figure by one day's data.
+    fix: >-
+      `date_trunc('week', d + interval '1 day') - interval '1 day'` for a
+      Sunday-start week. Write a comment explaining it, because the expression
+      is not self-evident.
+
+  - mistake: Rounding intermediate values
+    why: >-
+      Rounding at each step accumulates error, and rounding in a different type
+      at different steps produces different answers. The final figures then
+      disagree with a recomputation and nobody can say which is right.
+    fix: >-
+      Keep full precision through the calculation and round once, at the
+      boundary where the number becomes output.
+
+performance: |
+  Any function applied to a column in a `WHERE` clause makes the predicate
+  non-sargable — the index stores the column's values, not the function's
+  results. The two remedies are to rewrite as a range on the raw column, which
+  is nearly always possible for dates, or to create an **expression index**
+  that matches the predicate exactly:
+
+  ```sql
+  create index on orders (date_trunc('month', order_date));
+  ```
+
+  The expression in the index and in the query must match textually after
+  parsing, and the function must be `IMMUTABLE` — which `date_trunc` with a
+  constant unit is, and `to_char` with a timezone-dependent format is not.
+
+  Regular expressions cannot use a B-tree index at all. For
+  substring search at scale, a trigram index (`pg_trgm`) supports `LIKE '%x%'`
+  and regex; for word search, full-text search with a `tsvector` column and a
+  GIN index is the right tool. This application's own content search uses the
+  latter.
+
+  String functions on large text columns are cheap individually and add up in
+  a select list evaluated over millions of rows. Computing them once in a CTE
+  beats computing them in both `WHERE` and `SELECT`.
+
+interviewQuestions:
+  - question: What is the difference between date_trunc and extract?
+    answer: >-
+      `date_trunc` rounds a timestamp down to the start of a period and returns
+      a timestamp, so the result keeps its type and sorts chronologically;
+      `extract` pulls a single field out as a number. For grouping by month,
+      date_trunc is correct because it distinguishes March 2023 from March 2024
+      and because a predicate on it can be rewritten by the planner as a range.
+      extract is right when you want the number itself — say, to group all
+      Mondays together regardless of week.
+
+  - question: How do you filter a date range without breaking index usage?
+    answer: >-
+      Compare the raw column to constants with a half-open range: `>= start AND
+      < end`. Anything that wraps the column in a function — extract, date(),
+      to_char — makes the predicate non-sargable, because the index holds the
+      column's values rather than the function's. If a functional predicate is
+      genuinely required, create an expression index on exactly that expression,
+      which requires the function to be IMMUTABLE.
+
+  - question: Why might two columns of the same numbers round differently?
+    answer: >-
+      Because of their types. PostgreSQL's round on numeric rounds halves away
+      from zero, while on double precision it follows IEEE 754 round-half-to-
+      even, so 2.5 becomes 3 in one and 2 in the other. Combined with the fact
+      that floats cannot represent most decimal fractions exactly, this is how a
+      report and a spreadsheet come to differ by amounts nobody can trace. Store
+      money as numeric and round once at the point of display.
+
+  - question: What does `date '2024-01-31' + interval '1 month'` return, and why does it matter?
+    answer: >-
+      29 February 2024 — month arithmetic clamps to the last valid day of the
+      target month. It matters because the operation is not reversible:
+      subtracting a month from the result gives 29 January, not 31 January. Any
+      code that steps forward and back through months, such as a billing cycle
+      or a period comparison, has to treat month boundaries explicitly rather
+      than assuming the arithmetic round-trips.
+
+exercises:
+  - prompt: >-
+      For orders in 2023, return the ISO week start date, the number of orders
+      and the number of distinct customers. Columns week_start, orders,
+      customers. Order by week_start, limited to the first 10 weeks.
+    difficulty: Easy
+    hint: >-
+      date_trunc('week', order_date) for the bucket, and a half-open range on
+      the raw column for the filter.
+    solutionSql: |
+      select date_trunc('week', order_date)::date as week_start,
+             count(*)                             as orders,
+             count(distinct customer_id)          as customers
+      from orders
+      where order_date >= date '2023-01-01'
+        and order_date <  date '2024-01-01'
+      group by 1
+      order by 1
+      limit 10
+
+  - prompt: >-
+      From the contacts table, return each distinct email domain with how many
+      contacts use it. Columns domain, contacts. Order by contacts descending
+      then domain.
+    difficulty: Easy
+    hint: split_part on '@' taking field 2.
+    solutionSql: |
+      select split_part(email, '@', 2) as domain,
+             count(*)                  as contacts
+      from contacts
+      group by 1
+      order by contacts desc, domain
+
+  - prompt: >-
+      For each employee, return their name, hire date, and how many whole years
+      they had served as at 1 January 2025. Columns full_name, hire_date,
+      years_served. Order by years_served descending then full_name, limited
+      to 10.
+    difficulty: Medium
+    hint: >-
+      `age(date '2025-01-01', hire_date)` gives an interval; extract the year
+      from it. Use a literal date rather than current_date so the answer is
+      reproducible.
+    solutionSql: |
+      select first_name || ' ' || last_name                                as full_name,
+             hire_date,
+             extract(year from age(date '2025-01-01', hire_date))::int     as years_served
+      from employees
+      order by years_served desc, full_name
+      limit 10
+
+checklist:
+  - "date_trunc returns a timestamp and keeps the type; extract returns a number"
+  - Bucket with date_trunc in GROUP BY, filter on the raw column with a half-open range
+  - "date minus date is an integer number of days; timestamp minus timestamp is an interval"
+  - Month arithmetic clamps to the end of the month and does not round-trip
+  - "date_trunc('week') starts on Monday, per ISO 8601"
+  - "dow numbers Sunday 0; isodow numbers Monday 1"
+  - "concat_ws skips NULLs; || propagates them"
+  - "round halves away from zero on numeric and to even on double precision"
+
+related:
+  - f-data-types
+  - i-json
+  - a-group-by-having
+  - p-indexes
+
+dialect:
+  standard: >-
+    EXTRACT, CAST, SUBSTRING, TRIM, POSITION and the interval type are standard
+    SQL. CURRENT_DATE and CURRENT_TIMESTAMP are too.
+  postgres: >-
+    Adds date_trunc, age, to_char/to_date with its own format strings,
+    split_part, concat_ws, the regex operators and generate_series. `date -
+    date` yielding an integer is a PostgreSQL behaviour. round with a scale
+    argument exists only for numeric.
+  mysql: >-
+    Uses DATE_FORMAT instead of to_char with a completely different format
+    syntax, DATEDIFF for day differences, and DATE_ADD/DATE_SUB rather than
+    interval arithmetic with operators. WEEK() has nine different modes
+    controlled by an argument, which makes "start of week" a configuration
+    question rather than a standard. No split_part; SUBSTRING_INDEX is the
+    nearest equivalent.

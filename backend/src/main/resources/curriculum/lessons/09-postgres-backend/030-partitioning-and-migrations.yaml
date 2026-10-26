@@ -1,0 +1,506 @@
+id: pg-advanced-features
+moduleId: postgres-backend
+position: 30
+title: Partitioning, migrations and operational SQL
+slug: partitioning-and-migrations
+difficulty: Advanced
+estimatedMinutes: 25
+summary: >-
+  Declarative partitioning and what it does and does not solve, plus how to
+  change a schema on a live database without an outage — the questions that
+  separate "can write SQL" from "has run a database".
+tags: [partitioning, migrations, ddl-locks, zero-downtime, operations]
+
+prerequisites:
+  - p-indexes
+  - t-mvcc-locks
+
+objectives:
+  - Say what partitioning actually buys and what it does not
+  - Choose between range, list and hash partitioning
+  - Explain partition pruning and the condition for it to work
+  - Name the DDL operations that take a long exclusive lock and the safe alternatives
+  - Describe the expand-migrate-contract pattern for a breaking schema change
+
+concept: |
+  > The statements in this lesson are DDL and administrative commands, so none
+  > of them run in the read-only playground. The examples query the structures
+  > these commands produce.
+
+  ## Partitioning
+
+  A partitioned table is one logical table made of several physical ones, with
+  rows routed by a key.
+
+  ```sql
+  create table events (
+      event_id bigint,
+      occurred_at timestamptz not null,
+      payload jsonb
+  ) partition by range (occurred_at);
+
+  create table events_2024_01 partition of events
+      for values from ('2024-01-01') to ('2024-02-01');
+  ```
+
+  Three strategies: **range** (dates, id ranges), **list** (region, tenant,
+  status) and **hash** (even distribution when no natural key exists).
+
+  ### What it actually buys
+
+  The honest ranking:
+
+  1. **Cheap bulk deletion.** `DROP TABLE events_2023_01` is instantaneous and
+     reclaims the space immediately. `DELETE FROM events WHERE occurred_at <
+     ...` on the same volume rewrites, bloats, and has to be vacuumed. For
+     time-series data with a retention policy this is the dominant benefit and
+     often the only one that matters.
+  2. **Smaller indexes per partition**, which stay in cache and are faster to
+     maintain.
+  3. **Partition pruning** — the planner skips partitions that cannot match.
+  4. **Parallel maintenance.** VACUUM and ANALYZE run per partition.
+
+  It is **not** a general performance feature. A well-indexed unpartitioned
+  table usually beats a partitioned one for point lookups, because the planner
+  must now consider every partition. Partitioning a table because it is "big"
+  without a retention or pruning story usually makes things worse.
+
+  ### Pruning requires the key in the predicate
+
+  The planner can only skip a partition if the query constrains the partition
+  key with something it can evaluate. `where occurred_at >= '2024-03-01'`
+  prunes. `where event_id = 12345` does not, and reads every partition.
+
+  That is the design constraint: **the partition key must be in the queries
+  you care about**. If your access pattern is by customer and you partition by
+  date, you have gained deletion and lost everything else.
+
+  ### Costs
+
+  - Every unique constraint must include the partition key. That rules out a
+    globally unique natural key that is not part of it.
+  - Foreign keys referencing a partitioned table are supported only from
+    PostgreSQL 12, and have limitations.
+  - More tables, more indexes, more catalogue entries, more planning time.
+  - Cross-partition queries must touch every partition.
+
+  ## Migrations on a live database
+
+  The key fact: **DDL takes locks**, and an `ACCESS EXCLUSIVE` lock blocks
+  everything, including reads.
+
+  Worse, a lock request **queues**. A migration waiting behind a long-running
+  `SELECT` holds its place in the queue, and every subsequent query queues
+  behind the migration. One slow report plus one `ALTER TABLE` is a
+  site-wide outage, and this is the single most common way a "safe" migration
+  takes a system down.
+
+  `SET lock_timeout = '3s'` before DDL is the standard defence: the migration
+  fails fast instead of building a queue, and you retry.
+
+  ### Safe and unsafe operations
+
+  Fast, metadata-only in modern PostgreSQL:
+
+  - `ADD COLUMN` with no default, or with a **non-volatile** default
+    (PostgreSQL 11+)
+  - `DROP COLUMN` (marks it dropped; space is reclaimed later)
+  - `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE CONSTRAINT` separately
+  - `CREATE INDEX CONCURRENTLY`
+  - Renaming a table or column — fast, but breaks every running client
+
+  Slow, rewrites the whole table under an exclusive lock:
+
+  - changing a column type, except for a few widening cases
+  - `ADD COLUMN` with a volatile default
+  - `SET NOT NULL` on a large table (though a matching `CHECK ... NOT VALID`
+    that is then validated lets PostgreSQL 12+ skip the scan)
+  - `VACUUM FULL`, `CLUSTER`
+
+  ### Expand, migrate, contract
+
+  The pattern for any change that would break running code, because during a
+  deploy both the old and new versions are running:
+
+  1. **Expand.** Add the new column or table, nullable, with no constraint.
+     Deploy code that writes **both** old and new.
+  2. **Migrate.** Backfill in batches, committing between them so no single
+     long transaction blocks vacuum.
+  3. **Contract.** Deploy code that reads and writes only the new. Then add
+     the constraint and drop the old column.
+
+  Three deploys for one column rename. That is the price of not having an
+  outage, and the reason "just rename the column" is the wrong answer in an
+  interview about a live system.
+
+  ### Backfilling
+
+  Never `UPDATE` a large table in one statement. It takes one enormous
+  transaction, creates a dead version of every row at once, blocks vacuum for
+  the duration, and cannot be interrupted without losing all the work. Batch
+  by primary key range, commit each batch, and pause between them.
+
+syntax:
+  - form: "CREATE TABLE t (...) PARTITION BY RANGE (col)"
+    notes: >-
+      Also LIST and HASH. The partition key must be in the primary key and in
+      every unique constraint.
+  - form: "CREATE TABLE t_2024_01 PARTITION OF t FOR VALUES FROM (a) TO (b)"
+    notes: Upper bound is exclusive. A DEFAULT partition catches anything unmatched.
+  - form: "ALTER TABLE t DETACH PARTITION p CONCURRENTLY"
+    notes: >-
+      Removes a partition without a long lock. The usual first step of a
+      retention job, followed by DROP TABLE.
+  - form: "ALTER TABLE t ADD CONSTRAINT c CHECK (...) NOT VALID"
+    notes: >-
+      Brief lock, no scan. Existing rows are not checked until VALIDATE
+      CONSTRAINT runs, which takes only a SHARE UPDATE EXCLUSIVE lock.
+  - form: "CREATE INDEX CONCURRENTLY"
+    notes: >-
+      Does not block writes. Cannot run inside a transaction. Can leave an
+      INVALID index if it fails — check and retry.
+  - form: "SET lock_timeout = '3s'"
+    notes: >-
+      Before any DDL on a live system, so a blocked migration fails rather
+      than queueing every subsequent query behind it.
+
+sampleTables: [orders, daily_sales, order_items, employees]
+
+examples:
+  - title: The data shape that wants range partitioning
+    sql: |
+      select date_trunc('month', order_date)::date as month,
+             count(*)                               as orders,
+             count(*) filter (where status = 'completed') as completed,
+             min(order_id)                          as first_id,
+             max(order_id)                          as last_id
+      from orders
+      group by date_trunc('month', order_date)
+      order by month
+    walkthrough: |
+      Time-ordered, append-mostly, and queried by date range. That is the
+      profile partitioning serves.
+
+      Partitioned by month on `order_date`, a retention policy of "keep two
+      years" becomes `DROP TABLE orders_2023_01` — instantaneous, with the
+      space returned immediately. The unpartitioned equivalent is a `DELETE`
+      that rewrites a month of rows, bloats the table, and leaves vacuum to
+      clean up.
+
+      Note the `min(order_id)` and `max(order_id)` columns: ids increase with
+      date here, so a query filtering on `order_id` would **also** prune
+      correctly if partitioned by id. When the two correlate, you get a second
+      useful access path for free. When they do not, you get one.
+
+      On 151 rows none of this is worth doing. The threshold is usually tens
+      of millions of rows or a retention requirement, whichever comes first.
+
+  - title: A query that prunes, and one that cannot
+    sql: |
+      select 'filters on the partition key'      as query_shape,
+             count(*)                             as rows_examined
+      from orders
+      where order_date >= date '2024-01-01'
+        and order_date <  date '2024-04-01'
+      union all
+      select 'filters on a non-key column',
+             count(*)
+      from orders
+      where customer_id = 319
+      order by query_shape
+    walkthrough: |
+      If `orders` were partitioned by `order_date`, the first query would
+      touch three monthly partitions and the planner would skip the rest
+      entirely — visible in `EXPLAIN` as most partitions being absent from the
+      plan.
+
+      The second constrains `customer_id`, which is not the partition key.
+      Every partition must be searched, so partitioning has added planning
+      overhead and given nothing back for this query shape.
+
+      That asymmetry is the whole design question. Partitioning optimises the
+      access patterns that include the key and penalises the ones that do
+      not — so the key has to come from how the table is actually queried, not
+      from what is convenient to split on.
+
+  - title: A backfill, batched the way a migration should be
+    sql: |
+      select min(order_id)                                     as batch_start,
+             max(order_id)                                     as batch_end,
+             count(*)                                          as rows_in_batch,
+             count(*) filter (where ship_date is null)         as would_need_backfill
+      from orders
+      where order_id >= 1001
+        and order_id <  1051
+    walkthrough: |
+      One batch of a backfill: a half-open primary-key range, sized so the
+      statement completes quickly.
+
+      The real migration would be
+      `UPDATE orders SET new_col = ... WHERE order_id >= 1001 AND order_id <
+      1051 AND new_col IS NULL`, committed, then the next range.
+
+      Three reasons the batching matters. A single `UPDATE` over the whole
+      table is one enormous transaction that blocks vacuum for its entire
+      duration. It creates a dead version of every row at once, roughly
+      doubling the table's size. And if it is interrupted at 90%, all the work
+      is lost — whereas a batched backfill resumes from where it stopped,
+      which is why the `new_col IS NULL` predicate is there.
+
+      Batch size is a trade between transaction length and total overhead.
+      A few thousand rows is a reasonable starting point, tuned by measuring.
+
+  - title: What a long-running query does to a queued migration
+    sql: |
+      select count(*)                                          as rows,
+             count(distinct customer_id)                       as customers,
+             round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2) as revenue
+      from orders o
+      join order_items oi on oi.order_id = o.order_id
+    walkthrough: |
+      A reporting query like this takes an `ACCESS SHARE` lock on both tables
+      and holds it until it finishes. On a large table that could be minutes.
+
+      Now suppose a deployment runs `ALTER TABLE orders ADD COLUMN ...`. It
+      needs `ACCESS EXCLUSIVE`, which conflicts, so it waits — **and takes a
+      place in the lock queue**. Every query arriving afterwards, including
+      trivial primary-key lookups, queues behind the migration.
+
+      The result is that one slow report plus one harmless `ALTER TABLE`
+      produces a total outage on that table, and the `ALTER TABLE` itself
+      would have taken a millisecond.
+
+      `SET lock_timeout = '3s'` before the DDL is the fix: the migration gives
+      up rather than building a queue, and the deploy retries. It is one line
+      and it is the difference between a failed migration and a failed
+      service.
+
+edgeCases:
+  - title: Adding a column with a default is cheap now and used to be expensive
+    body: >-
+      Before PostgreSQL 11, `ADD COLUMN ... DEFAULT x` rewrote the entire
+      table under an exclusive lock, so the standard advice was to add the
+      column nullable and backfill. From 11 onwards a non-volatile default is
+      stored in the catalogue and applied on read, making it a metadata-only
+      change. A volatile default such as `random()` still rewrites. Knowing
+      which version introduced the change is the difference between following
+      current advice and following advice from 2017.
+    sql: |
+      select column_name,
+             data_type,
+             is_nullable,
+             column_default
+      from information_schema.columns
+      where table_schema = 'learning'
+        and table_name   = 'employees'
+        and column_default is not null
+      order by ordinal_position
+
+  - title: A unique constraint on a partitioned table must include the key
+    body: >-
+      employees.email is globally unique here, which an unpartitioned table
+      supports trivially. Partition the table by hire_date and that constraint
+      becomes impossible — every unique index must include the partition key,
+      so the best available is uniqueness of (email, hire_date), which permits
+      the same email on two different dates. There is no way around it short
+      of a separate table of emails, and it is the constraint that most often
+      rules partitioning out.
+    sql: |
+      select count(*)                      as employees,
+             count(distinct email)         as distinct_emails,
+             count(distinct hire_date)     as distinct_hire_dates,
+             count(distinct (email, hire_date)) as distinct_pairs
+      from employees
+
+pitfalls:
+  - mistake: Partitioning a table because it is large
+    why: >-
+      Without a retention requirement or a query pattern that includes the
+      partition key, partitioning adds planning overhead, constrains unique
+      constraints, and gives nothing back. A well-indexed unpartitioned table
+      is usually faster for point lookups.
+    fix: >-
+      Partition for bulk deletion or for pruning on a key your queries
+      actually use. If neither applies, index better instead.
+
+  - mistake: Running DDL without a lock timeout
+    why: >-
+      A blocked DDL statement queues, and every query behind it queues too. A
+      millisecond operation becomes a site-wide outage because one report was
+      running.
+    fix: >-
+      `SET lock_timeout` to a few seconds before any DDL on a live system, and
+      retry on failure. Some tools do this automatically; verify yours does.
+
+  - mistake: Backfilling with a single UPDATE
+    why: >-
+      One transaction over millions of rows blocks vacuum for its duration,
+      doubles the table's physical size with dead versions, and loses all
+      progress if interrupted.
+    fix: >-
+      Batch by primary-key range, commit each batch, include a predicate that
+      skips already-migrated rows so it is resumable, and pause between
+      batches to let autovacuum keep up.
+
+  - mistake: Renaming a column in one deploy
+    why: >-
+      During a rolling deploy both versions of the application are running.
+      One of them references a column that no longer exists.
+    fix: >-
+      Expand, migrate, contract — three deploys. Add the new column and write
+      both, backfill, then switch reads and drop the old column.
+
+performance: |
+  Partition pruning happens at **plan time** when the predicate uses
+  constants, and at **execution time** for parameters and nested-loop join
+  keys (PostgreSQL 11+). Execution-time pruning is why a prepared statement
+  with a parameterised date still prunes, which was not true in earlier
+  versions.
+
+  The planning cost grows with the partition count. A few hundred partitions
+  is routine; several thousand slows planning measurably, and tens of
+  thousands is a problem in itself. Partition granularity should be chosen so
+  the count stays bounded — monthly rather than daily for a table kept five
+  years.
+
+  `CREATE INDEX CONCURRENTLY` makes two passes over the table and waits for
+  all transactions that started before it, so it is considerably slower than
+  the blocking version and can be delayed indefinitely by a long-running
+  transaction. It cannot run inside a transaction block, and a failure leaves
+  an `INVALID` index that must be dropped and recreated — so a migration tool
+  must check `pg_index.indisvalid` afterwards.
+
+  `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID` takes a brief
+  `ACCESS EXCLUSIVE` lock and no scan; the subsequent `VALIDATE CONSTRAINT`
+  takes only `SHARE UPDATE EXCLUSIVE`, which permits reads and writes while it
+  scans. Splitting the operation this way is how constraints get added to
+  large production tables, and it is the single most useful trick in this
+  lesson.
+
+interviewQuestions:
+  - question: When would you partition a table, and what does it actually buy?
+    answer: >-
+      Primarily for cheap bulk deletion: dropping a partition is instantaneous
+      and reclaims space, where a DELETE of the same volume rewrites rows,
+      bloats the table and leaves vacuum work behind. Secondarily for partition
+      pruning, smaller per-partition indexes and parallel maintenance.
+      Crucially it is not a general performance feature — a well-indexed
+      unpartitioned table usually wins for point lookups. The decision hinges
+      on whether queries include the partition key and whether there is a
+      retention policy; without either, partitioning costs more than it
+      returns.
+
+  - question: How do you add a column to a large live table safely?
+    answer: >-
+      Adding a nullable column, or one with a non-volatile default, is a
+      metadata-only operation in PostgreSQL 11 and later — fast, though it
+      still needs a brief ACCESS EXCLUSIVE lock, so set lock_timeout first so a
+      blocked statement fails rather than queueing every subsequent query
+      behind it. A volatile default still rewrites the table. If the column
+      must end up NOT NULL, add it nullable, backfill in batches, add a CHECK
+      ... NOT VALID, validate it, then SET NOT NULL — which PostgreSQL can then
+      do without a full scan.
+
+  - question: Explain expand-migrate-contract.
+    answer: >-
+      A three-deploy pattern for a schema change that would otherwise break
+      running code, necessary because during a rolling deploy both versions are
+      live. Expand: add the new structure, nullable and unconstrained, and
+      deploy code that writes both old and new. Migrate: backfill existing rows
+      in batches. Contract: deploy code that uses only the new structure, then
+      add constraints and drop the old. It is slower and more work than a
+      single migration, and it is the only way to make a breaking change
+      without downtime.
+
+  - question: Why can a harmless ALTER TABLE cause an outage?
+    answer: >-
+      Because DDL needs an ACCESS EXCLUSIVE lock and lock requests queue. If a
+      long-running SELECT holds an ACCESS SHARE lock, the ALTER waits — and
+      every query arriving after it waits behind the ALTER, including ones
+      that would not have conflicted with the SELECT. One slow report plus a
+      millisecond ALTER becomes a total outage on that table. Setting
+      lock_timeout before DDL makes the migration fail fast instead of
+      building the queue.
+
+exercises:
+  - prompt: >-
+      Show how orders would divide into monthly range partitions: the month,
+      the row count, and the id range in each. Columns month, orders,
+      min_order_id, max_order_id. Order by month.
+    difficulty: Easy
+    hint: date_trunc on order_date, grouped.
+    solutionSql: |
+      select date_trunc('month', order_date)::date as month,
+             count(*)                               as orders,
+             min(order_id)                          as min_order_id,
+             max(order_id)                          as max_order_id
+      from orders
+      group by date_trunc('month', order_date)
+      order by month
+
+  - prompt: >-
+      Check whether order_id correlates with order_date, which determines
+      whether a query filtering on id would also prune a date-partitioned
+      table. Return the first and last order of each quarter. Columns
+      quarter, first_id, last_id, orders. Order by quarter.
+    difficulty: Medium
+    hint: date_trunc to the quarter, with min and max of order_id.
+    solutionSql: |
+      select date_trunc('quarter', order_date)::date as quarter,
+             min(order_id) as first_id,
+             max(order_id) as last_id,
+             count(*)      as orders
+      from orders
+      group by date_trunc('quarter', order_date)
+      order by quarter
+
+  - prompt: >-
+      Produce the batch boundaries for a backfill of order_items in chunks of
+      50 orders, showing each batch's order_id range and row count. Columns
+      batch, batch_start, batch_end, rows. Order by batch.
+    difficulty: Hard
+    hint: >-
+      Integer-divide order_id by 50 to form the batch number, then group by
+      it.
+    solutionSql: |
+      select (order_id / 50)        as batch,
+             min(order_id)          as batch_start,
+             max(order_id)          as batch_end,
+             count(*)               as rows
+      from order_items
+      group by (order_id / 50)
+      order by batch
+
+checklist:
+  - "Partitioning's main win is instantaneous bulk deletion, not general speed"
+  - Pruning only happens when the query constrains the partition key
+  - Every unique constraint on a partitioned table must include the partition key
+  - "DDL takes ACCESS EXCLUSIVE, and a blocked DDL queues every query behind it"
+  - "SET lock_timeout before any DDL on a live system"
+  - "ADD COLUMN with a non-volatile default is metadata-only from PostgreSQL 11"
+  - "ADD CONSTRAINT NOT VALID then VALIDATE splits a long lock into a brief one plus a slow scan"
+  - "Backfill in resumable batches; expand-migrate-contract for breaking changes"
+
+related:
+  - p-indexes
+  - t-mvcc-locks
+  - pg-backend-integration
+  - s-keys-constraints
+
+dialect:
+  standard: >-
+    DDL statements are standard SQL in outline, but the locking behaviour,
+    partitioning syntax and online-change capabilities are entirely
+    implementation-specific.
+  postgres: >-
+    Declarative partitioning from version 10, with execution-time pruning from
+    11 and DETACH PARTITION CONCURRENTLY from 14. Non-volatile column defaults
+    are metadata-only from 11. CREATE INDEX CONCURRENTLY and ADD CONSTRAINT
+    NOT VALID are the two essential online-change tools. DDL is transactional,
+    which is unusual and valuable — a failed migration rolls back cleanly.
+  mysql: >-
+    DDL is not transactional before 8.0 and only partially so afterwards, so a
+    failed migration can leave a half-applied schema — which is why tools such
+    as gh-ost and pt-online-schema-change exist, copying the table and swapping
+    it. MySQL's own ALGORITHM=INPLACE covers many cases online. MySQL
+    partitioning has similar restrictions on unique keys.

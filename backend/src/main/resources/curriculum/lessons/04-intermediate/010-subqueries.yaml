@@ -1,0 +1,441 @@
+id: i-subqueries
+moduleId: intermediate
+position: 10
+title: Subqueries in every position
+slug: subqueries
+difficulty: Intermediate
+estimatedMinutes: 25
+summary: >-
+  A SELECT can appear in the select list, in FROM, in WHERE and in HAVING, and
+  it means something different in each. Scalar, row, table and correlated
+  subqueries, and when each one is the right tool.
+tags: [subqueries, scalar-subquery, derived-table, correlated]
+
+prerequisites:
+  - j-exists-in
+
+objectives:
+  - Identify the four positions a subquery can occupy and what each requires
+  - Write a scalar subquery and say what happens when it returns two rows
+  - Use a derived table and explain why it must be aliased
+  - Recognise a correlated subquery and reason about its cost
+  - Decide between a subquery, a join and a CTE for a given problem
+
+concept: |
+  ## Where a subquery can go
+
+  **In the select list** — a **scalar subquery**. It must return at most one row
+  and exactly one column. Zero rows gives NULL; two rows is a runtime error.
+
+  ```sql
+  select c.company_name,
+         (select count(*) from orders o where o.customer_id = c.customer_id) as orders
+  from customers c
+  ```
+
+  **In FROM** — a **derived table**. It must be aliased, even if the alias is
+  never used, because the grammar requires every FROM item to have a name.
+
+  ```sql
+  from (select dept_id, avg(salary) as avg_salary from employees group by dept_id) d
+  ```
+
+  **In WHERE or HAVING** — a predicate subquery, with `IN`, `EXISTS`, `ANY`,
+  `ALL`, or as a scalar on one side of a comparison.
+
+  **In the FROM clause with LATERAL** — covered in the self-join lesson: a
+  derived table that can see the rows beside it.
+
+  ## Correlated or not
+
+  An **uncorrelated** subquery can be evaluated once, independently. A
+  **correlated** one references a column from the outer query and is
+  conceptually evaluated per outer row.
+
+  ```sql
+  -- uncorrelated: one evaluation
+  where salary > (select avg(salary) from employees)
+
+  -- correlated: once per outer row, conceptually
+  where salary > (select avg(e2.salary) from employees e2 where e2.dept_id = e.dept_id)
+  ```
+
+  "Conceptually" matters. PostgreSQL frequently rewrites a correlated subquery
+  into a join or a hash aggregate, so the naive per-row cost is often not what
+  happens. But it is sometimes exactly what happens, and a correlated scalar
+  subquery over a large outer set is one of the classic slow patterns.
+
+  ## Scalar subquery semantics
+
+  Three cases, and only one of them is an error:
+
+  - one row → that value
+  - zero rows → **NULL**, silently
+  - two or more rows → `ERROR: more than one row returned by a subquery used as
+    an expression`
+
+  The silent NULL is the one to watch. A scalar subquery that stops matching
+  returns NULL rather than failing, so a column quietly becomes empty.
+
+  ## Choosing between the forms
+
+  For "does a match exist", use `EXISTS`. For "a value computed from a related
+  table", a scalar subquery reads well for one column and badly for four — at
+  which point a join or a derived table is clearer and cheaper, because four
+  scalar subqueries are four passes.
+
+  For a multi-step calculation, a **CTE** is usually better than a nested
+  derived table, because `WITH a AS (...), b AS (...)` reads top to bottom while
+  nested `FROM (SELECT ... FROM (SELECT ...))` reads inside out.
+
+  ## Row constructors
+
+  A subquery can also return a **row**, compared with a row constructor:
+
+  ```sql
+  where (dept_id, salary) = (select dept_id, max(salary) from employees where dept_id = 10)
+  where (order_date, order_id) > (date '2023-06-14', 1042)
+  ```
+
+  The second form is keyset pagination; the comparison is lexicographic, which
+  is exactly what matches a multi-column sort.
+
+syntax:
+  - form: "SELECT (SELECT ... ) AS alias FROM ..."
+    notes: >-
+      Scalar subquery. At most one row and one column. Zero rows yields NULL.
+  - form: "FROM (SELECT ...) alias"
+    notes: >-
+      Derived table. The alias is mandatory. Cannot reference other FROM items
+      unless preceded by LATERAL.
+  - form: "WHERE col operator (SELECT ...)"
+    notes: Scalar comparison. Two rows from the subquery is a runtime error.
+  - form: "WHERE (a, b) = (SELECT x, y FROM ...)"
+    notes: >-
+      Row comparison. Compares lexicographically for the inequality operators.
+  - form: "HAVING aggregate operator (SELECT ...)"
+    notes: >-
+      A subquery in HAVING is evaluated against the groups, which is how you
+      compare a group's aggregate to a global one.
+
+sampleTables: [employees, departments, customers, orders, order_items, products]
+
+examples:
+  - title: Scalar subqueries in the select list
+    sql: |
+      select c.customer_id,
+             c.company_name,
+             (select count(*) from orders o
+              where o.customer_id = c.customer_id)                    as orders,
+             (select max(o.order_date) from orders o
+              where o.customer_id = c.customer_id)                    as last_order,
+             (select count(*) from orders o
+              where o.customer_id = c.customer_id
+                and o.status = 'cancelled')                           as cancelled
+      from customers c
+      where c.customer_id between 301 and 308
+      order by c.customer_id
+    walkthrough: |
+      Three correlated scalar subqueries, each returning one value per customer.
+      It reads clearly and it reads like a spreadsheet, which is why people
+      write it.
+
+      The cost is that it is three separate lookups into `orders` per customer.
+      For eight customers that is nothing. For eighty thousand it is three
+      index scans each, where a single `LEFT JOIN ... GROUP BY` with three
+      filtered aggregates would make one pass.
+
+      Note also what a scalar subquery does for a customer with no orders:
+      `count` returns 0 — aggregates over an empty set still return a row — but
+      `max` returns NULL. The two behave differently, consistently with the
+      aggregate rules.
+
+  - title: The same answer as a derived table
+    sql: |
+      select c.customer_id,
+             c.company_name,
+             coalesce(o.orders, 0)    as orders,
+             o.last_order,
+             coalesce(o.cancelled, 0) as cancelled
+      from customers c
+      left join (select customer_id,
+                        count(*)                                     as orders,
+                        max(order_date)                              as last_order,
+                        count(*) filter (where status = 'cancelled') as cancelled
+                 from orders
+                 group by customer_id) o on o.customer_id = c.customer_id
+      where c.customer_id between 301 and 308
+      order by c.customer_id
+    walkthrough: |
+      Same result, one pass over `orders`. The derived table aggregates once;
+      the LEFT JOIN attaches the result; `coalesce` turns a missing group into
+      zero.
+
+      The alias `o` on the derived table is required by the grammar even though
+      a query could be written that never uses it.
+
+      The trade is readability for scale. At eight customers the previous
+      version is clearer. At eight hundred thousand this one is the only one
+      that finishes, and the shape — aggregate once, join once — is the one to
+      reach for by default on anything fact-table-sized.
+
+  - title: A correlated subquery comparing a row to its group
+    sql: |
+      select e.emp_id,
+             e.first_name || ' ' || e.last_name as employee,
+             e.dept_id,
+             e.salary,
+             (select round(avg(e2.salary), 0)
+              from employees e2
+              where e2.dept_id = e.dept_id)     as dept_average
+      from employees e
+      where e.salary > (select avg(e2.salary)
+                        from employees e2
+                        where e2.dept_id = e.dept_id)
+      order by e.dept_id, e.salary desc
+    walkthrough: |
+      "Everyone paid above their own department's average." The subquery is
+      correlated on `e.dept_id`, so it computes a different average for each
+      outer row's department.
+
+      Writing it twice — once in `WHERE` and once in the select list — is
+      duplication the window-functions module removes entirely:
+      `avg(salary) over (partition by dept_id)` computes it once and makes it
+      available as a column.
+
+      This is a good example of a correlated subquery that PostgreSQL does not
+      have to run forty times: it can compute the per-department averages once
+      and hash-join them. `EXPLAIN` tells you which happened, and the answer
+      depends on the statistics.
+
+  - title: Subqueries in WHERE and HAVING together
+    sql: |
+      select d.dept_name,
+             count(*)                 as employees,
+             round(avg(e.salary), 0)  as avg_salary
+      from employees e
+      join departments d on d.dept_id = e.dept_id
+      where e.hire_date <= (select max(hire_date) from employees where dept_id = 10)
+      group by d.dept_name
+      having avg(e.salary) > (select avg(salary) from employees)
+      order by avg_salary desc
+    walkthrough: |
+      Two uncorrelated scalar subqueries doing different jobs. The one in
+      `WHERE` filters rows against a single value computed once. The one in
+      `HAVING` compares each group's average against the company-wide average,
+      also computed once.
+
+      Neither can be moved to the other clause. The `WHERE` subquery is about
+      individual rows and the `HAVING` one is about groups, which is the same
+      distinction as always.
+
+      Both are evaluated exactly once, because neither references the outer
+      query. PostgreSQL marks such subqueries as `InitPlan` in EXPLAIN output,
+      which is a useful thing to recognise: it means "computed once up front".
+
+edgeCases:
+  - title: A scalar subquery returning no rows is NULL, not an error
+    body: >-
+      The first column is NULL because no such department exists. No error, no
+      warning. A scalar subquery that stops matching — because data changed or a
+      filter was tightened — turns a column into NULLs silently, which then
+      propagate through any arithmetic. The second column shows the COALESCE
+      guard.
+    sql: |
+      select (select dept_name from departments where dept_id = 999)          as missing,
+             coalesce((select dept_name from departments where dept_id = 999),
+                      '(no such department)')                                 as guarded,
+             (select dept_name from departments where dept_id = 10)           as found
+
+  - title: A derived table cannot see its siblings without LATERAL
+    body: >-
+      Two derived tables joined on their outputs is fine — each is evaluated
+      independently and then joined. What is not allowed is one of them
+      referencing a column of the other inside its own body; that requires
+      LATERAL. The distinction is about when the correlation happens, not about
+      what the query means.
+    sql: |
+      select a.dept_id, a.headcount, b.avg_salary
+      from (select dept_id, count(*) as headcount
+            from employees where dept_id is not null group by dept_id) a
+      join (select dept_id, round(avg(salary), 0) as avg_salary
+            from employees where dept_id is not null group by dept_id) b
+        on b.dept_id = a.dept_id
+      order by a.dept_id
+
+pitfalls:
+  - mistake: A scalar subquery that can return more than one row
+    why: >-
+      It works until the data changes. `(select dept_id from employees where
+      last_name = 'Menon')` is fine while there is one Menon and a runtime error
+      when there are two — and in this dataset there already are.
+    fix: >-
+      Add an aggregate, a LIMIT with an ORDER BY, or restructure as a join.
+      Prefer whichever makes the choice between the rows explicit.
+
+  - mistake: Several correlated scalar subqueries over the same table
+    why: >-
+      Each is a separate lookup per outer row. Four columns from the same
+      related table means four passes where one join would do.
+    fix: >-
+      Aggregate once in a derived table or CTE and LEFT JOIN it. Use filtered
+      aggregates for the different conditions.
+
+  - mistake: Forgetting to alias a derived table
+    why: >-
+      PostgreSQL reports `subquery in FROM must have an alias`, which is clear
+      once seen and baffling the first time.
+    fix: >-
+      Alias it, even when unused. Pick a name that says what the subquery
+      produces rather than `t`.
+
+  - mistake: Nesting derived tables three deep
+    why: >-
+      The query must be read inside out, and each level's purpose is only
+      apparent after reading the one inside it.
+    fix: >-
+      Rewrite as a CTE chain. Same plan in PostgreSQL 12 and later, and it reads
+      in the order the steps happen.
+
+performance: |
+  **Uncorrelated** scalar subqueries are evaluated once and appear as `InitPlan`
+  in EXPLAIN. They are effectively free.
+
+  **Correlated** subqueries are where the cost is. PostgreSQL will often
+  "decorrelate" them into joins or aggregates, but not always — particularly
+  when the subquery contains a LIMIT, a volatile function, or an aggregate the
+  planner cannot pull up. A correlated subquery in the select list of a query
+  returning a million rows is the classic case where it does not.
+
+  A derived table is not an optimisation fence: the planner pushes predicates
+  into it and can flatten it into the outer query entirely. That is why
+  rewriting a simple subquery as a join often changes nothing in the plan.
+
+  `IN (subquery)` and `EXISTS` become semi-joins; a scalar subquery in the
+  select list does not and cannot, because it must produce a value for every
+  outer row including the non-matching ones.
+
+interviewQuestions:
+  - question: What is the difference between a correlated and an uncorrelated subquery?
+    answer: >-
+      An uncorrelated subquery can be evaluated independently of the outer
+      query, so it runs once; PostgreSQL shows it as an InitPlan. A correlated
+      subquery references a column from the outer query, so conceptually it is
+      evaluated once per outer row. In practice the planner frequently
+      decorrelates it into a join or a grouped aggregate, so the per-row cost is
+      not guaranteed — but it is not guaranteed away either, and a correlated
+      scalar subquery over a large result set is a common performance problem.
+
+  - question: What happens if a scalar subquery returns two rows?
+    answer: >-
+      A runtime error — "more than one row returned by a subquery used as an
+      expression". It is a runtime error rather than a planning error, so it
+      depends on the data: the query works until a second matching row exists.
+      Zero rows is not an error and yields NULL, which is the more dangerous
+      case because it is silent. Guard with an aggregate, with LIMIT 1 plus a
+      deterministic ORDER BY, or by restructuring as a join.
+
+  - question: When would you use a subquery instead of a join?
+    answer: >-
+      When the question is existence — EXISTS avoids the fan-out a join
+      introduces. When you need a single aggregated value from a related table
+      and a join would complicate the grouping. When the subquery expresses a
+      step in a calculation, in which case a CTE is usually better still.
+      Conversely, use a join when you need several columns from the related
+      table, or when several scalar subqueries would each cost a pass over the
+      same data.
+
+  - question: Why must a derived table have an alias?
+    answer: >-
+      Because every item in the FROM clause needs a name for its columns to be
+      referenced unambiguously, and a subquery has no inherent name the way a
+      table does. PostgreSQL enforces it even when the alias is unused, which is
+      stricter than the requirement strictly needs to be but removes a class of
+      ambiguity. Oracle does not require it, which is a portability difference
+      worth knowing.
+
+exercises:
+  - prompt: >-
+      List employees earning more than the company-wide average salary. Columns
+      emp_id, full_name, salary, ordered by salary descending.
+    difficulty: Easy
+    hint: One uncorrelated scalar subquery in WHERE.
+    solutionSql: |
+      select emp_id,
+             first_name || ' ' || last_name as full_name,
+             salary
+      from employees
+      where salary > (select avg(salary) from employees)
+      order by salary desc, emp_id
+
+  - prompt: >-
+      For each department, return its name, its headcount and the headcount of
+      the largest department, so each row can be compared to the maximum.
+      Columns dept_name, headcount, largest_department. Order by headcount
+      descending.
+    difficulty: Medium
+    hint: >-
+      Group in a derived table, then use an uncorrelated scalar subquery over
+      the same derived table — or repeat it. A CTE would let you reuse it.
+    solutionSql: |
+      select d.dept_name,
+             count(e.emp_id) as headcount,
+             (select max(n) from (select count(*) as n
+                                  from employees
+                                  where dept_id is not null
+                                  group by dept_id) x) as largest_department
+      from departments d
+      left join employees e on e.dept_id = d.dept_id
+      group by d.dept_name
+      order by headcount desc, d.dept_name
+
+  - prompt: >-
+      Return each product together with how many distinct orders it has
+      appeared on, including products that have never been ordered. Columns
+      product_id, product_name, orders. Order by orders descending then
+      product_id, limited to 10 rows.
+    difficulty: Medium
+    hint: >-
+      A correlated scalar subquery with count(distinct order_id) reads well
+      here, and count returns 0 rather than NULL for the never-ordered ones.
+    solutionSql: |
+      select p.product_id,
+             p.product_name,
+             (select count(distinct oi.order_id)
+              from order_items oi
+              where oi.product_id = p.product_id) as orders
+      from products p
+      order by orders desc, p.product_id
+      limit 10
+
+checklist:
+  - "A subquery can appear in the select list, in FROM, in WHERE and in HAVING"
+  - "A scalar subquery must return at most one row: zero gives NULL, two is an error"
+  - A derived table must be aliased
+  - A derived table cannot reference its siblings unless preceded by LATERAL
+  - Correlated means it references the outer query and conceptually runs per row
+  - PostgreSQL often decorrelates, but not when a LIMIT or volatile function is involved
+  - Several scalar subqueries over one table should usually be one join to an aggregate
+  - Nested derived tables read inside out — prefer a CTE chain
+
+related:
+  - j-exists-in
+  - i-ctes
+  - w-basics
+  - a-conditional-aggregation
+
+dialect:
+  standard: >-
+    Subqueries in all four positions, scalar subquery semantics and row
+    constructors are all standard SQL.
+  postgres: >-
+    Requires an alias on derived tables, supports LATERAL, and decorrelates many
+    subqueries automatically. Shows uncorrelated subqueries as InitPlan and
+    correlated ones as SubPlan in EXPLAIN, which is the quickest way to tell
+    which you have.
+  mysql: >-
+    Also requires a derived-table alias. Older versions executed `IN (subquery)`
+    extremely poorly, re-running it per outer row, which is the origin of the
+    widespread advice to rewrite subqueries as joins — advice that no longer
+    applies to modern MySQL and never applied to PostgreSQL. Oracle does not
+    require a derived-table alias at all.

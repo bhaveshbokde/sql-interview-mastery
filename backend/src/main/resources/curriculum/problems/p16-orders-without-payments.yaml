@@ -1,0 +1,349 @@
+id: p16-orders-without-payments
+position: 150
+title: Orders that do not reconcile with their payments
+slug: orders-without-payments
+difficulty: Hard
+topic: Joins
+tags: [reconciliation, fan-out, anti-join, multiple-aggregations]
+
+orderSensitive: false
+
+statement: |
+  Find completed orders whose payments do not cover their total, including
+  those with no payments at all.
+
+  For each, return the order total, the amount paid, the shortfall and the
+  number of payments. Treat "no payments" as zero paid, not as unknown.
+
+  Order total is the sum of `quantity * unit_price * (1 - discount)` over its
+  lines.
+
+tables: [orders, order_items, payments]
+
+expectedColumns: [order_id, order_date, order_total, paid, shortfall, payments]
+
+edgeCases:
+  - >-
+    An order with no payment rows must appear with paid = 0, not be dropped
+    and not show NULL.
+  - >-
+    Joining orders to both order_items and payments in one query multiplies
+    them — this is the central trap.
+  - >-
+    An order with no line items has a total of zero and cannot be short, so
+    it must not appear.
+  - >-
+    Floating-point comparison would be unsafe here; the columns are numeric,
+    so equality is exact.
+
+hints:
+  - Two one-to-many relationships in one query is one too many.
+  - Aggregate each side at its own grain before combining them.
+  - Which join keeps orders that have no payments at all?
+
+solutionSql: |
+  with order_totals as (
+      select oi.order_id,
+             sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as order_total
+      from order_items oi
+      group by oi.order_id
+  ),
+  payment_totals as (
+      select p.order_id,
+             sum(p.amount) as paid,
+             count(*)      as payments
+      from payments p
+      group by p.order_id
+  )
+  select o.order_id,
+         o.order_date,
+         round(t.order_total, 2)                                  as order_total,
+         round(coalesce(pt.paid, 0), 2)                           as paid,
+         round(t.order_total - coalesce(pt.paid, 0), 2)           as shortfall,
+         coalesce(pt.payments, 0)                                 as payments
+  from orders o
+  join order_totals t       on t.order_id = o.order_id
+  left join payment_totals pt on pt.order_id = o.order_id
+  where o.status = 'completed'
+    and t.order_total > coalesce(pt.paid, 0)
+  order by shortfall desc, o.order_id
+
+explanation:
+  lineByLine:
+    - clause: "with order_totals as (... group by oi.order_id)"
+      note: >-
+        Collapses order lines to one row per order **before** anything else
+        joins to it. This is the step that prevents the fan-out.
+    - clause: "with payment_totals as (... group by p.order_id)"
+      note: >-
+        The same for payments. Two independent aggregations at their own
+        grains, each producing at most one row per order.
+    - clause: "join order_totals t"
+      note: >-
+        Inner, deliberately. An order with no lines has no total and cannot
+        be short of anything, so it should not appear.
+    - clause: "left join payment_totals pt"
+      note: >-
+        Outer, equally deliberately. An order with no payments is exactly the
+        case the question is about, and an inner join would hide it.
+    - clause: "coalesce(pt.paid, 0)"
+      note: >-
+        Turns "no payment rows" into zero paid. Without it the comparison
+        `t.order_total > NULL` is NULL, not true, and every unpaid order
+        would be silently excluded — the opposite of what was asked.
+
+  walkthrough: |
+    `order_totals` produces one row per order that has lines; `payment_totals`
+    one row per order that has payments. Neither can multiply the other
+    because each is already one row per order.
+
+    The main query joins both to `orders`, inner to totals and outer to
+    payments. Sixteen orders have no payment rows at all, and the COALESCE
+    gives each of them `paid = 0` so the comparison includes them.
+
+    The result is dominated by those unpaid orders, whose shortfall equals
+    their entire total. Partially paid orders appear further down with
+    smaller shortfalls.
+
+    The structural point is the one worth taking away: the moment a query
+    touches two one-to-many relationships, the aggregates have to be computed
+    separately. There is no clever single-join arrangement that avoids it.
+
+  alternatives:
+    - title: Correlated scalar subqueries
+      sql: |
+        select o.order_id,
+               o.order_date,
+               round((select sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                      from order_items oi where oi.order_id = o.order_id), 2) as order_total,
+               round(coalesce((select sum(p.amount) from payments p
+                               where p.order_id = o.order_id), 0), 2)          as paid,
+               coalesce((select count(*) from payments p
+                         where p.order_id = o.order_id), 0)                    as payments
+        from orders o
+        where o.status = 'completed'
+          and (select sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+               from order_items oi where oi.order_id = o.order_id)
+              > coalesce((select sum(p.amount) from payments p
+                          where p.order_id = o.order_id), 0)
+        order by o.order_id
+      when: >-
+        Readable for a handful of orders and quadratic beyond that — five
+        correlated subqueries per order, two of them repeated in the WHERE
+        clause. It is equivalent, and it is the version that becomes a
+        production incident when the orders table grows.
+      equivalent: true
+
+    - title: LATERAL, aggregating once per order
+      sql: |
+        select o.order_id,
+               o.order_date,
+               round(t.order_total, 2)                        as order_total,
+               round(coalesce(pt.paid, 0), 2)                 as paid,
+               round(t.order_total - coalesce(pt.paid, 0), 2) as shortfall,
+               coalesce(pt.payments, 0)                       as payments
+        from orders o
+        join lateral (select sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as order_total
+                      from order_items oi where oi.order_id = o.order_id) t on t.order_total is not null
+        left join lateral (select sum(p.amount) as paid, count(*) as payments
+                           from payments p where p.order_id = o.order_id) pt on true
+        where o.status = 'completed'
+          and t.order_total > coalesce(pt.paid, 0)
+        order by shortfall desc, o.order_id
+      when: >-
+        When the outer set is small — a single order, or today's orders —
+        because each lateral aggregate is an indexed lookup rather than a
+        full aggregation of both child tables. For a whole-table report the
+        CTE version is better, since it aggregates each child table once.
+      equivalent: true
+
+  performance: |
+    The CTE version aggregates `order_items` once and `payments` once, then
+    performs two hash joins. Cost is roughly two full scans plus two hash
+    builds, independent of how many orders are examined — which is why it is
+    the right shape for a whole-table reconciliation.
+
+    The correlated version performs five indexed lookups per order. For one
+    order that is far cheaper; for 151 it is comparable; for a million it is
+    hopeless. The crossover is governed by how many orders the outer query
+    returns, which is the general rule for correlated-versus-aggregated.
+
+    `idx_orders_customer` does not help here. What would is an index on
+    `payments(order_id)`, which does not exist in this schema — a missing
+    foreign-key index, and exactly the omission the indexes lesson warns
+    about. On a large payments table it is the difference between a hash
+    aggregate over everything and a set of index-only scans.
+
+    The LATERAL form depends entirely on those indexes existing. Without
+    them, each lateral aggregate is a sequential scan and the query is
+    quadratic.
+
+  wrongApproaches:
+    - title: Joining both children in one query
+      sql: |
+        select o.order_id,
+               round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2) as inflated_total,
+               round(sum(p.amount), 2)                                        as inflated_paid,
+               count(*)                                                       as rows_produced
+        from orders o
+        join order_items oi on oi.order_id = o.order_id
+        left join payments p on p.order_id = o.order_id
+        where o.status = 'completed'
+          and o.order_id in (1005, 1006, 1011)
+        group by o.order_id
+        order by o.order_id
+      whyWrong: >-
+        Each order's lines are multiplied by its payments, so the total is
+        inflated by the payment count and the paid amount by the line count.
+        Both numbers are plausible and both are wrong, and `rows_produced`
+        shows the mechanism — far more rows than either child table
+        contributed. This is the single most common cause of a reconciliation
+        report that nobody can make balance.
+
+    - title: Inner join to payments, losing the unpaid orders
+      sql: |
+        with order_totals as (
+            select order_id, sum(quantity * unit_price * (1 - discount)) as order_total
+            from order_items group by order_id
+        ),
+        payment_totals as (
+            select order_id, sum(amount) as paid, count(*) as payments
+            from payments group by order_id
+        )
+        select o.order_id,
+               round(t.order_total, 2)            as order_total,
+               round(pt.paid, 2)                  as paid,
+               round(t.order_total - pt.paid, 2)  as shortfall
+        from orders o
+        join order_totals t   on t.order_id = o.order_id
+        join payment_totals pt on pt.order_id = o.order_id
+        where o.status = 'completed'
+          and t.order_total > pt.paid
+        order by shortfall desc, o.order_id
+      whyWrong: >-
+        The inner join to `payment_totals` drops every order with no payments
+        — which is the worst category and the one the question is most
+        interested in. The report then shows only partially paid orders and
+        looks reassuring.
+
+    - title: Comparing without COALESCE
+      sql: |
+        with order_totals as (
+            select order_id, sum(quantity * unit_price * (1 - discount)) as order_total
+            from order_items group by order_id
+        ),
+        payment_totals as (
+            select order_id, sum(amount) as paid from payments group by order_id
+        )
+        select o.order_id,
+               round(t.order_total, 2) as order_total,
+               round(pt.paid, 2)       as paid
+        from orders o
+        join order_totals t        on t.order_id = o.order_id
+        left join payment_totals pt on pt.order_id = o.order_id
+        where o.status = 'completed'
+          and t.order_total > pt.paid
+        order by o.order_id
+      whyWrong: >-
+        The LEFT JOIN is correct and the WHERE clause undoes it.
+        `order_total > NULL` is NULL, not true, so every unpaid order is
+        filtered out after being carefully preserved by the join. This is the
+        same mistake as filtering the outer side of a LEFT JOIN, in its most
+        expensive form.
+
+  extraTests:
+    - name: Empty order_items and a zero payment (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt has no order_items, so no order has a total and the
+        inner join to order_totals correctly returns nothing. It also has a
+        payment of 0.00, which would otherwise be a tempting thing to treat
+        as "no payment" — it is a payment of zero, and the two are different.
+      sql: |
+        with order_totals as (
+            select oi.order_id,
+                   sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as order_total
+            from order_items oi
+            group by oi.order_id
+        ),
+        payment_totals as (
+            select p.order_id, sum(p.amount) as paid, count(*) as payments
+            from payments p
+            group by p.order_id
+        )
+        select o.order_id,
+               o.order_date,
+               round(t.order_total, 2)                        as order_total,
+               round(coalesce(pt.paid, 0), 2)                 as paid,
+               round(t.order_total - coalesce(pt.paid, 0), 2) as shortfall,
+               coalesce(pt.payments, 0)                       as payments
+        from orders o
+        join order_totals t         on t.order_id = o.order_id
+        left join payment_totals pt on pt.order_id = o.order_id
+        where o.status = 'completed'
+          and t.order_total > coalesce(pt.paid, 0)
+        order by shortfall desc, o.order_id
+
+    - name: The fan-out factor, measured
+      schema: learning
+      note: >-
+        For orders with both lines and payments, the naive double join
+        produces lines × payments rows instead of one. Seeing the multiplier
+        explicitly is the quickest way to convince someone that separate
+        aggregation is not optional.
+      sql: |
+        select o.order_id,
+               l.lines,
+               p.payments,
+               l.lines * p.payments as rows_a_double_join_would_produce
+        from orders o
+        join lateral (select count(*) as lines from order_items oi
+                      where oi.order_id = o.order_id) l on true
+        join lateral (select count(*) as payments from payments pm
+                      where pm.order_id = o.order_id) p on true
+        where l.lines > 0 and p.payments > 1
+        order by rows_a_double_join_would_produce desc, o.order_id
+        limit 10
+
+  followUps:
+    - question: Why can you not join orders to both children in one query?
+      answer: >-
+        Because each join multiplies the other's rows. An order with four
+        lines and two payments produces eight rows, so the line revenue is
+        counted twice and the payment amount four times. Both totals come out
+        inflated by a plausible-looking factor, which is worse than an error.
+        The fix is one fan-out per query: aggregate each child to one row per
+        order first, then join the aggregates.
+
+    - question: Why does the WHERE clause need COALESCE when the join already handles NULLs?
+      answer: >-
+        The LEFT JOIN preserves orders with no payments, and then the WHERE
+        clause evaluates `order_total > NULL`, which is NULL rather than true,
+        so those rows are dropped immediately afterwards. The join and the
+        filter are separate steps and both have to account for the absent
+        row. This is the same mistake as putting an outer-side condition in
+        WHERE, and it is easier to miss here because the join looks correct.
+
+    - question: How would you find overpayments as well?
+      answer: >-
+        Change the comparison to `<>` and report the signed difference, so a
+        negative shortfall is an overpayment. A reconciliation report usually
+        wants both directions and a tolerance — numeric arithmetic is exact
+        here, but if the amounts came from different systems with different
+        rounding, comparing with `abs(difference) > 0.01` is the realistic
+        condition.
+
+    - question: Which index is missing for this query?
+      answer: >-
+        `payments(order_id)`. It is a foreign key and PostgreSQL does not
+        index foreign keys automatically, so the aggregation over payments is
+        a full scan and the LATERAL variant is quadratic. The same omission
+        makes deleting an order scan the whole payments table to check for
+        references. It is the single most common missing index in an
+        otherwise well-designed PostgreSQL schema.
+
+  related:
+    - j-inner-outer
+    - a-group-by-having
+    - i-ctes
+    - p-query-patterns

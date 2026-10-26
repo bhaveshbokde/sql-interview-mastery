@@ -1,0 +1,492 @@
+id: w-frames
+moduleId: windows
+position: 30
+title: Frames, offsets and running totals
+slug: frames-and-offsets
+difficulty: Advanced
+estimatedMinutes: 30
+summary: >-
+  LAG and LEAD for comparing a row to its neighbours, and the frame clause that
+  turns a window aggregate into a running total or a moving average. Also the
+  default frame, which is the subtlest trap in the whole subject.
+tags: [lag, lead, frame, running-total, moving-average, rows-vs-range]
+
+prerequisites:
+  - w-ranking
+
+objectives:
+  - Use LAG and LEAD with offsets and defaults
+  - State the default frame and say what it does to a window aggregate
+  - Distinguish ROWS from RANGE and give a case where they differ
+  - Write a running total and a centred moving average
+  - Use FIRST_VALUE, LAST_VALUE and NTH_VALUE without the LAST_VALUE trap
+
+concept: |
+  ## LAG and LEAD
+
+  `LAG(expr, offset, default)` returns the value from `offset` rows **before**
+  the current row within the partition; `LEAD` looks forward. Both default to
+  an offset of 1 and a default of NULL.
+
+  ```sql
+  lag(revenue)      over (partition by region order by sale_date)
+  lag(revenue, 7)   over (partition by region order by sale_date)
+  lag(revenue, 1, 0) over (partition by region order by sale_date)
+  ```
+
+  This replaces the self-join on "the previous row", and it is strictly better:
+  a self-join needs a key you can compute the predecessor of, which breaks
+  whenever the sequence has gaps. `LAG` takes the previous **row**, whatever
+  its key.
+
+  The third argument matters more than it looks. Without it the first row of
+  each partition gets NULL, which then propagates through any arithmetic. With
+  it you choose what "no previous value" means — often 0, sometimes the current
+  value so the difference is zero.
+
+  ## The frame
+
+  Within a window, a **frame** is the subset of rows the function actually
+  sees, relative to the current row.
+
+  ```
+  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW      -- running total
+  ROWS BETWEEN 6 PRECEDING AND CURRENT ROW              -- trailing 7
+  ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING              -- centred 7
+  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING  -- whole partition
+  ```
+
+  ## The default frame, which catches everyone
+
+  - **No `ORDER BY` in the window** → the frame is the **entire partition**.
+  - **`ORDER BY` present, no frame clause** → the frame is
+    `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
+
+  So adding an `ORDER BY` to a window aggregate silently converts a partition
+  total into a running total:
+
+  ```sql
+  sum(revenue) over (partition by region)                   -- region total
+  sum(revenue) over (partition by region order by sale_date) -- running total
+  ```
+
+  Both are valid, both produce plausible numbers, and nothing indicates which
+  you asked for. If you want the partition total alongside an ordered
+  function, either give that aggregate its own unordered window or spell out
+  `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`.
+
+  ## ROWS versus RANGE
+
+  - **`ROWS`** counts physical rows. "3 preceding" means three rows back.
+  - **`RANGE`** counts by **value** of the ordering column. All rows with the
+    same ordering value are in the frame together — they are *peers*.
+
+  With distinct ordering values they are identical. With ties they are not, and
+  the default frame uses `RANGE`, so:
+
+  ```sql
+  sum(x) over (order by score)   -- includes ALL rows tied on this score
+  sum(x) over (order by score rows unbounded preceding)  -- stops at this row
+  ```
+
+  A running total over a column with duplicate values jumps in steps under
+  `RANGE` and increments one row at a time under `ROWS`. This is the most
+  commonly misunderstood detail in the subject, and the fix is simply to write
+  `ROWS` when you mean rows.
+
+  `RANGE` also accepts value offsets with an ordered numeric or date type —
+  `RANGE BETWEEN INTERVAL '7 days' PRECEDING AND CURRENT ROW` — which is a
+  genuine calendar window rather than a row-count one, and handles missing days
+  correctly where `ROWS 6 PRECEDING` would not.
+
+  PostgreSQL 11 added `GROUPS`, which counts peer groups rather than rows or
+  values.
+
+  ## FIRST_VALUE, LAST_VALUE, NTH_VALUE
+
+  `FIRST_VALUE(expr)` returns the first value in the frame; `LAST_VALUE` the
+  last; `NTH_VALUE(expr, n)` the nth.
+
+  **`LAST_VALUE` with the default frame returns the current row's value**,
+  because the default frame ends at the current row. That is not a bug and it
+  is almost never what anyone wants. The fix is explicit:
+
+  ```sql
+  last_value(x) over (partition by p order by d
+                      rows between unbounded preceding and unbounded following)
+  ```
+
+  Or, more simply, `FIRST_VALUE` with the opposite sort — `first_value(x) over
+  (partition by p order by d desc)` — which needs no frame clause at all.
+
+syntax:
+  - form: "LAG(expr [, offset [, default]]) OVER (PARTITION BY ... ORDER BY ...)"
+    notes: >-
+      Value from `offset` rows earlier. Supply the default to avoid NULL on the
+      first row of each partition.
+  - form: "LEAD(expr [, offset [, default]]) OVER (...)"
+    notes: The same, looking forward.
+  - form: "ROWS BETWEEN n PRECEDING AND m FOLLOWING"
+    notes: Physical row counts. Use when you mean "the last 7 rows".
+  - form: "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+    notes: >-
+      The default frame when an ORDER BY is present. Includes all rows tied
+      with the current one.
+  - form: "RANGE BETWEEN INTERVAL '7 days' PRECEDING AND CURRENT ROW"
+    notes: >-
+      A value-based window over a date or timestamp ordering column. Correct
+      across gaps in the series.
+  - form: "LAST_VALUE(x) OVER (... ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"
+    notes: >-
+      The frame clause is required — with the default frame LAST_VALUE returns
+      the current row.
+
+sampleTables: [daily_sales, orders, employees, exam_scores]
+
+examples:
+  - title: LAG and LEAD for day-on-day change
+    sql: |
+      select sale_date,
+             region,
+             revenue,
+             lag(revenue)  over w                        as previous_day,
+             lead(revenue) over w                        as next_day,
+             revenue - lag(revenue, 1, revenue) over w   as change_vs_previous,
+             round(100.0 * (revenue - lag(revenue) over w)
+                   / nullif(lag(revenue) over w, 0), 2)  as pct_change
+      from daily_sales
+      where region = 'North'
+        and sale_date between date '2024-01-01' and date '2024-01-10'
+      window w as (partition by region order by sale_date)
+      order by sale_date
+    walkthrough: |
+      `lag(revenue)` on the first row is NULL — there is no previous day in the
+      window. `pct_change` is therefore NULL on that row, which is honest.
+
+      `lag(revenue, 1, revenue)` supplies the current row's own revenue as the
+      default, so `change_vs_previous` is 0 rather than NULL on the first row.
+      Which of those two is right depends on what the number is for: a chart
+      wants 0, an analysis of growth wants NULL so the missing comparison is
+      visible.
+
+      `nullif(..., 0)` guards the percentage against a zero previous day, which
+      would otherwise abort the query.
+
+  - title: The default frame turning a total into a running total
+    sql: |
+      select sale_date,
+             revenue,
+             sum(revenue) over (partition by region)                  as region_total,
+             sum(revenue) over (partition by region order by sale_date) as default_frame,
+             sum(revenue) over (partition by region order by sale_date
+                                rows between unbounded preceding and current row) as explicit_running,
+             sum(revenue) over (partition by region order by sale_date
+                                rows between unbounded preceding and unbounded following) as explicit_total
+      from daily_sales
+      where region = 'South'
+        and sale_date <= date '2024-01-06'
+      order by sale_date
+    walkthrough: |
+      Four sums over the same rows, differing only in the frame.
+
+      `region_total` has no `ORDER BY`, so its frame is the whole partition and
+      the value is constant down the column. `default_frame` adds an `ORDER BY`
+      and nothing else, and becomes a running total — the silent conversion.
+
+      `explicit_running` says exactly that, and matches. `explicit_total`
+      restores the partition total while keeping the ordering, which is what
+      you need when the same window is shared with a ranking function.
+
+      Note that `region_total` and `explicit_total` are the totals of the
+      **filtered** rows — the `WHERE` cut the data off at 6 January — so they
+      are smaller than the region's full total. Windows run after WHERE.
+
+  - title: ROWS and RANGE disagree when there are ties
+    sql: |
+      select student_id,
+             score,
+             sum(score) over (order by score)                              as range_default,
+             sum(score) over (order by score
+                              rows between unbounded preceding and current row) as rows_frame,
+             count(*)   over (order by score)                              as range_count,
+             count(*)   over (order by score
+                              rows between unbounded preceding and current row) as rows_count
+      from exam_scores
+      where subject = 'Chemistry'
+      order by score, student_id
+    walkthrough: |
+      Three students scored 80. Under the default `RANGE` frame all three are
+      peers, so all three see the same running total — the one that includes
+      all of them. Under `ROWS`, each row's frame ends at that physical row, so
+      the total increments one student at a time.
+
+      The count columns make it starkest: `range_count` jumps from 5 to 8
+      across the tied rows while `rows_count` goes 6, 7, 8.
+
+      Neither is wrong. `RANGE` answers "the total for everyone up to and
+      including this score", `ROWS` answers "the total for the rows so far".
+      The problem is only that `RANGE` is the default and almost nobody intends
+      it. Write `ROWS` when you mean rows.
+
+  - title: Moving averages, trailing and centred
+    sql: |
+      select sale_date,
+             revenue,
+             round(avg(revenue) over (order by sale_date
+                     rows between 6 preceding and current row), 2)  as trailing_7,
+             round(avg(revenue) over (order by sale_date
+                     rows between 3 preceding and 3 following), 2)  as centred_7,
+             count(*) over (order by sale_date
+                     rows between 6 preceding and current row)      as days_in_window,
+             round(avg(revenue) over (order by sale_date
+                     range between interval '6 days' preceding and current row), 2) as calendar_7
+      from daily_sales
+      where region = 'North'
+        and sale_date between date '2024-02-01' and date '2024-02-14'
+      order by sale_date
+    walkthrough: |
+      `rows between 6 preceding and current row` is a seven-day trailing
+      average. The first six rows have incomplete windows — `days_in_window`
+      shows 1, 2, 3 and so on — and the average is still computed over whatever
+      is there rather than returning NULL. For a chart that is usually fine;
+      for a published statistic it is a ramp-up artefact worth suppressing.
+
+      `rows between 3 preceding and 3 following` is a centred average, which
+      lags less but cannot be computed for the most recent days in real data.
+
+      `calendar_7` uses `RANGE` with an interval, so the window is "the last
+      seven calendar days" rather than "the last seven rows". On this dataset
+      every day is present so they agree; on a series with missing days they
+      would not, and the calendar version is the one that means what it says.
+
+edgeCases:
+  - title: LAST_VALUE with the default frame returns the current row
+    body: >-
+      `last_value` with no frame clause sees a frame ending at the current row,
+      so "the last value" is the current value and the column is just a copy.
+      The three alternatives all give the real last value of the partition. The
+      third — FIRST_VALUE over a reversed sort — is the one worth remembering,
+      because it needs no frame clause and is harder to get wrong.
+    sql: |
+      select sale_date,
+             revenue,
+             first_value(revenue) over w                    as first_in_partition,
+             last_value(revenue)  over w                    as last_value_default_frame,
+             last_value(revenue)  over (order by sale_date
+                 rows between unbounded preceding and unbounded following) as last_value_full_frame,
+             first_value(revenue) over (order by sale_date desc) as first_value_reversed
+      from daily_sales
+      where region = 'South'
+        and sale_date <= date '2024-01-05'
+      window w as (order by sale_date)
+      order by sale_date
+
+  - title: An incomplete window at the start of a partition
+    body: >-
+      The first rows of each partition have fewer rows available than the frame
+      asks for, and the function computes over what exists rather than
+      returning NULL. `count(*) over (frame)` is the way to detect it, and
+      filtering on that count is how a trailing average is suppressed until the
+      window is full.
+    sql: |
+      select sale_date,
+             region,
+             revenue,
+             count(*) over w                     as rows_in_frame,
+             round(avg(revenue) over w, 2)       as avg_7,
+             case when count(*) over w = 7
+                  then round(avg(revenue) over w, 2) end as avg_7_complete_only
+      from daily_sales
+      where sale_date between date '2024-01-01' and date '2024-01-09'
+      window w as (partition by region order by sale_date rows between 6 preceding and current row)
+      order by region, sale_date
+
+pitfalls:
+  - mistake: Adding ORDER BY to a window aggregate and getting a running total
+    why: >-
+      The default frame with an ORDER BY ends at the current row. The totals
+      look like totals and are cumulative, and the mistake is invisible unless
+      you check one row by hand.
+    fix: >-
+      Omit ORDER BY for a partition total, or write the frame out. When a
+      shared named window needs the ordering, give that one aggregate
+      `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`.
+
+  - mistake: Using LAST_VALUE with the default frame
+    why: >-
+      It returns the current row's value, so the column silently duplicates
+      another one. It is the most reported "window functions are broken" bug
+      and it is the documented behaviour.
+    fix: >-
+      Spell out the full frame, or use FIRST_VALUE over the reversed sort.
+
+  - mistake: Relying on RANGE when you mean ROWS
+    why: >-
+      They agree whenever the ordering values are unique, so the difference
+      only appears on data with ties — which is usually production data rather
+      than test data.
+    fix: >-
+      Write `ROWS` explicitly. It is three characters and it removes the
+      ambiguity entirely.
+
+  - mistake: Using ROWS n PRECEDING for a time window over a gappy series
+    why: >-
+      "The last 7 rows" is not "the last 7 days" when some days are missing.
+      The window silently reaches further back than intended.
+    fix: >-
+      `RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW`, or generate
+      the complete calendar first and left-join the data.
+
+performance: |
+  The frame determines how much work each row costs. `ROWS BETWEEN UNBOUNDED
+  PRECEDING AND CURRENT ROW` is computed incrementally in one pass — the
+  running total is maintained as the scan proceeds. A frame with a lower bound
+  that moves, such as `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW`, can also be
+  maintained incrementally for aggregates that support removal, which includes
+  `sum`, `count` and `avg` but not `max` and `min`.
+
+  A moving `max` or `min` therefore costs more than a moving `sum`, because the
+  value cannot be un-added: PostgreSQL recomputes over the frame. On a wide
+  frame that is visible.
+
+  `RANGE` with an interval offset requires locating the boundary by value,
+  which is a binary search within the partition rather than pointer arithmetic.
+  Slightly more expensive, and correct, which is usually the right trade.
+
+  As always, the dominant cost is the sort. An index on `(partition_key,
+  order_key)` removes it, and several functions sharing one window share one
+  sort.
+
+interviewQuestions:
+  - question: What is the default window frame, and why does it matter?
+    answer: >-
+      With no ORDER BY in the window, the frame is the entire partition. With an
+      ORDER BY and no explicit frame, it is RANGE BETWEEN UNBOUNDED PRECEDING
+      AND CURRENT ROW. The consequence is that adding an ORDER BY to a window
+      aggregate silently converts a partition total into a running total, and
+      that the default is RANGE rather than ROWS, so rows tied on the ordering
+      value are all included together. Both behaviours produce plausible numbers
+      and neither is signalled, which is why writing the frame out is a good
+      habit.
+
+  - question: What is the difference between ROWS and RANGE?
+    answer: >-
+      ROWS counts physical rows relative to the current one; RANGE works on the
+      values of the ordering column, so all rows with the same ordering value
+      are peers and enter the frame together. They are identical when the
+      ordering values are distinct and differ when there are ties — a running
+      total under RANGE jumps in steps across a tied group while ROWS
+      increments one row at a time. RANGE also accepts value offsets, such as
+      INTERVAL '7 days' PRECEDING, which gives a true calendar window that
+      handles gaps correctly.
+
+  - question: Why does LAST_VALUE often return the wrong answer?
+    answer: >-
+      Because the default frame ends at the current row, so "the last value in
+      the frame" is the current row's value. It is documented behaviour rather
+      than a bug. The fix is to state the frame explicitly as ROWS BETWEEN
+      UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, or to use FIRST_VALUE over
+      the reversed ordering, which needs no frame clause and is less easily
+      got wrong.
+
+  - question: How do you compute a 7-day moving average?
+    answer: >-
+      `avg(x) OVER (PARTITION BY k ORDER BY d ROWS BETWEEN 6 PRECEDING AND
+      CURRENT ROW)` for a trailing average over seven rows. If the series can
+      have missing days, use RANGE BETWEEN INTERVAL '6 days' PRECEDING AND
+      CURRENT ROW instead, so the window is seven calendar days rather than
+      seven rows. Either way the first few rows have incomplete windows and the
+      function averages over what exists; `count(*)` over the same frame detects
+      that, and a CASE on it suppresses the ramp-up if the statistic is
+      published.
+
+exercises:
+  - prompt: >-
+      For the South region in March 2024, show each day's revenue, the previous
+      day's, and the running total for the month. Columns sale_date, revenue,
+      previous_day, running_total. Order by sale_date.
+    difficulty: Medium
+    hint: >-
+      LAG for the previous day, and an explicit ROWS frame for the running
+      total so there is no doubt about what it is.
+    solutionSql: |
+      select sale_date,
+             revenue,
+             lag(revenue) over w as previous_day,
+             round(sum(revenue) over (order by sale_date
+                     rows between unbounded preceding and current row), 2) as running_total
+      from daily_sales
+      where region = 'South'
+        and sale_date >= date '2024-03-01'
+        and sale_date <  date '2024-04-01'
+      window w as (order by sale_date)
+      order by sale_date
+
+  - prompt: >-
+      For each region, show the first and last revenue figures of the whole
+      series alongside each day, for the first five days of January 2024.
+      Columns region, sale_date, revenue, first_revenue, last_revenue.
+    difficulty: Hard
+    hint: >-
+      FIRST_VALUE works with the default frame; LAST_VALUE needs the full frame
+      spelled out.
+    solutionSql: |
+      select region,
+             sale_date,
+             revenue,
+             first_value(revenue) over (partition by region order by sale_date) as first_revenue,
+             last_value(revenue)  over (partition by region order by sale_date
+                 rows between unbounded preceding and unbounded following)      as last_revenue
+      from daily_sales
+      where sale_date <= date '2024-01-05'
+      order by region, sale_date
+
+  - prompt: >-
+      For the North region, compute a three-day centred moving average of
+      revenue for the first week of February 2024, together with how many rows
+      each window contained. Columns sale_date, revenue, moving_avg,
+      rows_in_window.
+    difficulty: Medium
+    hint: "`rows between 1 preceding and 1 following`."
+    solutionSql: |
+      select sale_date,
+             revenue,
+             round(avg(revenue) over w, 2) as moving_avg,
+             count(*) over w               as rows_in_window
+      from daily_sales
+      where region = 'North'
+        and sale_date between date '2024-02-01' and date '2024-02-07'
+      window w as (order by sale_date rows between 1 preceding and 1 following)
+      order by sale_date
+
+checklist:
+  - LAG and LEAD take the previous and next row, not a computed adjacent key
+  - "Supply LAG's third argument to choose what \"no previous value\" means"
+  - "No ORDER BY in the window means the frame is the whole partition"
+  - "ORDER BY with no frame clause means RANGE UNBOUNDED PRECEDING TO CURRENT ROW"
+  - Adding ORDER BY silently turns a partition total into a running total
+  - "ROWS counts rows; RANGE includes all peers tied on the ordering value"
+  - "RANGE with an interval gives a true calendar window across gaps"
+  - LAST_VALUE needs an explicit full frame, or use FIRST_VALUE reversed
+
+related:
+  - w-ranking
+  - w-top-n-per-group
+  - p08-running-total-revenue
+  - p09-month-over-month-growth
+
+dialect:
+  standard: >-
+    LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE and the ROWS and RANGE frame
+    clauses are standard SQL from SQL:2003 and SQL:2011. The default frame is
+    defined by the standard, including the RANGE default.
+  postgres: >-
+    Full support including RANGE with value offsets, the GROUPS frame mode
+    added in version 11, and the EXCLUDE CURRENT ROW / GROUP / TIES options.
+    Maintains sum, count and avg incrementally over moving frames; recomputes
+    max and min.
+  mysql: >-
+    Window frames arrived with window functions in MySQL 8.0 and follow the
+    same syntax and defaults, including RANGE with interval offsets. No GROUPS
+    mode and no EXCLUDE clause. SQL Server supports ROWS and RANGE but RANGE
+    only with UNBOUNDED and CURRENT ROW, not with value offsets.

@@ -1,0 +1,868 @@
+# Multiple-choice theory questions.
+#
+# These are the questions that have a right answer and no query to run:
+# isolation levels, what MVCC does, when an index is not used. Anything that
+# can be settled by executing SQL belongs in a lesson example or a problem
+# instead, where the learner can watch it being settled.
+#
+# answerIndex is zero-based. The loader checks it is in range, because an
+# off-by-one here marks correct answers wrong and is invisible until somebody
+# complains.
+#
+# The explanation says why the right answer is right and, where the
+# distractors are the interesting part, why the others are wrong. A
+# distractor nobody would pick teaches nothing; every wrong option here is one
+# that a candidate has actually given.
+
+# ---------------------------------------------------------------- NULL ------
+- id: q-null-not-in
+  topic: NULL handling
+  difficulty: Medium
+  question: >-
+    `SELECT * FROM t WHERE x NOT IN (SELECT y FROM s)` returns no rows, but
+    you can see rows in `t` whose `x` appears nowhere in `s`. What is the most
+    likely cause?
+  options:
+    - Some row of `s` has a NULL `y`
+    - The subquery returns too many rows for NOT IN
+    - "`t` and `s` have incompatible column types"
+    - NOT IN requires an index on `s.y`
+  answerIndex: 0
+  explanation: >-
+    `x NOT IN (a, b, NULL)` expands to `x <> a AND x <> b AND x <> NULL`. The
+    last term is always NULL, and a conjunction containing NULL is either
+    false or NULL but never true, so no row can satisfy the predicate. There
+    is no error and no warning. NOT EXISTS is immune, because it asks whether
+    a matching row exists rather than comparing against every value. The other
+    options are not real constraints — NOT IN has no row limit, type
+    incompatibility would raise an error rather than return nothing, and no
+    index is required.
+
+- id: q-null-check-constraint
+  topic: NULL handling
+  difficulty: Medium
+  question: A column has `CHECK (age >= 18)` and is nullable. What happens on inserting NULL?
+  options:
+    - The row is accepted
+    - The row is rejected by the CHECK constraint
+    - The value is coerced to 18
+    - PostgreSQL raises a warning and accepts the row
+  answerIndex: 0
+  explanation: >-
+    A CHECK constraint rejects a row only when the condition evaluates to
+    **false**. `NULL >= 18` evaluates to NULL, which is not false, so the row
+    passes. This is the mirror image of WHERE, which keeps a row only when the
+    predicate is **true**. If the value must be present, that is a separate
+    requirement and needs NOT NULL — the CHECK only constrains the values that
+    are supplied.
+
+- id: q-null-aggregates
+  topic: NULL handling
+  difficulty: Easy
+  question: A column has 100 rows, 40 of which are NULL. What do `count(*)` and `sum(col)` return?
+  options:
+    - "count(*) = 100; sum ignores the NULLs and totals the other 60"
+    - "count(*) = 60; sum ignores the NULLs"
+    - "count(*) = 100; sum returns NULL because NULLs are present"
+    - "count(*) = 100; sum treats the NULLs as zero and the result is the same"
+  answerIndex: 0
+  explanation: >-
+    `count(*)` counts rows and never looks at a value, so it returns 100.
+    Every other aggregate ignores NULL inputs, so `sum` totals the 60 non-NULL
+    values. Option 3 confuses NULL propagation in expressions with aggregate
+    behaviour — aggregates skip NULLs rather than propagating them. Option 4
+    describes the same arithmetic result by a wrong mechanism, which matters
+    because sum over an input that is *entirely* NULL returns NULL rather than
+    zero.
+
+- id: q-null-empty-sum
+  topic: NULL handling
+  difficulty: Easy
+  question: What does `SELECT sum(amount) FROM payments WHERE 1 = 0` return?
+  options:
+    - One row containing NULL
+    - One row containing 0
+    - No rows at all
+    - An error
+  answerIndex: 0
+  explanation: >-
+    An aggregate with no GROUP BY always returns exactly one row, even over an
+    empty input — so "no rows" is wrong. Sum over nothing is undefined rather
+    than zero, so that row contains NULL. This is why a revenue report shows a
+    blank rather than a zero for a period with no sales, and why
+    `coalesce(sum(x), 0)` should be a reflex. `count` is the exception and
+    returns 0.
+
+# ------------------------------------------------------------ isolation -----
+- id: q-isolation-levels
+  topic: Transactions
+  difficulty: Medium
+  question: Which anomaly does PostgreSQL's REPEATABLE READ permit that SERIALIZABLE does not?
+  options:
+    - Write skew
+    - Dirty read
+    - Non-repeatable read
+    - Phantom read
+  answerIndex: 0
+  explanation: >-
+    PostgreSQL's REPEATABLE READ is snapshot isolation, which takes a
+    whole-database snapshot at the first statement. That prevents dirty reads,
+    non-repeatable reads and — unlike the standard's minimum requirement —
+    phantom reads as well. What it does not prevent is write skew, where two
+    transactions each read overlapping data and each make an individually
+    valid change that together violate an invariant. Only SERIALIZABLE closes
+    that gap, by tracking read-write dependencies and aborting one
+    transaction.
+
+- id: q-isolation-read-uncommitted
+  topic: Transactions
+  difficulty: Medium
+  question: What happens if you request READ UNCOMMITTED in PostgreSQL?
+  options:
+    - You get READ COMMITTED, because MVCC makes dirty reads impossible
+    - The statement is rejected as an unsupported isolation level
+    - You get genuine dirty reads, as the standard describes
+    - The transaction runs at SERIALIZABLE for safety
+  answerIndex: 0
+  explanation: >-
+    PostgreSQL accepts the request and silently gives you READ COMMITTED.
+    Under MVCC a row version is tagged with the transaction that created it,
+    and an uncommitted version is simply not visible to any other snapshot —
+    there is no mechanism to read one. The level exists only for
+    compatibility. MySQL's InnoDB does implement it genuinely, so dirty reads
+    are possible there, which is a real behavioural difference between the two.
+
+- id: q-serializable-retry
+  topic: Transactions
+  difficulty: Hard
+  question: Why must application code using SERIALIZABLE include a retry loop?
+  options:
+    - Because PostgreSQL aborts transactions with SQLSTATE 40001 when it detects a dependency cycle
+    - Because SERIALIZABLE transactions time out after a fixed interval
+    - Because SERIALIZABLE takes locks that frequently deadlock
+    - Because the isolation level is only applied on the second attempt
+  answerIndex: 0
+  explanation: >-
+    PostgreSQL implements SERIALIZABLE optimistically with Serializable
+    Snapshot Isolation — transactions proceed without extra locks, and one is
+    aborted with SQLSTATE 40001 when the set of them could not have arisen
+    from any serial order. The abort is the mechanism providing the
+    guarantee, not a failure, so the application must re-run the whole
+    transaction with fresh reads. Note the third option is specifically wrong:
+    SERIALIZABLE takes no additional locks in PostgreSQL, which is what makes
+    it practical.
+
+- id: q-statement-snapshot
+  topic: Transactions
+  difficulty: Hard
+  question: >-
+    At READ COMMITTED, can a single statement that reads the same table twice
+    see two different versions of it?
+  options:
+    - No — a statement always sees one snapshot, at every isolation level
+    - Yes — READ COMMITTED takes a fresh snapshot for each table access
+    - Yes, but only if the statement contains a subquery
+    - Only if another transaction commits during the statement
+  answerIndex: 0
+  explanation: >-
+    A statement, however complex, sees a single consistent snapshot. What READ
+    COMMITTED permits is two **separate statements** in the same transaction
+    seeing different instants, because each statement takes a fresh snapshot
+    when it begins. This is the guarantee most often underestimated — people
+    assume READ COMMITTED means "possibly inconsistent within a query", and it
+    does not.
+
+# --------------------------------------------------------------- MVCC -------
+- id: q-mvcc-locks
+  topic: Concurrency
+  difficulty: Medium
+  question: What locks does a plain `SELECT` take in PostgreSQL?
+  options:
+    - An ACCESS SHARE lock on the table, and no row locks
+    - A shared lock on every row it reads
+    - No locks of any kind
+    - A shared lock on the table and on each index it uses
+  answerIndex: 0
+  explanation: >-
+    A plain SELECT takes no row locks at all — under MVCC it reads the row
+    versions visible to its snapshot, so readers never block writers. It does
+    take an ACCESS SHARE lock on the table, which conflicts only with ACCESS
+    EXCLUSIVE from DROP TABLE, TRUNCATE and some ALTER TABLE forms. That
+    detail matters in practice: a long-running report can block a migration,
+    and then every subsequent query queues behind the migration.
+
+- id: q-mvcc-bloat
+  topic: Concurrency
+  difficulty: Hard
+  question: >-
+    A reporting transaction is left open for six hours. What is the most
+    significant consequence for the rest of the database?
+  options:
+    - VACUUM cannot reclaim dead row versions anywhere, so tables bloat
+    - All writes to the tables it read are blocked
+    - The connection pool is exhausted
+    - Other transactions are forced to SERIALIZABLE
+  answerIndex: 0
+  explanation: >-
+    VACUUM cannot remove a dead row version that any open snapshot might still
+    need, and an open transaction holds a snapshot covering the whole
+    database. So one forgotten transaction stalls cleanup everywhere, and
+    high-churn tables accumulate dead tuples that still have to be read past —
+    a read-performance problem before it is a disk-space one. It does not
+    block writes, because readers and writers do not conflict under MVCC. This
+    is why `idle_in_transaction_session_timeout` exists.
+
+- id: q-deadlock-prevention
+  topic: Concurrency
+  difficulty: Medium
+  question: What is the most effective way to prevent deadlocks?
+  options:
+    - Acquire locks in a consistent order, such as ascending primary key
+    - Use a higher isolation level
+    - Increase deadlock_timeout so the detector runs less often
+    - Replace row locks with table locks
+  answerIndex: 0
+  explanation: >-
+    A deadlock requires a cycle in the wait-for graph, and a globally
+    consistent lock ordering makes a cycle structurally impossible. Shorter
+    transactions reduce the window and a retry loop handles what remains, but
+    ordering is the only measure that eliminates the cause. Raising
+    deadlock_timeout only delays detection, leaving the transactions blocked
+    for longer. Table locks do prevent deadlocks between row-level
+    operations — by serialising everything, which trades a rare error for
+    permanent contention.
+
+# ------------------------------------------------------------- indexes ------
+- id: q-index-leftmost-prefix
+  topic: Indexes
+  difficulty: Medium
+  question: >-
+    Given an index on `(a, b, c)`, which of these queries can use it for
+    seeking?
+  options:
+    - "WHERE a = 1 AND b = 2"
+    - "WHERE b = 2 AND c = 3"
+    - "WHERE c = 3"
+    - "WHERE b = 2"
+  answerIndex: 0
+  explanation: >-
+    A composite B-tree is sorted by `a`, then by `b` within equal `a`, then by
+    `c`. It can therefore serve any **leftmost prefix** of its columns, and
+    not a suffix — the entries for a given `b` are scattered throughout the
+    index. The analogy is a phone book sorted by surname then forename: it
+    cannot find everyone called David. PostgreSQL can sometimes scan the whole
+    index for a non-prefix predicate if the index is much narrower than the
+    table, but that is a full scan, not a seek.
+
+- id: q-index-sargable
+  topic: Indexes
+  difficulty: Medium
+  question: >-
+    An index on `created_at` exists, but `WHERE date(created_at) =
+    '2024-03-10'` does not use it. Why?
+  options:
+    - The index stores created_at, and the predicate asks about a function of it
+    - The index is corrupt and needs reindexing
+    - Date comparison always requires a sequential scan
+    - The statistics are stale
+  answerIndex: 0
+  explanation: >-
+    The predicate is not sargable: the index holds the column's values, and
+    `date(created_at)` is a different value that the index knows nothing
+    about, so the function must be evaluated for every row. The fix is to
+    rewrite as a half-open range on the raw column — `>= '2024-03-10' AND <
+    '2024-03-11'` — which an index serves directly. An expression index on
+    exactly `date(created_at)` would also work, but the rewrite is free.
+    Stale statistics cause wrong *estimates*, not an impossible access path.
+
+- id: q-index-not-used
+  topic: Indexes
+  difficulty: Medium
+  question: >-
+    EXPLAIN shows a sequential scan on a filter that matches 80% of a large
+    table, even though an index on that column exists. What should you do?
+  options:
+    - Nothing — a sequential scan is genuinely cheaper for an unselective filter
+    - Force the index with enable_seqscan = off
+    - Rebuild the index
+    - Add the column to the primary key
+  answerIndex: 0
+  explanation: >-
+    An index scan costs a random heap fetch per matching row; reading pages
+    sequentially is several times cheaper per page. Past a few percent
+    selectivity the sequential scan wins, and PostgreSQL is making the correct
+    choice. "The index is not being used" is far more often the planner being
+    right than a problem. Disabling seqscan to prove the index helps measures
+    the wrong thing. The one genuine variant of this complaint is when the
+    *estimate* is wrong, which ANALYZE or better statistics addresses.
+
+- id: q-index-only-scan
+  topic: Indexes
+  difficulty: Hard
+  question: What does an index-only scan additionally require, beyond the index covering every column?
+  options:
+    - The visibility map must show the pages as all-visible
+    - The index must be unique
+    - The table must be clustered on that index
+    - The query must have no ORDER BY
+  answerIndex: 0
+  explanation: >-
+    An index does not record whether a row version is visible to the current
+    snapshot, so PostgreSQL must confirm visibility from the heap unless the
+    page is marked all-visible in the visibility map, which VACUUM maintains.
+    A table that has not been vacuumed recently therefore loses index-only
+    scans — a performance regression caused by a maintenance setting rather
+    than by the query. The `Heap Fetches` line in EXPLAIN reports how often
+    the shortcut failed.
+
+- id: q-fk-index
+  topic: Indexes
+  difficulty: Medium
+  question: Does PostgreSQL automatically create an index on a foreign-key column?
+  options:
+    - "No — only on the referenced key; the referencing column needs one creating"
+    - "Yes, on both sides of the relationship"
+    - Only when ON DELETE CASCADE is specified
+    - Only for composite foreign keys
+  answerIndex: 0
+  explanation: >-
+    PostgreSQL indexes primary keys and unique constraints, which covers the
+    **referenced** side. The referencing column gets nothing, so every join
+    from parent to child is a sequential scan and every DELETE on the parent
+    scans the child to check for references. This is one of the most common
+    and most easily fixed performance problems in a PostgreSQL schema. MySQL's
+    InnoDB does create the index automatically, which is why advice carried
+    over from MySQL experience misses it.
+
+# ----------------------------------------------------------- query plans ----
+- id: q-explain-estimate-vs-actual
+  topic: Query plans
+  difficulty: Hard
+  question: >-
+    A plan node shows `rows=5` in the estimate and `actual rows=50000`. What
+    is the significance?
+  options:
+    - Every planning decision above that node was made on false information
+    - The query returned the wrong results
+    - The node is the slowest part of the query
+    - The table needs reindexing
+  answerIndex: 0
+  explanation: >-
+    The results are correct — estimates affect plan choice, not correctness.
+    But a four-order-of-magnitude error means the planner chose join
+    algorithms and join orders above that node on the basis of a number that
+    was wrong, which is a far more common cause of a bad plan than a missing
+    index. The remedies are ANALYZE for stale statistics, a higher statistics
+    target for a skewed column, or CREATE STATISTICS when two filtered columns
+    are correlated and the planner is multiplying their selectivities.
+
+- id: q-explain-loops
+  topic: Query plans
+  difficulty: Medium
+  question: >-
+    A node reports `actual time=0.100..0.120 rows=15 loops=3000`. Roughly how
+    much time did it contribute?
+  options:
+    - About 360 ms, because the figures are per loop
+    - About 0.12 ms, which is the total
+    - About 45 seconds, because rows multiply the time
+    - It cannot be determined from these figures
+  answerIndex: 0
+  explanation: >-
+    Actual time and row counts in EXPLAIN ANALYZE are reported **per loop**,
+    so the total is 0.12 ms times 3000, roughly 360 ms. This is the most
+    commonly misread part of a plan — a node that looks instantaneous can
+    dominate the query. The same applies to the row count: 15 rows per loop is
+    45,000 rows in total. Visual plan tools do the multiplication for you,
+    which is a good reason to use one on anything non-trivial.
+
+- id: q-explain-buffers
+  topic: Query plans
+  difficulty: Medium
+  question: Why is `EXPLAIN (ANALYZE, BUFFERS)` more useful than timing alone for comparing two queries?
+  options:
+    - Buffer counts are deterministic, while timings depend on cache state
+    - BUFFERS makes the query run faster
+    - Timings are only reported for the top-level node
+    - BUFFERS reports the index each node used
+  answerIndex: 0
+  explanation: >-
+    The second run of any query is faster because its pages are in the shared
+    buffer cache and the OS page cache, so a timing comparison between two
+    variants measures cache state as much as query quality. Shared buffer hits
+    and reads per node are the same regardless, which lets you say that one
+    plan touches 40,000 pages and another touches 400 — a fact that
+    generalises to production, where the cache contents are different again.
+
+- id: q-nested-loop
+  topic: Query plans
+  difficulty: Hard
+  question: When is a nested loop join a disaster rather than the best available plan?
+  options:
+    - When the outer input is far larger than the planner estimated
+    - When both inputs are already sorted on the join key
+    - When the inner table has an index on the join column
+    - When the join returns very few rows
+  answerIndex: 0
+  explanation: >-
+    A nested loop costs outer rows times the per-row inner lookup, so it is
+    excellent when the outer side is small and the inner side is indexed —
+    often the cheapest plan available, with no startup cost. It becomes a
+    disaster when the outer input turns out to be far larger than estimated,
+    because the cost scales linearly with a number that was wrong. "A query
+    that used to be fast" very often has this shape, and the fix is usually
+    the estimate rather than the join.
+
+# ----------------------------------------------------- window functions -----
+- id: q-rank-vs-dense-rank
+  topic: Window functions
+  difficulty: Easy
+  question: Scores are 95, 88, 88, 79. What does `RANK()` assign to the 79?
+  options:
+    - 4
+    - 3
+    - 2
+    - 1
+  answerIndex: 0
+  explanation: >-
+    RANK reports the position in the ordering, and the two rows tied at 88
+    occupy positions 2 and 3, so the next distinct value is at position 4.
+    DENSE_RANK would give it 3, because it ranks distinct values and never
+    skips. ROW_NUMBER would also give 4, but by numbering rows rather than
+    positions — a coincidence here that disappears as soon as the tie is
+    elsewhere. Choose RANK for "top N positions including ties" and DENSE_RANK
+    for "the Nth distinct value".
+
+- id: q-window-in-where
+  topic: Window functions
+  difficulty: Easy
+  question: Why can a window function not appear in a WHERE clause?
+  options:
+    - WHERE is evaluated before the select list, where window functions are computed
+    - Window functions always return more than one value
+    - It is allowed, but only with a subquery alias
+    - PostgreSQL supports it; the SQL standard does not
+  answerIndex: 0
+  explanation: >-
+    The logical evaluation order is FROM, JOIN, WHERE, GROUP BY, HAVING, then
+    the SELECT list — and window functions are evaluated with the SELECT list,
+    after grouping. When WHERE runs the value does not yet exist. The standard
+    workaround is to compute the window function in a CTE or subquery and
+    filter in the outer query, which is the shape of every top-N-per-group
+    solution. The restriction is in the standard and applies everywhere.
+
+- id: q-default-frame
+  topic: Window functions
+  difficulty: Hard
+  question: >-
+    `sum(x) OVER (PARTITION BY p ORDER BY d)` and `sum(x) OVER (PARTITION BY
+    p)` — what is the difference?
+  options:
+    - The first is a running total, the second a partition total
+    - They are identical; ORDER BY only affects output order
+    - The first is a partition total, the second a running total
+    - The second is invalid without an ORDER BY
+  answerIndex: 0
+  explanation: >-
+    Adding an ORDER BY to a window aggregate introduces a default frame of
+    RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, which turns a partition
+    total into a running total. Without an ORDER BY the frame is the whole
+    partition. Both are valid and both produce plausible numbers, and nothing
+    indicates which you asked for — which is why writing the frame out is
+    worth the characters. Note also that the default is RANGE rather than
+    ROWS, so rows tied on the ordering value all enter the frame together.
+
+- id: q-last-value
+  topic: Window functions
+  difficulty: Hard
+  question: >-
+    `LAST_VALUE(x) OVER (ORDER BY d)` returns the current row's value rather
+    than the partition's last. Why?
+  options:
+    - The default frame ends at the current row
+    - LAST_VALUE requires a PARTITION BY clause
+    - LAST_VALUE is not supported without a frame specification
+    - The ORDER BY direction must be reversed for LAST_VALUE
+  answerIndex: 0
+  explanation: >-
+    With an ORDER BY and no explicit frame, the frame runs from the start of
+    the partition to the current row — so "the last value in the frame" is the
+    current value. It is documented behaviour rather than a bug, and it is the
+    most reported "window functions are broken" problem. Fix it with
+    `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`, or use
+    FIRST_VALUE over the reversed ordering, which needs no frame clause and is
+    harder to get wrong.
+
+- id: q-rows-vs-range
+  topic: Window functions
+  difficulty: Hard
+  question: When do `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` and the RANGE equivalent differ?
+  options:
+    - When rows tie on the ordering column
+    - When the partition contains NULLs
+    - When the window has no PARTITION BY
+    - They never differ for an aggregate
+  answerIndex: 0
+  explanation: >-
+    ROWS counts physical rows; RANGE works on the ordering column's values, so
+    all rows sharing the current row's value are peers and enter the frame
+    together. With distinct ordering values the two are identical, which is
+    why the difference only shows up on real data. A running total under RANGE
+    jumps in steps across a tied group while ROWS increments one row at a
+    time. RANGE additionally accepts value offsets such as `INTERVAL '7 days'`,
+    giving a true calendar window.
+
+# ---------------------------------------------------------- aggregation -----
+- id: q-where-vs-having
+  topic: Aggregation
+  difficulty: Easy
+  question: A condition contains no aggregate function. Where should it go?
+  options:
+    - WHERE, so rows are removed before the grouping step
+    - HAVING, so it is applied consistently with the other filters
+    - Either — PostgreSQL rewrites them identically
+    - In the ON clause of the first join
+  answerIndex: 0
+  explanation: >-
+    WHERE filters rows before grouping; HAVING filters groups afterwards. A
+    non-aggregate condition in HAVING is accepted and runs after every row it
+    would have removed has already been carried through the grouping step, so
+    it is a slower WHERE. The planner does not generally rewrite one into the
+    other. The rule of thumb is simple: no aggregate function in the
+    condition means it belongs in WHERE.
+
+- id: q-count-case-trap
+  topic: Aggregation
+  difficulty: Medium
+  question: What does `count(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END)` return?
+  options:
+    - The total number of rows in the group
+    - The number of cancelled rows
+    - Zero
+    - NULL when no rows are cancelled
+  answerIndex: 0
+  explanation: >-
+    `count` ignores only NULL, and `ELSE 0` supplies a non-NULL value for
+    every non-matching row, so every row is counted. The correct forms are
+    `count(CASE WHEN c THEN 1 END)`, relying on the implicit ELSE NULL, or
+    `sum(CASE WHEN c THEN 1 ELSE 0 END)`, or `count(*) FILTER (WHERE c)`. Note
+    the asymmetry: ELSE 0 is correct with sum and wrong with count, which is
+    exactly why the two get confused and why FILTER is preferable where it
+    exists.
+
+- id: q-group-by-missing-groups
+  topic: Aggregation
+  difficulty: Medium
+  question: >-
+    A grouped report is missing the categories that have no matching rows. How
+    do you include them?
+  options:
+    - LEFT JOIN from the table that lists the categories and count a column from the fact side
+    - Add `HAVING count(*) >= 0`
+    - Use GROUPING SETS
+    - Replace GROUP BY with DISTINCT
+  answerIndex: 0
+  explanation: >-
+    GROUP BY builds groups from rows that exist, so a category with no rows
+    produces no group — not a group containing zero. Starting from the table
+    that enumerates the categories and LEFT JOINing the facts to it is the
+    fix. The second half matters just as much: the outer join creates one
+    NULL-extended row per empty category, so `count(*)` would report 1. Count
+    a column from the fact side, and COALESCE any sums.
+
+- id: q-filter-vs-where
+  topic: Aggregation
+  difficulty: Medium
+  question: What can `FILTER (WHERE ...)` do that a WHERE clause cannot?
+  options:
+    - Restrict one aggregate's input while leaving the group and other aggregates intact
+    - Filter rows before the join is performed
+    - Apply a condition to a window function's frame
+    - Remove groups that fail the condition
+  answerIndex: 0
+  explanation: >-
+    WHERE removes rows before grouping, so it affects every aggregate in the
+    query and can eliminate groups entirely. FILTER restricts a single
+    aggregate's input, which is what makes several differently-conditioned
+    metrics possible in the same row — the basis of every pivot written in
+    portable SQL. It does not remove groups: a group where nothing matches
+    still appears, with 0 or NULL. FILTER is standard SQL from SQL:2003 and
+    is implemented by PostgreSQL and SQLite but not MySQL or SQL Server.
+
+# ------------------------------------------------------------- joins --------
+- id: q-left-join-where
+  topic: Joins
+  difficulty: Medium
+  question: >-
+    A LEFT JOIN with a condition on the right table moved from ON to WHERE
+    returns fewer rows. Why?
+  options:
+    - WHERE tests the NULL-extended rows, which fail, so the join becomes an inner join
+    - WHERE conditions are evaluated before the join
+    - The optimiser reorders the join when a WHERE clause is present
+    - A LEFT JOIN cannot have a WHERE clause on the right table
+  answerIndex: 0
+  explanation: >-
+    The join runs first and produces NULL-extended rows for unmatched left
+    rows. WHERE then tests those rows, and any comparison against the NULL
+    columns evaluates to NULL rather than true, so they are dropped — making
+    the result identical to an inner join. Conditions about **how rows match**
+    belong in ON; conditions about **which result rows survive** belong in
+    WHERE. For inner joins the two placements are equivalent, which is how the
+    habit forms in the wrong direction.
+
+- id: q-join-fan-out
+  topic: Joins
+  difficulty: Medium
+  question: >-
+    A report's revenue figure is about three times too large. The query joins
+    orders to both order_items and payments. What is the likely cause?
+  options:
+    - Fan-out — each order's lines are multiplied by its payments
+    - A missing WHERE clause on order status
+    - Rounding applied at the wrong point
+    - The payments table contains duplicates
+  answerIndex: 0
+  explanation: >-
+    Joining one row to two separate one-to-many relationships produces lines ×
+    payments rows per order, so each line's revenue is counted once per
+    payment. A factor of roughly three suggests about three rows on the
+    duplicating side. The diagnosis is to compare the joined row count with
+    the count of the driving entity. The fix is one fan-out per query:
+    aggregate each grain in its own CTE and join the aggregates.
+
+- id: q-anti-join
+  topic: Joins
+  difficulty: Easy
+  question: >-
+    In the `LEFT JOIN ... WHERE right.col IS NULL` anti-join idiom, which
+    column should `col` be?
+  options:
+    - One that cannot be NULL in the right-hand table, such as its primary key
+    - Any column mentioned in the ON clause
+    - The column with the fewest NULLs
+    - It does not matter
+  answerIndex: 0
+  explanation: >-
+    The IS NULL test is meant to detect that no row matched. If the column
+    tested is nullable in the data, a genuine NULL in a matched row is
+    indistinguishable from a non-match, so the query returns rows that do have
+    matches. Choosing the primary key avoids the problem entirely. NOT EXISTS
+    sidesteps the question by asking about the existence of a row rather than
+    about a column's value, which is one reason to prefer it.
+
+- id: q-natural-join
+  topic: Joins
+  difficulty: Easy
+  question: Why is NATURAL JOIN generally avoided?
+  options:
+    - Its join condition changes silently when a column is added to either table
+    - It is slower than an explicit join
+    - It cannot be used with outer joins
+    - It requires the tables to have identical schemas
+  answerIndex: 0
+  explanation: >-
+    NATURAL JOIN joins on every column the two tables happen to share. Adding
+    a `created_at` or `updated_at` column to both silently adds it to the join
+    condition, so the query starts returning different rows with no change to
+    its text and no error. The performance is identical to the equivalent
+    explicit join; the problem is entirely that the condition is implicit and
+    mutable. USING with a named column list gives the brevity without the
+    hazard.
+
+# ------------------------------------------------------- schema design ------
+- id: q-unique-nulls
+  topic: Schema design
+  difficulty: Medium
+  question: How many NULLs does a standard UNIQUE constraint permit in its column?
+  options:
+    - Any number, because NULLs are not equal to each other
+    - Exactly one
+    - None — UNIQUE implies NOT NULL
+    - It depends on the index type
+  answerIndex: 0
+  explanation: >-
+    A UNIQUE constraint forbids equal values, and NULL is not equal to NULL,
+    so any number of NULL rows is permitted. This surprises people who read
+    "unique" as "at most one of anything". PostgreSQL 15 added `UNIQUE NULLS
+    NOT DISTINCT`, which treats NULLs as equal and permits only one; before
+    that the workaround is a partial unique index or a sentinel value. A
+    PRIMARY KEY is different, because it additionally implies NOT NULL.
+
+- id: q-normalisation-3nf
+  topic: Schema design
+  difficulty: Medium
+  question: >-
+    `employees(emp_id, name, dept_id, dept_name)` with emp_id as the key.
+    Which normal form does it violate and why?
+  options:
+    - "3NF — dept_name depends on dept_id, which is not the key"
+    - "2NF — dept_name depends on part of a composite key"
+    - "1NF — dept_name is not atomic"
+    - "BCNF only — it satisfies 3NF"
+  answerIndex: 0
+  explanation: >-
+    `dept_name` depends on `dept_id`, which in turn depends on `emp_id` — a
+    transitive dependency, which is exactly what 3NF forbids. It is not a 2NF
+    violation because the key is a single column and 2NF only concerns partial
+    dependencies on composite keys. The practical consequence is an update
+    anomaly: renaming a department means updating one row per employee, and
+    missing one leaves the database self-contradictory.
+
+- id: q-snapshot-not-redundancy
+  topic: Schema design
+  difficulty: Hard
+  question: >-
+    `order_items.unit_price` duplicates `products.unit_price`. Should it be
+    normalised away?
+  options:
+    - "No — it records the price at the time of the order, which is a different fact"
+    - "Yes — it is a textbook transitive dependency"
+    - "Yes, but only if prices never change"
+    - "No, because it would require a join to retrieve"
+  answerIndex: 0
+  explanation: >-
+    The two columns look identical and mean different things: one is the
+    current catalogue price and the other is what was actually charged.
+    Removing the stored price makes every historical order reprice itself
+    whenever the catalogue changes, destroying information that cannot be
+    recovered. A point-in-time snapshot is not redundancy. "Is this the same
+    fact or a record of what it was at a moment?" is the question to ask
+    before removing any apparent duplicate.
+
+- id: q-cascade-delete
+  topic: Schema design
+  difficulty: Medium
+  question: When is `ON DELETE CASCADE` the right choice?
+  options:
+    - When the child rows are owned by the parent and have no independent meaning
+    - Whenever a foreign key exists, to avoid orphans
+    - Only on self-referencing foreign keys
+    - When the child table is larger than the parent
+  answerIndex: 0
+  explanation: >-
+    CASCADE is correct for genuinely owned children — order line items,
+    junction-table rows, attachments to a document. For anything with
+    independent existence it is dangerous: one delete can silently remove a
+    large subtree with no application involvement and no audit trail. The
+    default NO ACTION makes the deletion fail so the application has to decide
+    explicitly, which is usually what you want. SET NULL is the middle option
+    for "the parent is gone but the child remains".
+
+# ------------------------------------------- PostgreSQL and the backend -----
+- id: q-pool-size
+  topic: Backend integration
+  difficulty: Hard
+  question: >-
+    An application's throughput drops when the connection pool is raised from
+    20 to 200. Why?
+  options:
+    - Beyond the database's capacity, extra connections add contention rather than concurrency
+    - The pool itself becomes a bottleneck at that size
+    - HikariCP serialises above 100 connections
+    - Larger pools disable prepared-statement caching
+  answerIndex: 0
+  explanation: >-
+    A database can usefully run about as many queries at once as it has cores
+    and disk bandwidth. Past that, extra connections add context switching,
+    lock contention and memory pressure — each PostgreSQL connection is a
+    process, and worst-case memory is roughly connections × work_mem × sort
+    nodes. Throughput rises to a knee and then falls. The usual starting point
+    is around (cores × 2) + spindles, which is far smaller than most people
+    guess, and PgBouncer multiplexes many application pools onto few server
+    connections.
+
+- id: q-prepared-statement-injection
+  topic: Backend integration
+  difficulty: Easy
+  question: Why does a prepared statement prevent SQL injection?
+  options:
+    - The statement is parsed and planned before any parameter value is supplied
+    - The driver escapes dangerous characters in the parameters
+    - The database validates parameters against the column types
+    - It does not; it only improves performance
+  answerIndex: 0
+  explanation: >-
+    The protection is structural rather than a matter of escaping: by the time
+    a value is bound, the statement's structure is already fixed, so the value
+    cannot become part of it. That is why there are no bypasses. The
+    limitation follows from the same fact — parameters cannot substitute
+    identifiers such as table names or sort directions, because those are
+    structure. Those must be validated against an allow-list and the matched
+    value used, never the caller's string.
+
+- id: q-open-in-view
+  topic: Backend integration
+  difficulty: Hard
+  question: What does Spring's `spring.jpa.open-in-view`, enabled by default, actually do?
+  options:
+    - Keeps the persistence context and a connection open for the whole request
+    - Opens a read-only transaction for GET requests
+    - Enables lazy loading of entity relationships
+    - Caches entities between requests
+  answerIndex: 0
+  explanation: >-
+    It holds the persistence context open until the response is rendered,
+    which means a pooled connection is held during view rendering and every
+    lazy-loading N+1 is silently serviced rather than failing with a
+    LazyInitializationException. Turning it off is generally right, and it
+    surfaces problems that were already there and were being paid for in
+    connections and queries instead of in exceptions.
+
+- id: q-on-conflict
+  topic: Backend integration
+  difficulty: Medium
+  question: Why is `INSERT ... ON CONFLICT` safer than checking for a row and then inserting?
+  options:
+    - It is resolved inside a single statement, so there is no window for a concurrent insert
+    - It is faster, which reduces the chance of a collision
+    - It automatically retries on a unique violation
+    - It takes an exclusive lock on the table
+  answerIndex: 0
+  explanation: >-
+    Between a SELECT and an INSERT another transaction can insert the same
+    key, and at READ COMMITTED the SELECT cannot see that uncommitted row, so
+    it cannot warn you. ON CONFLICT is handled within one statement by the
+    index machinery, so there is no window at all. Being faster would narrow
+    the window, not close it — and a narrower race is still a race. It takes
+    no table lock.
+
+- id: q-sequence-gaps
+  topic: Backend integration
+  difficulty: Medium
+  question: A sequence-generated id column has gaps. What does that indicate?
+  options:
+    - "Nothing unusual — nextval is non-transactional, so rolled-back transactions consume values"
+    - Rows have been deleted
+    - The sequence is misconfigured and should be reset
+    - Concurrent inserts have corrupted the sequence
+  answerIndex: 0
+  explanation: >-
+    `nextval` deliberately does not roll back: if it did, every concurrent
+    inserter would serialise on the sequence. So a transaction that takes a
+    value and then fails keeps the gap permanently. A sequence guarantees
+    uniqueness and monotonicity, never contiguity. Deletions also leave gaps,
+    but they are not the only cause and usually not the main one. Genuine
+    gapless numbering needs a counter table with explicit locking and the
+    serialised writes that implies.
+
+- id: q-jsonb-containment-index
+  topic: Backend integration
+  difficulty: Hard
+  question: >-
+    A GIN index exists on a jsonb column, but `WHERE (attrs ->> 'cpu') = 'i9'`
+    does not use it. Why?
+  options:
+    - GIN indexes containment and key existence, not an expression over the column
+    - GIN indexes cannot be used for equality
+    - The value needs casting to jsonb first
+    - GIN indexes only work on arrays
+  answerIndex: 0
+  explanation: >-
+    A GIN index on the column supports `@>`, `?`, `?|`, `?&` and the jsonpath
+    operators. `(attrs ->> 'cpu') = 'i9'` is an expression over the column —
+    a different value that the index knows nothing about. Either rewrite as
+    containment, `attrs @> '{"cpu":"i9"}'`, which the GIN index serves, or
+    create a B-tree expression index on exactly that extraction. Needing
+    several such expression indexes is a sign the fields should be real
+    columns.

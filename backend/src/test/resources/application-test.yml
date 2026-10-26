@@ -1,0 +1,48 @@
+# Integration tests run against a real PostgreSQL, not an in-memory stand-in.
+#
+# The whole subject of this application is PostgreSQL — jsonb containment,
+# window frames, DISTINCT ON, GIN indexes, read-only transactions, SQLSTATE
+# codes. An H2 or HSQLDB substitute would pass tests that prove nothing about
+# the thing being shipped, and would fail on half the curriculum's own SQL.
+#
+# The database is sqlmastery_test_db, created alongside the application
+# database by scripts/provision-db.sh. The credentials come from .env, loaded
+# by DotenvEnvironmentPostProcessor from the project root — Surefire's working
+# directory is backend/, so the ../.env candidate resolves.
+#
+# Flyway runs against it on the first test, which is also the test: if the
+# migrations do not apply cleanly to an empty database, every integration test
+# fails at startup and says so.
+
+spring:
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    placeholders:
+      learnerRole: ${SQLMASTERY_LEARNER_USERNAME:sqlmastery_learner}
+    # Tests must be able to run against a database left over from a previous
+    # run, so a failed migration is repaired rather than halting everything.
+    clean-disabled: true
+
+sqlmastery:
+  datasource:
+    url: jdbc:postgresql://${SQLMASTERY_DB_HOST:127.0.0.1}:${SQLMASTERY_DB_PORT:5433}/${SQLMASTERY_TEST_DB_NAME:sqlmastery_test_db}
+
+  playground:
+    # Deliberately tighter than production so the limit-related tests do not
+    # have to generate five hundred rows to prove truncation works.
+    statement-timeout-ms: 3000
+    max-rows: 50
+    max-sql-length: 10000
+    allowed-schemas:
+      - learning
+      - learning_alt
+      - information_schema
+    max-concurrent: 4
+    rate-per-minute: 10000
+
+logging:
+  level:
+    root: WARN
+    com.bhavesh.sqlmastery: INFO
+    org.flywaydb: WARN

@@ -1,0 +1,399 @@
+id: f-logical-order
+moduleId: foundations
+position: 70
+title: The logical order of a SELECT
+slug: logical-query-order
+difficulty: Beginner
+estimatedMinutes: 20
+summary: >-
+  A SELECT is written in one order and evaluated in another. Learn the
+  evaluation order once and a whole class of errors — alias not found, aggregate
+  not allowed here, WHERE versus HAVING — stops being a list of rules to
+  memorise.
+tags: [query-processing, where-vs-having, aliases, mental-model]
+
+prerequisites:
+  - f-filtering
+
+objectives:
+  - Recite the logical processing order of a SELECT statement
+  - Explain every "column does not exist" alias error from that order
+  - Choose between WHERE and HAVING for a given condition and justify it
+  - Say why a LEFT JOIN condition in WHERE behaves like an INNER JOIN
+  - Distinguish logical order from the physical plan the optimiser chooses
+
+concept: |
+  ## Written order versus evaluation order
+
+  You write a query like this:
+
+  ```
+  SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ... ORDER BY ... LIMIT ...
+  ```
+
+  The database evaluates it like this:
+
+  ```
+  1. FROM        — identify the source tables
+  2. JOIN / ON   — combine them, applying the ON conditions
+  3. WHERE       — discard rows that do not satisfy the predicate
+  4. GROUP BY    — collapse the remaining rows into groups
+  5. HAVING      — discard whole groups that do not satisfy the predicate
+  6. SELECT      — evaluate the select list, creating aliases
+  7. DISTINCT    — remove duplicate result rows
+  8. ORDER BY    — sort the result
+  9. LIMIT/OFFSET— take a slice
+  ```
+
+  `SELECT`, the first thing you write, is the sixth thing that happens. That one
+  fact explains almost every confusing error message a beginner meets.
+
+  ## Everything that follows from it
+
+  **An alias is not visible in WHERE.** The select list has not run yet. It *is*
+  visible in `ORDER BY`, which runs after. PostgreSQL also permits it in
+  `GROUP BY` as an extension.
+
+  **An aggregate is not allowed in WHERE.** Grouping happens at step 4 and
+  `WHERE` is step 3 — there are no groups yet, so `where count(*) > 1` has
+  nothing to count. The clause for filtering groups is `HAVING`.
+
+  **WHERE filters rows, HAVING filters groups.** Both are needed and they are
+  not interchangeable:
+
+  ```sql
+  select dept_id, count(*)
+  from employees
+  where is_active              -- drops rows before grouping
+  group by dept_id
+  having count(*) >= 5         -- drops groups after grouping
+  ```
+
+  Put a condition in `WHERE` whenever it can go there. It removes rows earlier,
+  so less work reaches the grouping step, and `HAVING` on a non-aggregate is
+  just a slower `WHERE`.
+
+  **After GROUP BY, only grouped columns and aggregates exist.** Step 4 replaces
+  the rows with groups, so by step 6 there is no single `first_name` to show for
+  a group of fifteen employees. PostgreSQL does make an exception when the
+  grouping is by a primary key, because then the other columns are functionally
+  determined — a genuinely useful relaxation that most databases lack.
+
+  **A LEFT JOIN condition belongs in ON, not WHERE.** The join is step 2 and
+  produces NULL-extended rows for non-matches; `WHERE` at step 3 then tests
+  those NULLs, fails, and drops exactly the rows the LEFT JOIN was there to
+  keep. The result is an inner join written the long way. This is the single
+  most common join bug and the joins module returns to it.
+
+  ## Logical order is not physical order
+
+  None of the above describes what the database *does*. The planner is free to
+  reorder anything as long as the result is identical: it pushes filters below
+  joins, converts subqueries into joins, uses an index to avoid the sort, and
+  stops early when it sees a LIMIT.
+
+  Logical order is a **specification of meaning**, and the physical plan is an
+  implementation of it. Keeping the two separate is what lets you reason about
+  correctness from the logical order and about speed from `EXPLAIN`, without
+  confusing the two.
+
+syntax:
+  - form: "SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ... ORDER BY ... LIMIT ..."
+    notes: The written order. Clauses must appear in this sequence.
+  - form: "FROM → JOIN/ON → WHERE → GROUP BY → HAVING → SELECT → DISTINCT → ORDER BY → LIMIT"
+    notes: The logical evaluation order. Memorise this one.
+  - form: "WHERE non_aggregate_predicate"
+    notes: Filters input rows, before grouping. Cannot reference aggregates or aliases.
+  - form: "HAVING aggregate_predicate"
+    notes: >-
+      Filters groups, after grouping. Can reference aggregates. A HAVING clause
+      with no aggregate almost always belongs in WHERE.
+
+sampleTables: [employees, departments, orders, customers]
+
+examples:
+  - title: Where each clause acts, in one query
+    sql: |
+      select d.dept_name,
+             count(*)                as active_employees,
+             round(avg(e.salary), 0) as avg_salary
+      from employees e
+      join departments d on d.dept_id = e.dept_id
+      where e.is_active
+      group by d.dept_name
+      having count(*) >= 3
+      order by avg_salary desc
+    walkthrough: |
+      Trace it in evaluation order. `FROM` and `JOIN` build the combined rows —
+      38 of them, since two employees have no department and the inner join
+      drops them. `WHERE e.is_active` removes the two inactive employees,
+      leaving 36. `GROUP BY` collapses those into one row per department.
+      `HAVING` discards any department with fewer than three, which removes
+      Research — it has no employees at all and therefore no group.
+
+      Only now does `SELECT` run, creating the alias `avg_salary`, which
+      `ORDER BY` can then use. Moving `having count(*) >= 3` into `WHERE` would
+      be an error; moving `where e.is_active` into `HAVING` would work and be
+      slower, because the inactive rows would survive to be grouped.
+
+  - title: WHERE and HAVING doing different jobs
+    sql: |
+      select status,
+             count(*)                                      as orders,
+             count(distinct customer_id)                   as customers,
+             min(order_date)                               as first_order,
+             max(order_date)                               as last_order
+      from orders
+      where order_date >= date '2023-01-01'
+      group by status
+      having count(*) > 5
+      order by orders desc
+    walkthrough: |
+      `WHERE` restricts which orders are considered at all. `HAVING` restricts
+      which statuses survive once counted. Swapping them is not possible:
+      `where count(*) > 5` has no groups to count, and `having order_date >=
+      ...` has no single `order_date` per group.
+
+      Note that `count(distinct customer_id)` is an aggregate over the group,
+      and it answers a different question from `count(*)` whenever a customer
+      placed more than one order with that status.
+
+  - title: The alias visibility rule, demonstrated
+    sql: |
+      select e.emp_id,
+             e.salary,
+             e.salary * 12 as annual_salary
+      from employees e
+      where e.salary * 12 > 2400000
+      order by annual_salary desc
+    walkthrough: |
+      `WHERE` repeats the expression because the alias does not exist yet;
+      `ORDER BY` uses the alias because by then it does.
+
+      Repeating the expression is fine here. When it is long, the maintainable
+      form is a CTE — `with paid as (select ..., salary * 12 as annual from
+      employees) select * from paid where annual > 2400000` — where the alias
+      becomes a real column of an intermediate result and can be used anywhere.
+
+  - title: The LEFT JOIN condition in the wrong place
+    sql: |
+      select 'left join, condition in ON'   as variant,
+             count(*)                        as rows_returned
+      from departments d
+      left join employees e
+             on e.dept_id = d.dept_id and e.salary > 200000
+      union all
+      select 'left join, condition in WHERE',
+             count(*)
+      from departments d
+      left join employees e on e.dept_id = d.dept_id
+      where e.salary > 200000
+    walkthrough: |
+      Same tables, same intent, different answers — and the second variant is an
+      inner join wearing a LEFT JOIN's clothes.
+
+      In the first, the condition is part of matching: a department with no
+      highly-paid employee still appears, with NULLs. In the second, the join
+      produces those NULL-extended rows and then `WHERE e.salary > 200000`
+      evaluates `NULL > 200000`, which is NULL, which is not true, so the row is
+      dropped.
+
+      The rule that follows from the evaluation order: conditions about **how
+      rows match** go in `ON`; conditions about **which rows survive** go in
+      `WHERE`. For an inner join the distinction does not change the result,
+      which is why the habit is easy to form in the wrong direction.
+
+edgeCases:
+  - title: GROUP BY a primary key frees the other columns
+    body: >-
+      Normally every non-aggregated select-list column must appear in GROUP BY.
+      PostgreSQL relaxes this when the grouping columns include the table's
+      primary key, because the remaining columns are then functionally
+      dependent — there is exactly one possible value per group. This is
+      standard SQL since SQL:1999 and is implemented by very few databases, so
+      it is convenient and not portable.
+    sql: |
+      select d.dept_id, d.dept_name, d.location, count(e.emp_id) as employees
+      from departments d
+      left join employees e on e.dept_id = d.dept_id
+      group by d.dept_id
+      order by d.dept_id
+
+  - title: HAVING without GROUP BY treats the whole result as one group
+    body: >-
+      Legal, occasionally useful, and startling the first time. With no GROUP BY
+      the entire table is a single group, so HAVING either keeps that one row or
+      returns nothing at all. It is a way of asking "is this true of the table
+      as a whole?" and getting zero rows when it is not.
+    sql: |
+      select count(*) as employees, round(avg(salary), 0) as avg_salary
+      from employees
+      having count(*) > 10
+
+pitfalls:
+  - mistake: Putting a non-aggregate condition in HAVING
+    why: >-
+      It works, so nothing objects. The condition is then evaluated after
+      grouping, which means every row it would have removed was carried through
+      the group-by step first.
+    fix: >-
+      Move it to WHERE. The rule of thumb: if the condition does not mention an
+      aggregate function, it belongs in WHERE.
+
+  - mistake: Putting a filter on the right-hand table of a LEFT JOIN in WHERE
+    why: >-
+      The NULL-extended rows the LEFT JOIN created fail the filter and
+      disappear, turning the outer join into an inner one. The query returns
+      fewer rows than expected and no error.
+    fix: >-
+      Move the condition into the ON clause, or allow for the NULLs explicitly
+      with `(e.salary > 200000 or e.emp_id is null)`. The first is clearer.
+
+  - mistake: Expecting the written order to be the execution order
+    why: >-
+      Every other language evaluates top to bottom. SQL's clause order is a
+      historical choice made for readability, not for evaluation.
+    fix: >-
+      Learn the nine-step order once. Every alias and aggregate error then
+      explains itself, and you stop having to remember which clauses allow what.
+
+performance: |
+  Logical order says nothing about cost; the planner reorders freely. Two
+  consequences are worth knowing.
+
+  **Predicate pushdown**: a `WHERE` condition written against the outer query
+  is usually pushed inside a subquery, a view or a CTE so it filters as early as
+  possible. PostgreSQL does this for views and ordinary subqueries, and since
+  version 12 for CTEs too — before that, a CTE was an optimisation fence, which
+  is why older advice treats `WITH` as something to use carefully.
+
+  **Early termination**: `ORDER BY ... LIMIT n` with a matching index lets the
+  executor stop after n rows instead of sorting everything. This is one of the
+  largest wins available and it depends entirely on the index matching the sort.
+
+  Neither changes what the query means. If a rewrite changes the result, it was
+  not a performance change.
+
+interviewQuestions:
+  - question: What is the logical order of execution of a SELECT statement?
+    answer: >-
+      FROM, then JOIN with its ON conditions, then WHERE, then GROUP BY, then
+      HAVING, then the SELECT list, then DISTINCT, then ORDER BY, then
+      LIMIT/OFFSET. It explains why a select-list alias is unavailable in WHERE
+      but available in ORDER BY, why aggregates cannot appear in WHERE, and why
+      a filter on the right table of a LEFT JOIN placed in WHERE converts it to
+      an inner join. It is a definition of meaning, not of execution — the
+      planner reorders freely as long as the result is unchanged.
+
+  - question: What is the difference between WHERE and HAVING?
+    answer: >-
+      WHERE filters individual rows before grouping and cannot reference
+      aggregates; HAVING filters groups after grouping and can. A condition that
+      does not involve an aggregate should go in WHERE, where it removes rows
+      before the more expensive grouping step. HAVING without GROUP BY treats
+      the entire result as a single group.
+
+  - question: Why does a filter on the outer table of a LEFT JOIN behave differently in ON and in WHERE?
+    answer: >-
+      ON participates in matching, so a non-matching row still produces a
+      NULL-extended output row and the outer join's guarantee is preserved.
+      WHERE runs after the join and tests those NULL-extended rows, where any
+      comparison against the NULL columns yields NULL rather than true, so they
+      are dropped — making the result identical to an inner join. For inner
+      joins the two placements are equivalent, which is how the habit forms.
+
+  - question: Does PostgreSQL actually execute clauses in the logical order?
+    answer: >-
+      No. The planner produces a physical plan that may filter before joining,
+      rewrite subqueries as joins, use an index to satisfy ORDER BY without
+      sorting, or stop early for a LIMIT. The logical order defines what the
+      query means; EXPLAIN shows what it does. Confusing the two leads to
+      "optimisations" like rewriting a subquery as a join, which the planner
+      usually already did.
+
+exercises:
+  - prompt: >-
+      For each country, show the number of customers and the number of distinct
+      cities, but only for countries with at least two customers. Exclude
+      customers who signed up before 2023. Columns country, customers, cities,
+      ordered by customers descending then country.
+    difficulty: Easy
+    hint: >-
+      The signup filter is about rows, so it belongs in WHERE. The "at least
+      two" filter is about groups, so it belongs in HAVING.
+    solutionSql: |
+      select country,
+             count(*)               as customers,
+             count(distinct city)   as cities
+      from customers
+      where signup_date >= date '2023-01-01'
+      group by country
+      having count(*) >= 2
+      order by customers desc, country
+
+  - prompt: >-
+      List every department with the number of employees earning more than
+      150000, including departments where that count is zero. Columns
+      dept_name, high_earners. Order by high_earners descending then dept_name.
+    difficulty: Medium
+    hint: >-
+      A LEFT JOIN with the salary condition in ON keeps the empty departments.
+      Count a column from the employees side so the non-matches count as zero.
+    solutionSql: |
+      select d.dept_name,
+             count(e.emp_id) as high_earners
+      from departments d
+      left join employees e
+             on e.dept_id = d.dept_id
+            and e.salary > 150000
+      group by d.dept_name
+      order by high_earners desc, d.dept_name
+
+  - prompt: >-
+      Return job titles held by more than one active employee, with the count
+      and the highest salary for that title. Columns job_title, holders,
+      top_salary, ordered by holders descending then job_title.
+    difficulty: Easy
+    hint: >-
+      is_active is a row-level condition; "more than one" is a group-level one.
+    solutionSql: |
+      select job_title,
+             count(*)     as holders,
+             max(salary)  as top_salary
+      from employees
+      where is_active
+      group by job_title
+      having count(*) > 1
+      order by holders desc, job_title
+
+checklist:
+  - "Evaluation order: FROM, JOIN/ON, WHERE, GROUP BY, HAVING, SELECT, DISTINCT, ORDER BY, LIMIT"
+  - SELECT is the sixth step, which is why aliases are unavailable in WHERE
+  - Aggregates cannot appear in WHERE because no groups exist yet
+  - WHERE filters rows, HAVING filters groups — prefer WHERE when both would work
+  - A LEFT JOIN filter in WHERE silently turns it into an inner join
+  - After GROUP BY only grouped columns and aggregates are available
+  - Grouping by a primary key frees the other columns of that table in PostgreSQL
+  - Logical order defines meaning; EXPLAIN shows what actually happens
+
+related:
+  - f-filtering
+  - a-group-by-having
+  - j-inner-outer
+  - p-explain
+
+dialect:
+  standard: >-
+    The logical processing order is defined by the SQL standard, as is the rule
+    that non-aggregated select-list columns must appear in GROUP BY. SQL:1999
+    added the functional-dependency relaxation for primary keys.
+  postgres: >-
+    Implements the functional-dependency relaxation, allows a select-list alias
+    in GROUP BY, and since version 12 no longer treats a CTE as an optimisation
+    fence unless it is declared MATERIALIZED.
+  mysql: >-
+    Historically allowed selecting arbitrary non-aggregated columns with no
+    GROUP BY relationship at all, returning a value from an unspecified row.
+    The ONLY_FULL_GROUP_BY mode, on by default since 5.7, restores standard
+    behaviour. MySQL also permits select-list aliases in HAVING and in GROUP BY,
+    which PostgreSQL does for GROUP BY only.

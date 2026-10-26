@@ -1,0 +1,443 @@
+id: i-views
+moduleId: intermediate
+position: 60
+title: Views and materialised views
+slug: views
+difficulty: Intermediate
+estimatedMinutes: 20
+summary: >-
+  A view is a stored query, not stored data — which explains everything about
+  how it performs and when it can be written through. Materialised views are
+  the opposite: stored data that goes stale.
+tags: [views, materialized-views, abstraction, updatable-views]
+
+prerequisites:
+  - i-ctes
+
+objectives:
+  - Say what a view stores and what it does not
+  - Read a view's definition out of the catalogue
+  - Explain when a view is automatically updatable and when it is not
+  - Contrast a view with a materialised view on freshness and cost
+  - Decide when a view helps and when it hides a problem
+
+concept: |
+  ## A view is a stored query
+
+  `CREATE VIEW v AS SELECT ...` stores the **text of the query**, not its
+  result. Selecting from the view substitutes the definition into your query
+  and plans the whole thing together, so a filter you apply outside the view is
+  usually pushed inside it.
+
+  Two consequences follow immediately:
+
+  - A view is **always current**. It cannot be stale, because there is nothing
+    stored to go stale.
+  - A view has **no intrinsic performance cost and no intrinsic benefit**.
+    Querying a view is querying its definition. A slow view is a slow query
+    with a name.
+
+  The second point is the one people get wrong in both directions — some avoid
+  views fearing overhead, others add them hoping for caching. Neither happens.
+
+  ## What views are good for
+
+  - **Naming a join or a formula** so it is defined once. `order_revenue` in
+    this dataset exists because `quantity * unit_price * (1 - discount)` was
+    being written in a dozen places, and one of those places was eventually
+    going to get it wrong.
+  - **A stable interface over a changing schema.** Callers select from the
+    view; the table underneath can be reshaped as long as the view's output
+    stays the same.
+  - **Row- and column-level access control.** Grant `SELECT` on a view that
+    excludes the salary column, and revoke it on the table. The privilege is
+    checked against the view's owner, so the caller needs no rights on the base
+    table at all.
+
+  The last one is a real security mechanism, not a convention. It is also why
+  `SECURITY INVOKER` versus the default `SECURITY DEFINER`-like behaviour of
+  views is worth understanding before relying on it.
+
+  ## Updatable views
+
+  A simple view — one table, no aggregate, no DISTINCT, no GROUP BY, no window
+  function, no set operation — is **automatically updatable**: you can INSERT,
+  UPDATE and DELETE through it and PostgreSQL rewrites the statement against
+  the base table.
+
+  Anything more complex is not, because the mapping back is ambiguous: given a
+  row of a grouped view, which base rows should an UPDATE change? For those,
+  PostgreSQL offers `INSTEAD OF` triggers, where you write the mapping
+  yourself.
+
+  `WITH CHECK OPTION` closes the obvious hole: without it, you can insert a row
+  through a filtered view that the view's own `WHERE` clause excludes, so the
+  row vanishes from the view immediately after being inserted through it.
+
+  ## Materialised views
+
+  `CREATE MATERIALIZED VIEW` stores the **result**. It is a table that
+  remembers how to rebuild itself.
+
+  - Reads are as fast as a table, because it is one.
+  - It can be indexed. An ordinary view cannot.
+  - It is **stale** from the moment it is built until `REFRESH MATERIALIZED
+    VIEW` is run. There is no automatic refresh.
+  - A plain refresh takes an exclusive lock, blocking readers.
+  `REFRESH ... CONCURRENTLY` does not, but requires a unique index on the
+    materialised view and is slower.
+
+  So the decision is a freshness-versus-cost trade, and it should be stated as
+  one: "this dashboard may be up to fifteen minutes out of date, and in
+  exchange it loads in 40 ms instead of 9 seconds" is an engineering decision.
+  "We added a materialised view to make it faster" is half of one.
+
+syntax:
+  - form: "CREATE VIEW v AS SELECT ..."
+    notes: >-
+      Stores the query text, not its result. The column list is resolved and
+      frozen at creation time, which is why `SELECT *` in a view definition
+      does not track later columns.
+  - form: "CREATE OR REPLACE VIEW v AS SELECT ..."
+    notes: >-
+      Redefines an existing view. The new definition must keep the same
+      columns, in the same order, with the same types — you may append columns
+      but not remove or reorder them.
+  - form: "CREATE VIEW v AS SELECT ... WITH CHECK OPTION"
+    notes: >-
+      Rejects an INSERT or UPDATE through the view that would produce a row
+      the view's own WHERE clause excludes. Without it such a row is accepted
+      and then invisible.
+  - form: "CREATE MATERIALIZED VIEW mv AS SELECT ..."
+    notes: >-
+      Stores the result as a physical table. Can be indexed; is stale until
+      refreshed; is not in the SQL standard.
+  - form: "REFRESH MATERIALIZED VIEW [CONCURRENTLY] mv"
+    notes: >-
+      Rebuilds it entirely. The plain form takes an ACCESS EXCLUSIVE lock;
+      CONCURRENTLY does not but requires a unique index on the view.
+  - form: "CREATE TRIGGER ... INSTEAD OF INSERT ON v"
+    notes: >-
+      How a non-updatable view is made writable — you define the mapping back
+      to the base tables yourself.
+
+sampleTables: [order_revenue, employee_directory, orders, employees]
+
+examples:
+  - title: Selecting from a view
+    sql: |
+      select order_id,
+             order_date,
+             status,
+             line_count,
+             units,
+             round(revenue, 2) as revenue
+      from order_revenue
+      where status = 'completed'
+        and order_date >= date '2024-01-01'
+      order by revenue desc
+      limit 10
+    walkthrough: |
+      `order_revenue` is a view defined in migration V3. It joins `orders` to
+      `order_items`, groups by the order, and computes the revenue formula
+      once.
+
+      The `WHERE` clause here is applied outside the view, and the planner
+      pushes `status = 'completed'` and the date range down into the scan of
+      `orders` inside the view's definition — so this does not compute revenue
+      for every order and then filter. That pushdown is why a view costs
+      nothing extra.
+
+      What the view buys is that the revenue formula, the outer join to
+      `order_items` and the `coalesce` for orders with no lines are written
+      once, in one place, correctly.
+
+  - title: Reading a view's definition from the catalogue
+    sql: |
+      select table_name,
+             is_updatable,
+             is_insertable_into
+      from information_schema.views
+      where table_schema = 'learning'
+      order by table_name
+    walkthrough: |
+      Views are described in `information_schema.views`, which is queryable
+      with ordinary SQL like everything else in the catalogue.
+
+      Both views here report `is_updatable = NO`. `order_revenue` groups and
+      aggregates, so there is no way to map an UPDATE back to base rows.
+      `employee_directory` joins three tables, which is also disqualifying —
+      even though it feels like it should be updatable, because a change to
+      `salary` has an obvious target. PostgreSQL does not guess.
+
+      `information_schema.views` also exposes a `view_definition` column with
+      the SQL text. It is omitted here because the normalised definition
+      PostgreSQL stores is long; `\d+ learning.order_revenue` in psql is the
+      comfortable way to read it.
+
+  - title: A view that hides a join
+    sql: |
+      select full_name,
+             job_title,
+             dept_name,
+             location,
+             manager_name,
+             salary
+      from employee_directory
+      where dept_name = 'Engineering'
+        and is_active
+      order by salary desc
+      limit 8
+    walkthrough: |
+      Three tables — employees, departments and employees again for the
+      manager — behind one name. The query reads like a query against a single
+      denormalised table.
+
+      Notice the two outer joins the view performs on your behalf. The CEO has
+      no manager and two employees have no department, and the view keeps all
+      of them with NULLs rather than dropping them. Every caller writing this
+      join by hand would have to remember that, and some would not.
+
+      The trade: `dept_name = 'Engineering'` filters on a joined column, so the
+      planner must do the join before it can filter. Filtering on
+      `dept_id = 10` against the base table would be cheaper. Convenience has a
+      cost, and here it is small.
+
+  - title: What a view is not — the staleness a materialised view would have
+    sql: |
+      select (select count(*) from orders)                            as orders_now,
+             (select count(*) from order_revenue)                     as rows_in_view,
+             (select count(*) from order_revenue where revenue = 0)   as zero_revenue_orders,
+             (select round(sum(revenue), 2) from order_revenue
+              where status = 'completed')                             as completed_revenue
+    walkthrough: |
+      `rows_in_view` equals `orders_now` and always will, instantly, because
+      the view is executed at query time. Insert an order and the next select
+      from the view includes it.
+
+      A materialised view of the same definition would report whatever was true
+      at the last `REFRESH`. That is the whole difference, and it is why the
+      choice between them is about freshness requirements rather than about
+      style.
+
+      `zero_revenue_orders` is non-zero: those are the cancelled orders with no
+      line items, kept by the view's outer join and given 0 by its `coalesce`.
+      A view that had silently excluded them would make this number
+      unobtainable without going back to the base tables.
+
+edgeCases:
+  - title: A view's columns are fixed when it is created
+    body: >-
+      `CREATE VIEW v AS SELECT * FROM t` resolves the `*` at creation time and
+      stores the column list. Adding a column to `t` afterwards does **not**
+      add it to the view — the view keeps returning the original columns until
+      it is recreated. This is a frequent surprise, and it is a good reason not
+      to write `SELECT *` in a view definition, where it reads as "all columns"
+      and means "these columns, as of today".
+    sql: |
+      select column_name, ordinal_position, data_type
+      from information_schema.columns
+      where table_schema = 'learning'
+        and table_name   = 'employee_directory'
+      order by ordinal_position
+
+  - title: Querying a view is querying its definition
+    body: >-
+      These two queries return the same number because they are the same query.
+      The view adds a name and removes the opportunity to write the join
+      differently; it adds no caching, no materialisation and no overhead. If
+      the view version were slower, that would be a planning difference worth
+      investigating with EXPLAIN, not an inherent cost of views.
+    sql: |
+      select (select count(*) from employee_directory where dept_name = 'Sales') as via_view,
+             (select count(*)
+              from employees e
+              left join departments d on d.dept_id = e.dept_id
+              where d.dept_name = 'Sales')                                       as written_out
+
+pitfalls:
+  - mistake: Expecting a view to cache its result
+    why: >-
+      The word "view" suggests a snapshot, and materialised views exist, so the
+      distinction is easy to lose. An ordinary view re-executes every time.
+    fix: >-
+      If you want a stored result, say MATERIALIZED and own the refresh. If you
+      want freshness, an ordinary view gives it for free.
+
+  - mistake: Stacking views on views on views
+    why: >-
+      Each layer is substituted into the next, so a three-deep stack presents
+      the planner with one very large query. Estimates degrade, join orders get
+      strange, and the query that is slow has no single place to look at.
+    fix: >-
+      Keep view nesting shallow. When a pipeline genuinely needs several
+      stages, consider a materialised view at the expensive boundary.
+
+  - mistake: Writing SELECT * in a view definition
+    why: >-
+      The star is expanded and frozen at creation time, so the view does not
+      pick up new columns — but it does break if a column it captured is
+      dropped. It gives the appearance of tracking the table while doing
+      neither reliably.
+    fix: >-
+      List the columns. The view's contract is then explicit and visible in its
+      definition.
+
+  - mistake: Relying on a materialised view without a refresh strategy
+    why: >-
+      It is correct on the day it is built. Then the data moves on and nobody
+      notices, because a stale result looks exactly like a fresh one.
+    fix: >-
+      Decide and document the refresh schedule and the acceptable staleness.
+      Expose the last refresh time next to the numbers, so a stale dashboard
+      says so.
+
+performance: |
+  An ordinary view is inlined into the calling query, so predicates are pushed
+  down, joins are reordered freely, and the plan is whatever the equivalent
+  written-out query would get. There is no per-view overhead to measure.
+
+  The exception is a view containing something the planner cannot see
+  through — a window function, a `DISTINCT ON`, a `LIMIT`, or an aggregate
+  whose grouping the outer filter does not align with. Then the view acts as an
+  optimisation barrier in practice, and filtering outside it means computing
+  the whole thing first.
+
+  A materialised view is a table: it can be indexed, it has statistics, and it
+  is as fast to read as its size and indexes allow. `REFRESH MATERIALIZED VIEW`
+  rebuilds it entirely and takes an `ACCESS EXCLUSIVE` lock; `REFRESH ...
+  CONCURRENTLY` builds the new contents alongside the old and swaps, requiring
+  a unique index and roughly doubling the work. Neither is incremental —
+  PostgreSQL has no built-in incremental materialised-view maintenance, which
+  is the main reason large ones are refreshed on a schedule rather than on
+  write.
+
+interviewQuestions:
+  - question: What is the difference between a view and a materialised view?
+    answer: >-
+      A view stores the query text and executes it on every access, so it is
+      always current and has no storage. A materialised view stores the result
+      as a physical table, so reads are as fast as a table and it can be
+      indexed, but it is stale until explicitly refreshed. Choosing between them
+      is a freshness-versus-cost decision: a materialised view is right when the
+      underlying query is expensive, the data changes less often than it is
+      read, and a known staleness window is acceptable.
+
+  - question: Does using a view make a query slower?
+    answer: >-
+      No, in general. PostgreSQL substitutes the view's definition into the
+      calling query and plans them together, including pushing the caller's
+      predicates down into the view. The plan is the same as writing the query
+      out. The exception is a view containing a construct the planner cannot
+      see through — a window function, a LIMIT, a DISTINCT ON, or an aggregate
+      at the wrong grain — where the view does become an optimisation barrier
+      and outer filters cannot be pushed in.
+
+  - question: When is a view updatable?
+    answer: >-
+      When it is simple enough for PostgreSQL to map a modification back to
+      exactly one base row: a single table in FROM, no aggregates, no GROUP BY
+      or HAVING, no DISTINCT, no window functions, no set operations and no
+      LIMIT. Then INSERT, UPDATE and DELETE are rewritten against the base
+      table. For anything more complex you write an INSTEAD OF trigger that
+      defines the mapping. Adding WITH CHECK OPTION prevents inserting or
+      updating a row through the view that the view's own WHERE clause would
+      exclude.
+
+  - question: How can a view be used for access control?
+    answer: >-
+      Grant SELECT on a view that omits sensitive columns or restricts rows,
+      and withhold privileges on the base table. Permissions on the base table
+      are checked against the view's owner rather than the caller, so a user
+      with no rights on the table can read exactly what the view exposes. This
+      is a genuine privilege boundary enforced by the database. For row-level
+      restrictions that vary per user, PostgreSQL's row-level security policies
+      are usually the better tool, since they apply to every access path rather
+      than only to those that go through the view.
+
+exercises:
+  - prompt: >-
+      Using the order_revenue view, return the five customers with the highest
+      completed revenue. Columns customer_id, orders, revenue rounded to two
+      decimals. Order by revenue descending.
+    difficulty: Easy
+    hint: >-
+      Group the view by customer_id and filter on status before grouping.
+    solutionSql: |
+      select customer_id,
+             count(*)               as orders,
+             round(sum(revenue), 2) as revenue
+      from order_revenue
+      where status = 'completed'
+      group by customer_id
+      order by revenue desc, customer_id
+      limit 5
+
+  - prompt: >-
+      Using employee_directory, list the active employees whose manager is in a
+      different department from their own. Columns full_name, dept_name,
+      manager_name. Order by full_name.
+    difficulty: Medium
+    hint: >-
+      The view exposes manager_id but not the manager's department, so join
+      back to the view itself on manager_id.
+    solutionSql: |
+      select e.full_name,
+             e.dept_name,
+             e.manager_name
+      from employee_directory e
+      join employee_directory m on m.emp_id = e.manager_id
+      where e.is_active
+        and e.dept_id is distinct from m.dept_id
+      order by e.full_name
+
+  - prompt: >-
+      List every view in the learning schema with the number of columns it
+      has. Columns table_name, columns. Order by table_name.
+    difficulty: Medium
+    hint: >-
+      Join information_schema.views to information_schema.columns on the
+      schema and table name.
+    solutionSql: |
+      select v.table_name,
+             count(c.column_name) as columns
+      from information_schema.views v
+      join information_schema.columns c
+        on c.table_schema = v.table_schema
+       and c.table_name   = v.table_name
+      where v.table_schema = 'learning'
+      group by v.table_name
+      order by v.table_name
+
+checklist:
+  - A view stores the query text, not the result, so it is always current
+  - A view is inlined into the calling query and has no inherent cost or benefit
+  - "A view's columns are fixed at creation — SELECT * is frozen, not tracking"
+  - Simple single-table views are automatically updatable; complex ones need INSTEAD OF triggers
+  - WITH CHECK OPTION stops inserting rows the view would then hide
+  - A materialised view stores data, can be indexed, and is stale until refreshed
+  - "REFRESH takes an exclusive lock; CONCURRENTLY does not but needs a unique index"
+  - Views grant access without granting rights on the base table
+
+related:
+  - i-ctes
+  - s-normalisation
+  - pg-advanced-features
+  - p-explain
+
+dialect:
+  standard: >-
+    CREATE VIEW, WITH CHECK OPTION, the updatable-view rules and
+    information_schema.views are all standard SQL. Materialised views are not
+    in the standard.
+  postgres: >-
+    Automatically updatable simple views since 9.3, INSTEAD OF triggers for the
+    rest, and materialised views since 9.3 with CONCURRENTLY refresh since 9.4.
+    No incremental refresh. Views can also be the basis of row-level access
+    control, alongside row-level security policies.
+  mysql: >-
+    Has views with similar updatability rules and WITH CHECK OPTION, but no
+    materialised views at all — the usual workaround is a real table refreshed
+    by an event or an application job. Oracle has materialised views with
+    incremental "fast refresh" on materialised view logs, which PostgreSQL
+    does not.

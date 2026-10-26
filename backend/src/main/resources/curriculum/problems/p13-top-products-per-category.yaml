@@ -1,0 +1,368 @@
+id: p13-top-products-per-category
+position: 120
+title: Best-selling product in each category
+slug: top-products-per-category
+difficulty: Hard
+topic: Joins
+tags: [aggregation, top-n-per-group, fan-out, outer-join]
+
+orderSensitive: false
+
+statement: |
+  For every product category, return the product with the highest total
+  revenue from completed orders, with that revenue and the number of distinct
+  orders it appeared on.
+
+  Categories with no products, and categories whose products were never
+  ordered on a completed order, must still appear — with NULLs.
+
+  Revenue for a line is `quantity * unit_price * (1 - discount)`.
+
+tables: [categories, products, order_items, orders]
+
+expectedColumns: [category_name, product_name, revenue, orders]
+
+edgeCases:
+  - >-
+    Four products have never been ordered at all, and one leaf category has
+    no products.
+  - Cancelled orders must be excluded, which changes the ranking.
+  - >-
+    Joining orders to order_items fans out, so counting orders needs
+    count(distinct) or a separate aggregation step.
+  - >-
+    Categories form a hierarchy, but this question asks about the product's
+    direct category, not a rolled-up one.
+
+hints:
+  - Aggregate to one row per product first. Then rank. Then pick.
+  - >-
+    "Categories must still appear" tells you where the outer join has to be,
+    and it is not inside the aggregation.
+  - A per-group LIMIT needs LATERAL, and LATERAL needs a driving table.
+
+solutionSql: |
+  with product_revenue as (
+      select p.product_id,
+             p.category_id,
+             p.product_name,
+             sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue,
+             count(distinct oi.order_id)                          as orders
+      from products p
+      join order_items oi on oi.product_id = p.product_id
+      join orders o       on o.order_id    = oi.order_id
+      where o.status = 'completed'
+      group by p.product_id, p.category_id, p.product_name
+  )
+  select c.category_name,
+         top.product_name,
+         round(top.revenue, 2) as revenue,
+         top.orders
+  from categories c
+  left join lateral (
+        select pr.product_name, pr.revenue, pr.orders
+        from product_revenue pr
+        where pr.category_id = c.category_id
+        order by pr.revenue desc, pr.product_id
+        limit 1) top on true
+  order by c.category_name
+
+explanation:
+  lineByLine:
+    - clause: "with product_revenue as (...)"
+      note: >-
+        Aggregates to one row per product first. Doing the ranking and the
+        aggregation in one step is where this problem usually goes wrong,
+        because the join to order_items fans out.
+    - clause: "count(distinct oi.order_id)"
+      note: >-
+        A product can appear on several lines of one order, and the join
+        produces a row per line. Without DISTINCT this counts lines and calls
+        them orders.
+    - clause: "where o.status = 'completed'"
+      note: >-
+        Applied before aggregation, so cancelled lines contribute nothing.
+        Placing it in HAVING would be impossible — there is no single status
+        per product.
+    - clause: "left join lateral (...) on true"
+      note: >-
+        LEFT keeps categories whose subquery found nothing, which covers both
+        the empty category and the categories whose products never sold.
+        `ON true` is required by the grammar.
+    - clause: "order by pr.revenue desc, pr.product_id limit 1"
+      note: >-
+        Top-1 within the category, with product_id breaking a revenue tie so
+        the answer is reproducible.
+
+  walkthrough: |
+    `product_revenue` joins products to their completed order lines and sums
+    the line revenue, producing one row per product that sold. Products never
+    ordered, and products whose only orders were cancelled, are absent from
+    it entirely — which is correct, and is why the outer join has to be
+    outside.
+
+    For each of the nine categories, the lateral subquery picks that
+    category's highest-revenue product. Laptops returns the most expensive
+    line of business; Accessories returns a cheaper product that sold in
+    volume, which is the kind of result that makes the question worth asking.
+
+    Categories with no qualifying product come back with NULLs rather than
+    being dropped. Two of them are parents — Electronics and Home hold no
+    products directly, only subcategories — which is a reminder that the
+    question asked about the direct category rather than the subtree.
+
+  alternatives:
+    - title: ROW_NUMBER over the aggregate
+      sql: |
+        with product_revenue as (
+            select p.product_id, p.category_id, p.product_name,
+                   sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue,
+                   count(distinct oi.order_id)                          as orders
+            from products p
+            join order_items oi on oi.product_id = p.product_id
+            join orders o       on o.order_id    = oi.order_id
+            where o.status = 'completed'
+            group by p.product_id, p.category_id, p.product_name
+        ),
+        ranked as (
+            select pr.*,
+                   row_number() over (partition by pr.category_id
+                                      order by pr.revenue desc, pr.product_id) as rn
+            from product_revenue pr
+        )
+        select c.category_name,
+               r.product_name,
+               round(r.revenue, 2) as revenue,
+               r.orders
+        from categories c
+        left join ranked r on r.category_id = c.category_id and r.rn = 1
+        order by c.category_name
+      when: >-
+        The portable form, and equally good here. Note `and r.rn = 1` is in
+        the ON clause — moving it to WHERE would drop the empty categories and
+        silently turn the outer join into an inner one.
+      equivalent: true
+
+    - title: Rolled up through the category hierarchy
+      sql: |
+        with recursive subtree as (
+            select category_id as root_id, category_id as descendant_id
+            from categories
+            union all
+            select s.root_id, c.category_id
+            from subtree s
+            join categories c on c.parent_category_id = s.descendant_id
+        ),
+        product_revenue as (
+            select p.product_id, p.category_id, p.product_name,
+                   sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue
+            from products p
+            join order_items oi on oi.product_id = p.product_id
+            join orders o       on o.order_id    = oi.order_id
+            where o.status = 'completed'
+            group by p.product_id, p.category_id, p.product_name
+        )
+        select c.category_name,
+               round(sum(pr.revenue), 2) as subtree_revenue,
+               count(distinct pr.product_id) as products
+        from categories c
+        join subtree s on s.root_id = c.category_id
+        left join product_revenue pr on pr.category_id = s.descendant_id
+        group by c.category_id, c.category_name
+        order by subtree_revenue desc nulls last, c.category_name
+      when: >-
+        When "category" should mean the whole subtree rather than the direct
+        assignment — which is usually what a business means by "revenue by
+        category". Electronics then has revenue even though no product is
+        directly assigned to it.
+      equivalent: false
+
+  performance: |
+    The aggregation dominates: a three-table join over every completed order
+    line, grouped by product. Indexes on `order_items(product_id)` and
+    `orders(order_id)` — the latter being the primary key — make the joins
+    cheap, and both exist here.
+
+    The lateral subquery runs once per category and scans `product_revenue`,
+    which is a CTE with no index. With nine categories that is irrelevant;
+    with ten thousand it would not be, and the ROW_NUMBER form — one sort over
+    the aggregate — becomes the better choice. This is the opposite of the
+    usual LATERAL advantage, because the driving side is small but the
+    probed side is an unindexed intermediate result.
+
+    `count(distinct order_id)` per product is the most expensive aggregate
+    here, since each group must deduplicate. If an approximate count were
+    acceptable it could be dropped; if exact counts across many such columns
+    were needed, a two-stage aggregation would be faster.
+
+  wrongApproaches:
+    - title: Ranking before aggregating
+      sql: |
+        with ranked as (
+            select p.category_id,
+                   p.product_name,
+                   oi.quantity * oi.unit_price * (1 - oi.discount) as line_revenue,
+                   row_number() over (partition by p.category_id
+                                      order by oi.quantity * oi.unit_price * (1 - oi.discount) desc) as rn
+            from products p
+            join order_items oi on oi.product_id = p.product_id
+            join orders o       on o.order_id    = oi.order_id
+            where o.status = 'completed'
+        )
+        select category_id, product_name, round(line_revenue, 2) as revenue
+        from ranked
+        where rn = 1
+        order by category_id
+      whyWrong: >-
+        Ranks individual **lines**, so it returns the single largest order
+        line in each category rather than the product with the highest total.
+        A product that sold steadily in small quantities loses to one that had
+        a single large order, which is usually the opposite of what was meant.
+
+    - title: "count(*) instead of count(distinct order_id)"
+      sql: |
+        with product_revenue as (
+            select p.product_id, p.category_id, p.product_name,
+                   sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue,
+                   count(*) as orders
+            from products p
+            join order_items oi on oi.product_id = p.product_id
+            join orders o       on o.order_id    = oi.order_id
+            where o.status = 'completed'
+            group by p.product_id, p.category_id, p.product_name
+        )
+        select product_name, round(revenue, 2) as revenue, orders
+        from product_revenue
+        order by revenue desc, product_id
+        limit 5
+      whyWrong: >-
+        Counts order **lines** rather than distinct orders. The primary key on
+        order_items is (order_id, product_id), so a product appears at most
+        once per order and the two happen to agree on this data — which means
+        the bug is invisible here and would appear the moment the schema
+        allowed a product twice on one order.
+
+    - title: Filtering the outer side in WHERE
+      sql: |
+        with product_revenue as (
+            select p.product_id, p.category_id, p.product_name,
+                   sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue
+            from products p
+            join order_items oi on oi.product_id = p.product_id
+            join orders o       on o.order_id    = oi.order_id
+            group by p.product_id, p.category_id, p.product_name
+        ),
+        ranked as (
+            select pr.*, row_number() over (partition by pr.category_id
+                                            order by pr.revenue desc, pr.product_id) as rn
+            from product_revenue pr
+        )
+        select c.category_name, r.product_name, round(r.revenue, 2) as revenue
+        from categories c
+        left join ranked r on r.category_id = c.category_id
+        where r.rn = 1
+        order by c.category_name
+      whyWrong: >-
+        Two faults. `where r.rn = 1` tests a NULL for categories with no
+        qualifying product, so those categories are dropped and the LEFT JOIN
+        becomes an inner one. And the status filter has been lost, so
+        cancelled orders now count towards revenue — which changes the
+        ranking, not just the totals.
+
+  extraTests:
+    - name: Empty order_items (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt has order_items intentionally empty, so no product has
+        any revenue at all. Every category must still appear with NULLs —
+        this is the degenerate case that distinguishes a correct outer join
+        from a lucky one.
+      sql: |
+        with product_revenue as (
+            select p.product_id,
+                   p.category_id,
+                   p.product_name,
+                   sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue,
+                   count(distinct oi.order_id)                          as orders
+            from products p
+            join order_items oi on oi.product_id = p.product_id
+            join orders o       on o.order_id    = oi.order_id
+            where o.status = 'completed'
+            group by p.product_id, p.category_id, p.product_name
+        )
+        select c.category_name,
+               top.product_name,
+               round(top.revenue, 2) as revenue,
+               top.orders
+        from categories c
+        left join lateral (
+              select pr.product_name, pr.revenue, pr.orders
+              from product_revenue pr
+              where pr.category_id = c.category_id
+              order by pr.revenue desc, pr.product_id
+              limit 1) top on true
+        order by c.category_name
+
+    - name: How much the status filter changes the ranking
+      schema: learning
+      note: >-
+        Running the aggregate with and without the cancelled-order exclusion
+        shows that it is not a rounding difference — some products' totals
+        move enough to change which one leads its category.
+      sql: |
+        select p.product_id,
+               p.product_name,
+               round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2) as all_statuses,
+               round(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                     filter (where o.status = 'completed'), 2)                as completed_only
+        from products p
+        join order_items oi on oi.product_id = p.product_id
+        join orders o       on o.order_id    = oi.order_id
+        group by p.product_id, p.product_name
+        order by all_statuses desc, p.product_id
+        limit 10
+
+  followUps:
+    - question: Why must the aggregation come before the ranking?
+      answer: >-
+        Because the question ranks products by their total revenue, and the
+        total only exists after aggregation. Ranking the joined rows ranks
+        individual order lines, so a single large order beats a product that
+        sold steadily — a different and usually wrong answer. The general rule
+        for these problems is aggregate to the grain the question asks about,
+        then rank, then filter, in three separate steps.
+
+    - question: Where does the outer join belong, and why not inside the CTE?
+      answer: >-
+        Outside. The CTE's job is to compute revenue for products that sold,
+        and a product that never sold has no revenue — NULL is not zero here,
+        it is "no qualifying lines". Making the join inside the CTE outer
+        would produce a row per product with NULL revenue, which then has to
+        be excluded from the ranking anyway. Keeping the aggregation inner and
+        the category join outer puts each concern where it belongs.
+
+    - question: How would you report revenue rolled up through the category tree?
+      answer: >-
+        Build the closure of the hierarchy with a recursive CTE — every
+        category paired with each of its descendants including itself — then
+        join product revenue to the descendant side and group by the ancestor.
+        Electronics then shows the sum of Computers, Laptops, Accessories and
+        Audio. This is almost always what a business means by "revenue by
+        category", and the direct-assignment version is the more literal
+        reading of the question.
+
+    - question: What would you index for this query?
+      answer: >-
+        `order_items(product_id)` for the join from products, which exists,
+        and `orders(order_id, status)` so the status filter can be applied
+        during the join rather than afterwards — though the primary key
+        already covers the join and the status filter is cheap on a narrow
+        table. The more significant win on a large fact table would be a
+        materialised view of product revenue refreshed periodically, since the
+        aggregate is expensive and the answer changes slowly.
+
+  related:
+    - w-top-n-per-group
+    - j-inner-outer
+    - a-group-by-having
+    - p05-department-top-earners

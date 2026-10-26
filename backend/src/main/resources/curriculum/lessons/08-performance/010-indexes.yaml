@@ -1,0 +1,504 @@
+id: p-indexes
+moduleId: performance
+position: 10
+title: How indexes work and when they are ignored
+slug: indexes
+difficulty: Advanced
+estimatedMinutes: 30
+summary: >-
+  A B-tree index is a sorted structure with a leftmost-prefix rule, which
+  explains both when it helps and the four common reasons the planner refuses
+  to use one.
+tags: [indexes, b-tree, sargable, composite-index, covering-index, gin]
+
+prerequisites:
+  - f-filtering
+
+objectives:
+  - Describe what a B-tree index stores and why column order matters
+  - State the leftmost-prefix rule and apply it to a given index
+  - List four reasons the planner declines to use an index
+  - Choose between a composite index and several single-column indexes
+  - Name the index types beyond B-tree and what each is for
+
+concept: |
+  ## What a B-tree index is
+
+  A sorted structure mapping indexed values to row locations. Because it is
+  sorted, it supports:
+
+  - equality — `col = x`
+  - ranges — `col > x`, `BETWEEN`
+  - prefix matching — `col LIKE 'abc%'`
+  - ordering — satisfying `ORDER BY col` without a sort
+  - `IS NULL`, because PostgreSQL indexes NULLs
+  - `min(col)` and `max(col)`, read from either end
+
+  What it cannot do is anything that is not about the value's **sorted
+  position**: `LIKE '%abc'` has no known prefix, `f(col) = x` asks about a
+  different value.
+
+  ## Composite indexes and the leftmost prefix
+
+  An index on `(a, b, c)` sorts by `a`, then by `b` within equal `a`, then by
+  `c`. So it can serve a query that constrains:
+
+  - `a`
+  - `a, b`
+  - `a, b, c`
+
+  and **not** `b` alone, or `c` alone, or `b, c`. This is the **leftmost
+  prefix rule**, and it follows directly from the sort order: a phone book
+  sorted by surname then forename cannot find everyone called David.
+
+  The subtlety: a **range** on an earlier column stops the later ones being
+  used for seeking. With `(a, b)` and `where a > 5 and b = 3`, the index finds
+  the `a > 5` region and must then filter on `b`, because within that region
+  `b` is not sorted. Equality first, range last, when ordering the columns.
+
+  ## Covering and index-only scans
+
+  If every column a query needs is in the index, PostgreSQL can answer from
+  the index alone — an **index-only scan** — without visiting the table. That
+  roughly halves the I/O.
+
+  It depends on the **visibility map** being current, because the index does
+  not store row visibility and PostgreSQL must confirm the row is visible to
+  the snapshot. A table that has not been vacuumed recently loses index-only
+  scans.
+
+  `INCLUDE` adds payload columns that are stored in the leaf pages but not
+  used for searching or ordering:
+
+  ```sql
+  create index on orders (customer_id) include (order_date, status);
+  ```
+
+  Smaller than putting them in the key, and it still enables an index-only
+  scan.
+
+  ## Partial indexes
+
+  ```sql
+  create index on orders (order_date) where status = 'processing';
+  ```
+
+  Indexes only the matching rows. Much smaller, much cheaper to maintain, and
+  usable only when the query's `WHERE` implies the index's. For a status
+  column where 99% of rows are in a terminal state and every query looks for
+  the other 1%, this is a very large win and it is often overlooked.
+
+  ## Why an index is not used
+
+  Four reasons, in rough order of frequency:
+
+  1. **The predicate is not sargable.** The column is wrapped in a function,
+     the pattern has a leading wildcard, or a type mismatch forces a cast on
+     the column.
+  2. **The index does not match.** Wrong column order, the query constrains a
+     non-leading column, or the sort direction does not line up.
+  3. **The planner estimates a sequential scan is cheaper.** For a filter
+     matching a large fraction of the table, it usually is — random I/O per
+     row plus a heap fetch beats sequential reading only when the result is
+     small. This is the planner being right.
+  4. **The statistics are wrong.** `ANALYZE` has not run, or the distribution
+     is skewed in a way the default 100 histogram buckets do not capture.
+     `ALTER TABLE ... ALTER COLUMN ... SET STATISTICS` raises the resolution.
+
+  Only the fourth is a problem to fix by force. "The index is not being used"
+  is frequently the planner making a correct decision.
+
+  ## Beyond B-tree
+
+  | Type | For |
+  |------|-----|
+  | **B-tree** | equality, ranges, ordering. The default and usually right |
+  | **GIN** | containment in composite values — jsonb `@>`, arrays, full-text |
+  | **GiST** | geometric and range types, nearest-neighbour, exclusion constraints |
+  | **BRIN** | very large tables where the column correlates with physical order |
+  | **Hash** | equality only; rarely worth it over a B-tree |
+
+  BRIN deserves a mention because it is tiny — it stores min and max per block
+  range — and is nearly free on an append-only table whose timestamp increases
+  with insertion order.
+
+  ## The cost of an index
+
+  Every index must be updated on every `INSERT`, `UPDATE` touching its columns,
+  and `DELETE`. It consumes disk and cache. An unused index is pure overhead,
+  and `pg_stat_user_indexes` reports which ones have never been scanned.
+
+  The common mistake is not too few indexes but too many — one per query added
+  over years, several redundant with each other, because an index on `(a, b)`
+  already serves everything an index on `(a)` would.
+
+syntax:
+  - form: "CREATE INDEX ON t (col)"
+    notes: B-tree by default. Takes a lock that blocks writes.
+  - form: "CREATE INDEX CONCURRENTLY ON t (col)"
+    notes: >-
+      Does not block writes. Slower, cannot run in a transaction, and can
+      leave an invalid index if it fails. The production default.
+  - form: "CREATE INDEX ON t (a, b)"
+    notes: >-
+      Composite. Serves queries constraining `a`, or `a` and `b`. Equality
+      columns first, range columns last.
+  - form: "CREATE INDEX ON t (a) INCLUDE (b, c)"
+    notes: >-
+      Payload columns in the leaf pages. Enables an index-only scan without
+      widening the key.
+  - form: "CREATE INDEX ON t (col) WHERE condition"
+    notes: >-
+      Partial. Usable only when the query's WHERE implies the index's
+      condition.
+  - form: "CREATE INDEX ON t ((lower(col)))"
+    notes: >-
+      Expression index. The query must use the identical expression. The
+      double parentheses are required.
+  - form: "CREATE INDEX ON t USING gin (jsonb_col)"
+    notes: Non-default access method, for containment and full-text search.
+
+sampleTables: [employees, orders, order_items, products, contacts]
+
+examples:
+  - title: Every index in the learning schema
+    sql: |
+      select t.table_name,
+             c.column_name,
+             c.ordinal_position
+      from information_schema.table_constraints t
+      join information_schema.key_column_usage c
+        on c.constraint_name = t.constraint_name
+       and c.table_schema    = t.table_schema
+      where t.table_schema = 'learning'
+        and t.constraint_type in ('PRIMARY KEY', 'UNIQUE')
+      order by t.table_name, t.constraint_name, c.ordinal_position
+    walkthrough: |
+      Primary keys and unique constraints are always backed by an index, so
+      this is a partial inventory of the schema's indexes read from the
+      standard catalogue.
+
+      Note the composite primary keys — `order_items(order_id, product_id)`
+      and `employee_projects(emp_id, project_id)` — and their column order.
+      That order is not cosmetic: `order_items`'s index serves "all lines of
+      this order" and does **not** serve "all orders containing this product",
+      which is why migration V2 adds a separate index on
+      `order_items(product_id)`.
+
+      `information_schema` has no view for non-constraint indexes; those live
+      in `pg_indexes`, which the playground cannot read because `pg_catalog`
+      is outside its allow-list. `\di learning.*` in psql shows them all.
+
+  - title: A sargable predicate and its non-sargable twin
+    sql: |
+      select 'sargable: order_date range'              as predicate,
+             count(*)                                   as matching_rows
+      from orders
+      where order_date >= date '2024-01-01'
+        and order_date <  date '2024-02-01'
+      union all
+      select 'non-sargable: extract(month)',
+             count(*)
+      from orders
+      where extract(year  from order_date) = 2024
+        and extract(month from order_date) = 1
+      union all
+      select 'sargable: product_name prefix',
+             count(*)
+      from products
+      where product_name like 'Meridian%'
+      union all
+      select 'non-sargable: product_name contains',
+             count(*)
+      from products
+      where product_name like '%Laptop%'
+      order by predicate
+    walkthrough: |
+      The first two count exactly the same rows and only one can use an index
+      on `order_date`. The index stores dates; the predicate asks about a
+      function of a date, so the planner must compute that function for every
+      row.
+
+      The second pair is the same point for text. `like 'Meridian%'` has a
+      known prefix, so the matching entries are contiguous in a B-tree and the
+      index can seek to them. `like '%Laptop%'` has no prefix, so every entry
+      must be examined — which is what a trigram index exists for.
+
+      On this tiny dataset neither distinction costs anything measurable. The
+      habit is what matters: the rewrite is free and the difference at scale
+      is several orders of magnitude.
+
+  - title: Where the leftmost-prefix rule bites
+    sql: |
+      select 'by order_id (leading column)'         as access_pattern,
+             count(*)                                as rows,
+             count(distinct product_id)              as distinct_products
+      from order_items
+      where order_id = 1003
+      union all
+      select 'by product_id (second column)',
+             count(*),
+             count(distinct order_id)
+      from order_items
+      where product_id = 213
+      order by access_pattern
+    walkthrough: |
+      `order_items` has a primary key on `(order_id, product_id)`.
+
+      The first query constrains the **leading** column, so the primary-key
+      index serves it directly: seek to the `order_id = 1003` region and read.
+
+      The second constrains only the **second** column. The composite index
+      cannot help, because the entries for product 213 are scattered across
+      every `order_id` region. Without a separate index this is a full scan —
+      and migration V2 creates `idx_order_items_product` for exactly this
+      reason.
+
+      The test for whether you need a second index is not "do I query this
+      column" but "do I query it **without** constraining the ones to its
+      left".
+
+  - title: Where a partial index would pay
+    sql: |
+      select status,
+             count(*)                                               as orders,
+             round(100.0 * count(*) / sum(count(*)) over (), 1)     as pct_of_table
+      from orders
+      group by status
+      order by orders desc
+    walkthrough: |
+      If the application's hot query is "show me the orders that still need
+      attention" — `where status = 'processing'` — then a full index on
+      `status` indexes 151 rows to serve a query interested in a small
+      fraction of them.
+
+      `create index on orders (order_date) where status = 'processing'` indexes
+      only those rows. It is proportionally smaller, proportionally cheaper to
+      maintain, and stays small as the completed orders accumulate forever —
+      which is the real argument, because the full index grows without bound
+      while the working set does not.
+
+      The condition in the query must imply the index's condition for the
+      planner to use it. `where status = 'processing' and order_date > ...`
+      qualifies; `where status in ('processing', 'shipped')` does not.
+
+edgeCases:
+  - title: A filter that matches most of the table should not use an index
+    body: >-
+      The first predicate matches a large majority of rows and the second a
+      handful. For the first, an index scan would mean a random heap fetch for
+      nearly every row, which is slower than reading the table sequentially —
+      so the planner correctly chooses a sequential scan, and an index on
+      is_active would sit unused. "The index is not being used" is often the
+      planner being right rather than a problem to solve.
+    sql: |
+      select count(*) filter (where is_active)            as active,
+             count(*) filter (where not is_active)        as inactive,
+             count(*)                                     as total,
+             round(100.0 * count(*) filter (where is_active) / count(*), 1) as pct_active
+      from employees
+
+  - title: An unindexed table, kept that way on purpose
+    body: >-
+      contacts has no index beyond its primary key, deliberately, so the
+      duplicate-detection lessons have a table where a sequential scan and a
+      hash aggregate are what actually happens. Grouping by email here is a
+      full scan of the table followed by a hash — which on twelve rows is
+      instantaneous and on twelve million would be the thing to index.
+    sql: |
+      select email,
+             count(*)             as rows,
+             min(contact_id)      as lowest_id,
+             max(created_at)      as latest
+      from contacts
+      group by email
+      order by rows desc, email
+
+pitfalls:
+  - mistake: Indexing every column individually
+    why: >-
+      Each index costs write time and cache space, and single-column indexes
+      rarely serve multi-column predicates well. An index on `(a, b)` already
+      does everything an index on `(a)` would, so the latter is redundant.
+    fix: >-
+      Index for the queries you actually run. Check pg_stat_user_indexes for
+      indexes that have never been scanned and drop them.
+
+  - mistake: Putting the range column first in a composite index
+    why: >-
+      A range on the leading column means later columns cannot be used for
+      seeking, because within the range they are not sorted. The index is then
+      doing half the job it could.
+    fix: >-
+      Equality columns first, range column last. `(status, order_date)` rather
+      than `(order_date, status)` for `where status = ? and order_date > ?`.
+
+  - mistake: Creating an index without CONCURRENTLY on a live table
+    why: >-
+      A plain CREATE INDEX takes a SHARE lock, which blocks all writes for the
+      duration. On a large table that is an outage.
+    fix: >-
+      CREATE INDEX CONCURRENTLY. It cannot run inside a transaction and can
+      leave an INVALID index if it fails, so check pg_index.indisvalid
+      afterwards and drop-and-retry if needed.
+
+  - mistake: Forcing an index the planner declined
+    why: >-
+      Usually the planner was right, and the real issue is stale statistics or
+      a non-sargable predicate. Disabling sequential scans to "prove" the index
+      helps measures the wrong thing.
+    fix: >-
+      Run ANALYZE, check whether the predicate is sargable, and compare the
+      estimated and actual row counts in EXPLAIN ANALYZE. A large divergence
+      points at statistics; a close match points at the planner being correct.
+
+performance: |
+  The planner's choice between a sequential scan and an index scan is a cost
+  comparison driven by **selectivity**. Reading a page sequentially is cheap
+  (`seq_page_cost`, default 1.0); reading one at random is modelled as four
+  times more expensive (`random_page_cost`, default 4.0). On SSDs that ratio
+  is far too conservative, and lowering `random_page_cost` to 1.1 is one of
+  the most common and most effective configuration changes on modern hardware.
+
+  Beyond a few percent selectivity, a sequential scan usually wins, because an
+  index scan costs one random heap fetch per matching row. A **bitmap heap
+  scan** is the middle ground: collect the matching row locations from the
+  index, sort them, and read the heap pages in physical order. PostgreSQL
+  chooses it automatically for mid-range selectivity, and seeing one in a plan
+  is normal rather than a sign of a problem.
+
+  **Correlation** matters as much as selectivity. If the indexed column
+  correlates with physical row order — a timestamp on an append-only table —
+  an index range scan touches contiguous heap pages and is far cheaper than
+  the model's random-access assumption. `pg_stats.correlation` reports it, and
+  it is why BRIN indexes work.
+
+  Index maintenance is paid on every write. Measuring it is straightforward:
+  time a bulk insert, add the index, time it again. On write-heavy tables the
+  difference is routinely 2-3× per index.
+
+interviewQuestions:
+  - question: Explain how a B-tree index works and what the column order means.
+    answer: >-
+      It is a balanced, sorted structure mapping values to row locations, so it
+      supports equality, ranges, prefix matches, ordering and min/max. A
+      composite index sorts by the first column, then the second within equal
+      firsts, and so on — so it can serve any leftmost prefix of its columns
+      and not a suffix. That is the leftmost-prefix rule, and it follows
+      directly from the sort order. A range on an earlier column also prevents
+      later columns being used for seeking, which is why equality columns go
+      first and the range column last.
+
+  - question: Give four reasons an index might not be used.
+    answer: >-
+      The predicate is not sargable — the column is wrapped in a function, the
+      LIKE pattern has a leading wildcard, or a type mismatch forces a cast on
+      the column rather than the literal. The index does not match the query's
+      columns or their order. The planner estimates a sequential scan is
+      cheaper, which for a filter matching a large fraction of the table it
+      genuinely is. Or the statistics are stale or too coarse, so the estimate
+      is wrong. Only the last is a bug to fix; the third is the planner working
+      correctly and is the most common cause of the complaint.
+
+  - question: What is an index-only scan and what does it require?
+    answer: >-
+      A scan that answers the query entirely from the index without visiting
+      the table, roughly halving the I/O. It requires every column the query
+      needs to be present in the index — either in the key or via INCLUDE — and
+      it requires the visibility map to show the relevant pages as all-visible,
+      because the index does not record row visibility. That second condition
+      means a table which has not been vacuumed recently loses index-only
+      scans, which is a performance regression caused by a maintenance setting
+      rather than by the query.
+
+  - question: When would you use a partial index?
+    answer: >-
+      When queries consistently target a small subset defined by a stable
+      predicate — rows in a non-terminal state, undeleted rows, a single
+      high-traffic tenant. The index covers only those rows, so it is far
+      smaller and cheaper to maintain, and crucially it stays small as the
+      excluded rows accumulate indefinitely. The requirement is that the
+      query's WHERE clause must imply the index's predicate for the planner to
+      use it, so the condition has to be one the queries genuinely always
+      include.
+
+exercises:
+  - prompt: >-
+      List the composite primary keys in the learning schema with their
+      columns in order, so you can reason about which access patterns they
+      serve. Columns table_name, key_columns. Order by table_name.
+    difficulty: Medium
+    hint: >-
+      Join table_constraints to key_column_usage, filter to PRIMARY KEY, and
+      string_agg the columns in ordinal order.
+    solutionSql: |
+      select tc.table_name,
+             string_agg(kcu.column_name, ', ' order by kcu.ordinal_position) as key_columns
+      from information_schema.table_constraints tc
+      join information_schema.key_column_usage kcu
+        on kcu.constraint_name = tc.constraint_name
+       and kcu.table_schema    = tc.table_schema
+      where tc.table_schema    = 'learning'
+        and tc.constraint_type = 'PRIMARY KEY'
+      group by tc.table_name
+      having count(*) > 1
+      order by tc.table_name
+
+  - prompt: >-
+      Rewrite this non-sargable filter as a sargable one and return the same
+      count both ways, to show they agree. Columns non_sargable, sargable.
+      The filter is "orders placed in March 2023".
+    difficulty: Easy
+    hint: >-
+      extract() versus a half-open range on the raw column.
+    solutionSql: |
+      select (select count(*) from orders
+              where extract(year from order_date) = 2023
+                and extract(month from order_date) = 3)  as non_sargable,
+             (select count(*) from orders
+              where order_date >= date '2023-03-01'
+                and order_date <  date '2023-04-01')     as sargable
+
+  - prompt: >-
+      Estimate how selective a partial index on non-completed orders would be,
+      by reporting the number of such orders and their share of the table.
+      Columns non_completed, total, pct.
+    difficulty: Easy
+    hint: FILTER for the count, and divide by count(*) with a 100.0 multiplier.
+    solutionSql: |
+      select count(*) filter (where status <> 'completed')              as non_completed,
+             count(*)                                                   as total,
+             round(100.0 * count(*) filter (where status <> 'completed')
+                   / count(*), 1)                                       as pct
+      from orders
+
+checklist:
+  - A B-tree is sorted, so it serves equality, ranges, prefixes, ordering and min/max
+  - "The leftmost-prefix rule: an index on (a, b, c) serves a, or a+b, or a+b+c"
+  - A range on an earlier column stops later columns being used for seeking
+  - "Equality columns first, range column last"
+  - An index-only scan needs every column in the index and a current visibility map
+  - A partial index stays small while the excluded rows grow without bound
+  - '"Not using the index" is often the planner correctly choosing a sequential scan'
+  - "Every index costs write time; unused ones are pure overhead"
+
+related:
+  - f-filtering
+  - p-explain
+  - p-query-patterns
+  - pg-jsonb-indexing
+
+dialect:
+  standard: >-
+    The SQL standard does not define indexes at all — they are a physical
+    implementation detail every vendor provides with its own syntax.
+  postgres: >-
+    B-tree, GIN, GiST, SP-GiST, BRIN and hash access methods. Partial indexes,
+    expression indexes, INCLUDE columns and CREATE INDEX CONCURRENTLY. Indexes
+    NULLs, so IS NULL can use one. Does not index foreign keys automatically.
+  mysql: >-
+    InnoDB tables are clustered on the primary key, so the primary key
+    determines physical row order and secondary indexes store the primary key
+    rather than a row pointer — making a wide primary key expensive across
+    every index. MySQL has no partial indexes and no expression indexes before
+    8.0.13 (functional key parts). It does index foreign keys automatically.

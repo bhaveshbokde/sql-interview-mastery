@@ -1,0 +1,377 @@
+id: a-aggregates
+moduleId: aggregation
+position: 10
+title: Aggregate functions
+slug: aggregate-functions
+difficulty: Beginner
+estimatedMinutes: 20
+summary: >-
+  COUNT, SUM, AVG, MIN, MAX and the string and array aggregates — what each one
+  does with NULL, what each returns over an empty input, and why count(*) and
+  count(col) are different questions.
+tags: [aggregates, count, sum, avg, null-handling]
+
+prerequisites:
+  - f-nulls
+
+objectives:
+  - Choose between count(*), count(col) and count(distinct col) deliberately
+  - State what each aggregate returns over zero rows
+  - Use string_agg and array_agg, including their ORDER BY clause
+  - Explain why sum() of an empty set is NULL rather than zero
+  - Apply an aggregate to a whole table with no GROUP BY
+
+concept: |
+  ## An aggregate collapses many rows into one
+
+  Without `GROUP BY`, an aggregate treats the entire input as one group and the
+  query returns exactly one row — even if the table is empty.
+
+  ```sql
+  select count(*), avg(salary) from employees;   -- always 1 row
+  ```
+
+  That "exactly one row" is a guarantee worth remembering: a query with an
+  aggregate and no GROUP BY never returns zero rows, which is why
+  `select count(*) from t where false` gives you `0` and not nothing.
+
+  ## The three COUNTs
+
+  | Form | Counts |
+  |------|--------|
+  | `count(*)` | rows |
+  | `count(col)` | rows where `col` is not NULL |
+  | `count(distinct col)` | distinct non-NULL values of `col` |
+
+  These answer three different questions and people routinely pick the wrong
+  one. `count(*)` is also the fastest, because it does not have to look at any
+  column value.
+
+  `count(*) - count(col)` is the idiomatic way to count NULLs in a column.
+
+  ## NULL handling, and the empty-input rule
+
+  **Every aggregate except `count(*)` ignores NULL inputs.** `avg(salary)`
+  divides by the number of non-NULL salaries; `max(ship_date)` is the latest
+  actual ship date, not NULL because one order was unshipped.
+
+  Over an input with **no rows at all** — or where every value is NULL:
+
+  - `count(...)` returns `0`
+  - `sum`, `avg`, `min`, `max`, `string_agg`, `array_agg` return **NULL**
+
+  `sum` returning NULL rather than 0 is the one that causes trouble. A revenue
+  report that shows a blank cell for a quarter with no sales is technically
+  correct — the sum of nothing is undefined, not zero — and operationally
+  useless. `coalesce(sum(x), 0)` is the fix, and it should be a reflex.
+
+  ## Beyond the five
+
+  - `string_agg(expr, delimiter ORDER BY ...)` concatenates text across rows.
+  - `array_agg(expr ORDER BY ...)` collects values into an array.
+  - `bool_and` / `bool_or` aggregate booleans — "did every row satisfy this?"
+  - `stddev`, `variance`, `percentile_cont`, `mode()` cover statistics.
+  - `count(*) filter (where cond)` restricts any aggregate to a subset. This is
+    standard SQL and it is the single most useful thing in this module; the
+    conditional-aggregation lesson is devoted to it.
+
+  The `ORDER BY` inside `string_agg` and `array_agg` is not decoration. Without
+  it the concatenation order is whatever the executor produced, so the same
+  query can return `'a,b'` and `'b,a'` on different runs.
+
+syntax:
+  - form: "count(*)  |  count(expr)  |  count(DISTINCT expr)"
+    notes: Rows, non-NULL values, distinct non-NULL values.
+  - form: "sum(expr) | avg(expr) | min(expr) | max(expr)"
+    notes: >-
+      All ignore NULL. All return NULL over an empty input, including sum.
+      `avg` on an integer column returns numeric, so it does not truncate.
+  - form: "string_agg(expr, delimiter ORDER BY sort_expr)"
+    notes: >-
+      Text concatenation across rows. Always supply the ORDER BY; without it the
+      order is undefined.
+  - form: "array_agg(expr ORDER BY sort_expr)"
+    notes: Collects into an array. Keeps NULLs, unlike most aggregates.
+  - form: "aggregate(expr) FILTER (WHERE condition)"
+    notes: >-
+      Restricts the aggregate to rows matching the condition. Standard SQL and
+      clearer than the CASE equivalent.
+
+sampleTables: [employees, orders, order_items, exam_scores, payments]
+
+examples:
+  - title: The three COUNTs, side by side
+    sql: |
+      select count(*)                      as rows_in_table,
+             count(dept_id)                as with_a_department,
+             count(*) - count(dept_id)     as without_a_department,
+             count(distinct dept_id)       as distinct_departments,
+             count(distinct job_title)     as distinct_job_titles
+      from employees
+    walkthrough: |
+      40 rows, 38 of which have a department, so two do not — that subtraction
+      is the standard NULL-counting idiom.
+
+      `count(distinct dept_id)` is 5, not 6: department 60 (Research) has no
+      employees, so its id never appears in this table. That is the difference
+      between "how many departments exist" (a question for `departments`) and
+      "how many departments are represented here" — a distinction that
+      disappears if you only ever query one table.
+
+  - title: What the aggregates do with missing data
+    sql: |
+      select count(*)                            as orders,
+             count(ship_date)                    as shipped,
+             min(ship_date)                      as earliest_shipment,
+             max(ship_date)                      as latest_shipment,
+             round(avg(ship_date - order_date), 2) as avg_days_to_ship,
+             sum(case when ship_date is null then 1 else 0 end) as never_shipped
+      from orders
+    walkthrough: |
+      `min` and `max` skip the NULL ship dates entirely and report real dates.
+      `avg(ship_date - order_date)` likewise averages only over the orders that
+      shipped — the unshipped ones contribute nothing rather than contributing a
+      zero, which is almost certainly what you want but is worth being
+      deliberate about.
+
+      The last column is the classic pre-`FILTER` idiom: a `CASE` that produces
+      1 or 0 and a `sum` over it. `count(*) filter (where ship_date is null)`
+      says the same thing more directly, and the conditional-aggregation lesson
+      prefers it.
+
+  - title: sum over nothing is NULL, not zero
+    sql: |
+      select count(*)                        as matching_rows,
+             sum(amount)                     as raw_sum,
+             coalesce(sum(amount), 0)        as safe_sum,
+             avg(amount)                     as raw_avg,
+             max(amount)                     as raw_max
+      from payments
+      where method = 'cryptocurrency'
+    walkthrough: |
+      No payment uses that method, so the filter matches nothing. `count(*)` is
+      `0` — a real number — while `sum`, `avg` and `max` are all NULL.
+
+      Note that the query still returns one row. An aggregate with no GROUP BY
+      always does, which is why this is an easy bug to ship: the report has a
+      row, the row has a blank, and nothing anywhere said "no data".
+
+  - title: Aggregating text and arrays, in a defined order
+    sql: |
+      select e.dept_id,
+             count(*)                                               as headcount,
+             string_agg(e.last_name, ', ' order by e.last_name)     as surnames,
+             array_agg(e.salary order by e.salary desc)             as salaries_desc,
+             bool_and(e.is_active)                                  as all_active,
+             bool_or(not e.is_active)                               as any_inactive
+      from employees e
+      where e.dept_id in (40, 50)
+      group by e.dept_id
+      order by e.dept_id
+    walkthrough: |
+      `string_agg` joins the surnames alphabetically. Drop the `order by` and
+      the result is still correct but no longer reproducible, which matters the
+      moment anyone diffs two runs of a report.
+
+      `bool_and(is_active)` answers "is everyone in this department active?" and
+      `bool_or(not is_active)` answers its complement. Department 50 has an
+      inactive employee, so the two columns disagree between the groups — these
+      are the aggregate forms of "for all" and "there exists", and they are far
+      clearer than counting and comparing to zero.
+
+edgeCases:
+  - title: count(distinct) ignores NULL but array_agg does not
+    body: >-
+      Most aggregates drop NULL inputs. `array_agg` keeps them, because an array
+      with a hole in it is a meaningful thing and silently shortening the array
+      would be worse. This asymmetry catches people building a list and then
+      comparing its length to a count.
+    sql: |
+      select count(*)                        as rows,
+             count(manager_id)               as non_null_managers,
+             count(distinct manager_id)      as distinct_managers,
+             array_length(array_agg(manager_id), 1) as array_length
+      from employees
+      where emp_id <= 5
+
+  - title: avg of an integer column is numeric, not integer
+    body: >-
+      PostgreSQL promotes the result so the average is not truncated — unlike
+      integer division, which does truncate. The two behave differently and the
+      inconsistency is worth seeing rather than discovering.
+    sql: |
+      select avg(score)                 as avg_score,
+             pg_typeof(avg(score))      as avg_type,
+             sum(score)                 as total,
+             pg_typeof(sum(score))      as sum_type,
+             sum(score) / count(*)      as integer_division_average
+      from exam_scores
+      where subject = 'Physics'
+
+pitfalls:
+  - mistake: Using count(col) when you meant count(*)
+    why: >-
+      They are the same number until the column has a NULL, and then they differ
+      silently. Reviewers rarely notice because both read as "count the rows".
+    fix: >-
+      `count(*)` for "how many rows". Name a column only when you specifically
+      want to exclude the NULLs, and consider adding a comment saying so.
+
+  - mistake: Expecting sum() to return 0 over no rows
+    why: >-
+      Arithmetic intuition says the empty sum is zero. SQL says it is undefined,
+      because sum ignores NULLs and there is nothing left to add.
+    fix: >-
+      `coalesce(sum(x), 0)` whenever the result is displayed or compared
+      numerically. Leave it as NULL when "no data" and "zero" genuinely differ.
+
+  - mistake: string_agg or array_agg without ORDER BY
+    why: >-
+      The order is whatever the executor happened to produce. It is stable in
+      testing and changes when the plan changes, so the report that always
+      listed names alphabetically starts listing them differently after an
+      index is added.
+    fix: >-
+      Put `order by` inside the aggregate's parentheses. It costs almost
+      nothing and makes the output a function of the data.
+
+  - mistake: count(distinct x) on a large table as a matter of course
+    why: >-
+      It cannot be computed with a simple hash aggregate in parallel the way
+      count(*) can, and it is substantially more expensive on big inputs.
+    fix: >-
+      Use it when you need it. For approximate distinct counts at scale, the
+      `hll` or `postgresql-hll` extensions exist, and for exact counts over a
+      grouped query, consider aggregating in two stages.
+
+performance: |
+  `count(*)` in PostgreSQL is not free: MVCC means visibility is per-transaction,
+  so there is no single stored row count and the table must be scanned. An
+  index-only scan on a small index helps, and for an approximate figure
+  `reltuples` from the planner's statistics is instant.
+
+  Most aggregates are computed with a hash aggregate (one pass, memory
+  proportional to the number of groups) or a sorted group aggregate. `DISTINCT`
+  inside an aggregate forces extra work per group, because each group must
+  deduplicate.
+
+  `min(col)` and `max(col)` over an indexed column are special-cased: the
+  planner can read the first or last index entry and stop. That makes them
+  dramatically cheaper than `avg` or `sum` on the same column — a difference
+  that disappears the moment a `WHERE` clause the index cannot serve is added.
+
+interviewQuestions:
+  - question: What is the difference between count(*), count(column) and count(distinct column)?
+    answer: >-
+      `count(*)` counts rows and never looks at a value. `count(column)` counts
+      rows where that column is not NULL, so the difference between the two is
+      the number of NULLs. `count(distinct column)` counts distinct non-NULL
+      values and is considerably more expensive, since it must deduplicate.
+      Choosing the wrong one produces a plausible number, which is why it is a
+      common interview probe.
+
+  - question: What does sum() return when no rows match?
+    answer: >-
+      NULL, not zero. Aggregates ignore NULL inputs and there is nothing left to
+      sum, so the result is undefined rather than zero. `count` is the exception
+      and returns 0. This matters in reports and in application code that does
+      arithmetic on the result; `coalesce(sum(x), 0)` is the usual guard. The
+      query still returns one row, because an aggregate with no GROUP BY always
+      does.
+
+  - question: Why is count(*) slow on a large PostgreSQL table?
+    answer: >-
+      Because of MVCC. Different transactions can see different numbers of rows,
+      so there is no single maintained counter; PostgreSQL must check visibility
+      for each row. An index-only scan over a narrow index reduces the I/O but
+      not the row count work, and it depends on the visibility map being current.
+      When an estimate suffices, `pg_class.reltuples` is instantaneous.
+
+  - question: How do you count rows matching a condition without a second query?
+    answer: >-
+      `count(*) filter (where condition)`, which is standard SQL, or the older
+      `sum(case when condition then 1 else 0 end)`. Note that `count(case when
+      condition then 1 end)` also works, because the implicit ELSE NULL is then
+      ignored by count — but `count(case when c then 1 else 0 end)` counts
+      everything, because 0 is not NULL. That trap is why FILTER is preferable.
+
+exercises:
+  - prompt: >-
+      For the orders table, return the total number of orders, the number that
+      shipped, the number cancelled, and the percentage cancelled rounded to one
+      decimal. Columns orders, shipped, cancelled, cancelled_pct.
+    difficulty: Easy
+    hint: >-
+      FILTER for the two conditional counts, and multiply by 100.0 rather than
+      100 so the division is not integer division.
+    solutionSql: |
+      select count(*)                                           as orders,
+             count(ship_date)                                   as shipped,
+             count(*) filter (where status = 'cancelled')       as cancelled,
+             round(100.0 * count(*) filter (where status = 'cancelled')
+                   / count(*), 1)                               as cancelled_pct
+      from orders
+
+  - prompt: >-
+      For each subject in exam_scores, return the number of students, the lowest
+      and highest score, the average rounded to one decimal, and the list of
+      scores in descending order as a comma-separated string. Columns subject,
+      students, lowest, highest, average, scores.
+    difficulty: Medium
+    hint: >-
+      `string_agg(score::text, ', ' order by score desc)` — the cast is needed
+      because string_agg works on text.
+    solutionSql: |
+      select subject,
+             count(*)                                            as students,
+             min(score)                                          as lowest,
+             max(score)                                          as highest,
+             round(avg(score), 1)                                as average,
+             string_agg(score::text, ', ' order by score desc)   as scores
+      from exam_scores
+      group by subject
+      order by subject
+
+  - prompt: >-
+      Return the total revenue across all order items, computed as quantity *
+      unit_price * (1 - discount), rounded to 2 decimals, and the number of
+      distinct products that have ever been ordered. Columns revenue,
+      products_ordered.
+    difficulty: Easy
+    hint: >-
+      One sum over an expression, one count(distinct).
+    solutionSql: |
+      select round(sum(quantity * unit_price * (1 - discount)), 2) as revenue,
+             count(distinct product_id)                           as products_ordered
+      from order_items
+
+checklist:
+  - An aggregate with no GROUP BY always returns exactly one row
+  - "count(*) counts rows; count(col) counts non-NULLs; their difference is the NULL count"
+  - Every aggregate except count(*) ignores NULL inputs
+  - Over an empty input count returns 0 and everything else returns NULL
+  - "coalesce(sum(x), 0) whenever a blank would be read as a problem"
+  - string_agg and array_agg need an ORDER BY inside the parentheses
+  - array_agg keeps NULLs; nearly every other aggregate drops them
+  - "min/max over an indexed column can be answered from the index in constant time"
+
+related:
+  - f-nulls
+  - a-group-by-having
+  - a-conditional-aggregation
+  - p10-median-score
+
+dialect:
+  standard: >-
+    COUNT, SUM, AVG, MIN, MAX, the DISTINCT modifier and the FILTER clause are
+    all standard SQL, as is the rule that aggregates ignore NULL.
+  postgres: >-
+    Adds string_agg, array_agg, bool_and/bool_or, mode(), the ordered-set
+    aggregates percentile_cont and percentile_disc, and allows ORDER BY inside
+    an aggregate call. PostgreSQL implements FILTER, which many databases still
+    do not.
+  mysql: >-
+    Uses GROUP_CONCAT instead of string_agg, with a SEPARATOR keyword and a
+    silent truncation at group_concat_max_len — a genuine data-loss trap with no
+    PostgreSQL equivalent. MySQL has no FILTER clause, so conditional
+    aggregation is written with CASE or with the fact that a boolean is 1 or 0.

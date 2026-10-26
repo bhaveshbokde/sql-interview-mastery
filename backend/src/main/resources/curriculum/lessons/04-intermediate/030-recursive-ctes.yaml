@@ -1,0 +1,512 @@
+id: i-recursive-cte
+moduleId: intermediate
+position: 30
+title: Recursive CTEs
+slug: recursive-ctes
+difficulty: Advanced
+estimatedMinutes: 25
+summary: >-
+  WITH RECURSIVE walks a hierarchy or generates a sequence by repeatedly feeding
+  a query its own previous output. The structure is always the same — an anchor,
+  a recursive term and a UNION — and so is the way it goes wrong.
+tags: [recursive-cte, hierarchy, tree, graph, cycle-detection]
+
+prerequisites:
+  - i-ctes
+
+objectives:
+  - Write a recursive CTE with an anchor and a recursive term
+  - Track depth and build a path string while descending a hierarchy
+  - Explain the difference UNION versus UNION ALL makes to termination
+  - Detect and stop a cycle in a graph traversal
+  - Decide when a recursive CTE is the right tool and when it is not
+
+concept: |
+  ## The shape
+
+  Every recursive CTE has the same three parts:
+
+  ```sql
+  with recursive name as (
+      select ...                 -- anchor: the starting rows
+      union all
+      select ...                 -- recursive term: references `name`
+      from source join name on ...
+  )
+  select * from name
+  ```
+
+  The execution is iterative rather than truly recursive:
+
+  1. Evaluate the anchor. Its rows become the result and the **working set**.
+  2. Evaluate the recursive term with `name` bound to the working set only.
+  3. Those rows are appended to the result and become the new working set.
+  4. Repeat until an iteration produces no rows.
+
+  Step 2 is the part people get wrong. In each round, the self-reference sees
+  **only the rows added in the previous round**, not the whole accumulated
+  result. That is why the recursion terminates and why `name` cannot be used
+  twice in the recursive term.
+
+  The `RECURSIVE` keyword goes after `WITH`, once, even when several CTEs
+  follow and only one of them recurses.
+
+  ## UNION versus UNION ALL
+
+  `UNION ALL` appends everything. `UNION` deduplicates against the whole
+  accumulated result, which means a row already produced does not re-enter the
+  working set — so `UNION` terminates on a cyclic graph where `UNION ALL` would
+  loop forever.
+
+  That makes `UNION` sound like the safe default, and it is a reasonable one
+  for graph traversal. But it compares whole rows, so adding a `depth` or
+  `path` column to the output defeats it: the same node at a different depth is
+  a different row. Explicit cycle detection with a path array is the robust
+  answer.
+
+  ## Depth, path and ordering
+
+  Two columns carry the traversal's state and are worth adding by reflex:
+
+  ```sql
+  1 as depth, ...                                 -- anchor
+  parent.depth + 1, ...                           -- recursive term
+
+  array[node.id] as path,                         -- anchor
+  parent.path || node.id                          -- recursive term
+  ```
+
+  `depth` gives you a level number and a termination guard
+  (`where depth < 10`). `path` gives you an ordering that produces a readable
+  tree — sorting by the path array yields depth-first order — and the means to
+  detect a cycle: `where not node.id = any(parent.path)`.
+
+  ## When not to use one
+
+  A recursive CTE is the right tool for an arbitrary-depth hierarchy or a
+  generated series. It is the wrong tool for:
+
+  - **A fixed, shallow depth.** Three self-joins are clearer than a recursion
+    when the tree is always three levels.
+  - **A simple sequence.** `generate_series` is simpler and faster.
+  - **Very large graph traversals.** Each iteration is a join, and the working
+    set can explode combinatorially. Graph problems at scale want a graph
+    database or a materialised path/closure-table design.
+
+  PostgreSQL also offers `CYCLE` and `SEARCH` clauses (version 14 and later)
+  that build the cycle-detection and ordering columns for you.
+
+syntax:
+  - form: "WITH RECURSIVE name AS (anchor UNION ALL recursive_term) SELECT ..."
+    notes: >-
+      RECURSIVE appears once after WITH, even when several CTEs follow. The
+      recursive term must reference `name` exactly once.
+  - form: "UNION ALL in the recursive term"
+    notes: >-
+      Appends everything. Faster, and will loop forever on a cycle without an
+      explicit guard.
+  - form: "UNION in the recursive term"
+    notes: >-
+      Deduplicates whole rows against the accumulated result, which terminates
+      on cycles — unless a depth or path column makes every row distinct.
+  - form: "array[id] AS path  /  parent.path || child.id"
+    notes: >-
+      Accumulates the route taken. Sorting by it gives depth-first order;
+      `NOT id = ANY(path)` stops cycles.
+  - form: "WHERE depth < n"
+    notes: >-
+      A belt-and-braces guard. Worth including on any traversal over data you
+      do not control.
+
+sampleTables: [employees, categories, daily_sales]
+
+examples:
+  - title: Descending the reporting hierarchy
+    sql: |
+      with recursive org as (
+          select e.emp_id,
+                 e.first_name || ' ' || e.last_name as name,
+                 e.manager_id,
+                 1                                   as depth,
+                 array[e.emp_id]                     as path
+          from employees e
+          where e.manager_id is null
+          union all
+          select e.emp_id,
+                 e.first_name || ' ' || e.last_name,
+                 e.manager_id,
+                 o.depth + 1,
+                 o.path || e.emp_id
+          from employees e
+          join org o on o.emp_id = e.manager_id
+          where o.depth < 10
+      )
+      select depth,
+             repeat('    ', depth - 1) || name as org_chart,
+             emp_id,
+             manager_id,
+             path
+      from org
+      order by path
+    walkthrough: |
+      The anchor is the one employee with no manager — Asha Raman, the CEO. The
+      recursive term joins `employees` to the previous round's rows, so round 2
+      finds everyone reporting to the CEO, round 3 finds their reports, and so
+      on until a round produces nobody.
+
+      `order by path` is what makes the output a readable tree rather than a
+      flat list: sorting by the array of ancestor ids puts each person directly
+      after their manager, which is depth-first order.
+
+      `repeat('    ', depth - 1)` indents by level. It is presentation, but it
+      is the presentation that makes a hierarchy query worth running
+      interactively.
+
+      Note which employees are absent: the two with no department are present
+      (the hierarchy is independent of department), but anyone unreachable from
+      the root would be missing entirely. On real data that is worth checking
+      with a count.
+
+  - title: Walking upwards, from a leaf to the root
+    sql: |
+      with recursive chain as (
+          select e.emp_id,
+                 e.first_name || ' ' || e.last_name as name,
+                 e.job_title,
+                 e.manager_id,
+                 1 as level_up
+          from employees e
+          where e.emp_id = 20
+          union all
+          select m.emp_id,
+                 m.first_name || ' ' || m.last_name,
+                 m.job_title,
+                 m.manager_id,
+                 c.level_up + 1
+          from employees m
+          join chain c on c.manager_id = m.emp_id
+      )
+      select level_up, emp_id, name, job_title
+      from chain
+      order by level_up
+    walkthrough: |
+      The same machinery, with the join reversed. Downward traversal joins
+      `child.manager_id = previous.emp_id`; upward traversal joins
+      `manager.emp_id = previous.manager_id`.
+
+      Harpreet Singh reports to Arjun Deshpande, who reports to Vikram Shetty,
+      who reports to the CEO. Four levels, and the recursion stops because the
+      CEO's `manager_id` is NULL so the join finds nothing.
+
+      "Find the management chain for this person" is a standard interview
+      question and this is the whole answer. The termination condition is
+      implicit — a NULL manager_id — rather than a depth guard, which is fine
+      here and would not be on data where a cycle is possible.
+
+  - title: A category tree with a full path string
+    sql: |
+      with recursive tree as (
+          select c.category_id,
+                 c.category_name,
+                 c.parent_category_id,
+                 1                            as depth,
+                 c.category_name::text        as full_path,
+                 array[c.category_id]         as id_path
+          from categories c
+          where c.parent_category_id is null
+          union all
+          select c.category_id,
+                 c.category_name,
+                 c.parent_category_id,
+                 t.depth + 1,
+                 t.full_path || ' > ' || c.category_name,
+                 t.id_path || c.category_id
+          from categories c
+          join tree t on t.category_id = c.parent_category_id
+          where not c.category_id = any (t.id_path)
+      )
+      select depth,
+             full_path,
+             (select count(*) from products p where p.category_id = tree.category_id) as products
+      from tree
+      order by id_path
+    walkthrough: |
+      Two roots — Electronics and Home — so the anchor returns two rows and the
+      traversal proceeds from both at once. A recursive CTE handles a forest as
+      easily as a tree; nothing in the structure assumes a single root.
+
+      `full_path` builds the breadcrumb by concatenating as it descends, which
+      is the usual way to produce "Electronics > Computers > Laptops" from a
+      parent-pointer table.
+
+      `where not c.category_id = any (t.id_path)` is the cycle guard. The data
+      here is a clean tree so it never fires, and it costs almost nothing. On a
+      table where a category could be made its own ancestor by a bad update —
+      which no constraint prevents — it is the difference between a query and a
+      hang.
+
+  - title: Generating a series without generate_series
+    sql: |
+      with recursive months as (
+          select date '2024-01-01' as month_start
+          union all
+          select (month_start + interval '1 month')::date
+          from months
+          where month_start < date '2024-06-01'
+      )
+      select m.month_start,
+             to_char(m.month_start, 'Mon YYYY')             as label,
+             coalesce(round(sum(s.revenue), 2), 0)          as revenue
+      from months m
+      left join daily_sales s
+             on s.sale_date >= m.month_start
+            and s.sale_date <  (m.month_start + interval '1 month')
+      group by m.month_start
+      order by m.month_start
+    walkthrough: |
+      The recursive term has no join to another table at all — it just adds a
+      month to the previous row. The `WHERE` is the termination condition, and
+      without it this runs forever.
+
+      In PostgreSQL this is the long way round: `generate_series(date
+      '2024-01-01', date '2024-06-01', interval '1 month')` does the same thing
+      in one function call. It is shown here because MySQL and SQL Server have
+      no `generate_series`, and the recursive CTE is the portable answer — one
+      worth recognising when you meet it in someone else's code.
+
+      The LEFT JOIN then fills in the months, including April, May and June,
+      which have no sales data and would be absent from a plain GROUP BY.
+
+edgeCases:
+  - title: UNION terminates on a cycle where UNION ALL would not
+    body: >-
+      This traversal would loop forever with UNION ALL if the data contained a
+      cycle, because each lap would produce the same rows again. UNION
+      deduplicates against the accumulated result, so the second lap produces
+      nothing and the recursion stops. The catch is that it compares the
+      **whole row**, so adding a depth column — which is almost always wanted —
+      makes every lap distinct and restores the infinite loop. That is why a
+      path array is the robust guard rather than UNION.
+    sql: |
+      with recursive reachable as (
+          select emp_id from employees where emp_id = 2
+          union
+          select e.emp_id
+          from employees e
+          join reachable r on e.manager_id = r.emp_id
+      )
+      select count(*) as reachable_from_emp_2 from reachable
+
+  - title: A depth guard that fires
+    body: >-
+      Setting the guard below the real depth of the tree truncates the result
+      rather than failing. That is useful for exploring an unknown hierarchy
+      safely, and it is a trap if the guard is left in place at a value someone
+      later exceeds — the query silently stops returning the deepest rows.
+    sql: |
+      with recursive org as (
+          select emp_id, manager_id, 1 as depth
+          from employees where manager_id is null
+          union all
+          select e.emp_id, e.manager_id, o.depth + 1
+          from employees e
+          join org o on o.emp_id = e.manager_id
+          where o.depth < 2
+      )
+      select depth, count(*) as people
+      from org
+      group by depth
+      order by depth
+
+pitfalls:
+  - mistake: Omitting the termination condition
+    why: >-
+      A recursive term with no join that narrows the set, and no WHERE that
+      eventually fails, produces rows forever. The query consumes memory until
+      something kills it.
+    fix: >-
+      Make sure every recursion either joins to a finite structure that runs
+      out, or has an explicit bound. Add `where depth < n` as a habit even when
+      you believe it cannot be reached.
+
+  - mistake: Assuming the self-reference sees all accumulated rows
+    why: >-
+      It sees only the previous iteration's output. Queries written on the other
+      assumption produce too few rows and the error is subtle, because the first
+      couple of levels look right.
+    fix: >-
+      Accumulate what you need into a column — a path array, a running total —
+      so each row carries forward the state the next iteration requires.
+
+  - mistake: Relying on UNION for cycle safety while selecting a depth column
+    why: >-
+      UNION deduplicates whole rows. `(node, depth)` differs from `(node,
+      depth+1)`, so every lap round the cycle produces new rows and the
+      deduplication never fires.
+    fix: >-
+      Carry a path array and test `not id = any(path)`, or use PostgreSQL's
+      CYCLE clause, which maintains the same thing for you.
+
+  - mistake: Using a recursive CTE for a fixed shallow depth
+    why: >-
+      It is harder to read and harder for the planner to estimate than the
+      equivalent joins, for no benefit when the depth is known and small.
+    fix: >-
+      Three self-joins for a three-level tree. Save the recursion for depths
+      that are genuinely variable.
+
+performance: |
+  Each iteration is a join between the working set and the source table, so the
+  cost is roughly the depth multiplied by the cost of one join. An index on the
+  column the recursion joins on — `employees(manager_id)` here — matters more
+  than almost anything else, because without it every iteration is a sequential
+  scan.
+
+  The planner has very poor estimates for recursive CTEs: it cannot know how
+  many iterations there will be, so row-count estimates above the recursion are
+  often badly wrong, which can produce a bad join order in the outer query.
+  Materialising the result into a temporary table is sometimes the fix for a
+  slow query that is slow above the CTE rather than inside it.
+
+  For a hierarchy read far more often than it is written, a **closure table**
+  (every ancestor-descendant pair, maintained by triggers) or a **materialised
+  path** column turns every traversal into a simple indexed lookup. The cost is
+  write complexity. Knowing the trade-off is a standard schema-design interview
+  topic.
+
+interviewQuestions:
+  - question: Explain the structure of a recursive CTE.
+    answer: >-
+      Three parts: an anchor query producing the starting rows, UNION or UNION
+      ALL, and a recursive term that references the CTE's own name. Execution is
+      iterative — the anchor runs once, then the recursive term runs repeatedly
+      with the self-reference bound to the rows produced by the previous
+      iteration only, appending each round's output, until an iteration returns
+      nothing. The key subtlety is that the self-reference sees the previous
+      round's rows rather than the whole accumulated result, which is what makes
+      it terminate.
+
+  - question: How do you prevent a recursive CTE from looping forever on cyclic data?
+    answer: >-
+      Carry an array of visited node ids down the recursion and add
+      `WHERE NOT child_id = ANY(path)` to the recursive term; a row that would
+      revisit a node is simply not produced. A depth limit is a useful
+      additional guard. UNION instead of UNION ALL also terminates, because it
+      deduplicates against the accumulated result — but only if the selected
+      columns are identical across laps, so it stops working the moment you add
+      a depth column. PostgreSQL 14 added a CYCLE clause that maintains the path
+      and a cycle flag automatically.
+
+  - question: When is a recursive CTE the wrong tool for a hierarchy?
+    answer: >-
+      When the depth is fixed and small, where explicit self-joins are clearer.
+      When the traversal is very hot and the hierarchy changes rarely, where a
+      closure table or a materialised path column turns each query into an
+      indexed lookup. And when the graph is large and densely connected, where
+      each iteration's working set grows combinatorially and a purpose-built
+      graph store is a better fit. Recursive CTEs are for variable-depth
+      traversals of modest size.
+
+  - question: What is a closure table and when would you use one?
+    answer: >-
+      A table holding one row for every ancestor-descendant pair in a
+      hierarchy, including each node with itself, usually with the distance
+      between them. It makes "all descendants of X" and "is A an ancestor of B"
+      single indexed lookups instead of recursive traversals. The cost is
+      maintenance: inserting or moving a subtree rewrites many rows, normally
+      via triggers. It is the right trade when reads vastly outnumber writes,
+      which is typical of category trees and organisation charts.
+
+exercises:
+  - prompt: >-
+      Return every employee who reports, directly or indirectly, to employee 2
+      (Vikram Shetty), with their depth below him. Columns emp_id, full_name,
+      depth. Order by depth then emp_id.
+    difficulty: Medium
+    hint: >-
+      Anchor on emp_id = 2 with depth 0, then join employees to the previous
+      round on manager_id. Exclude the anchor from the final result if you want
+      only the reports.
+    solutionSql: |
+      with recursive reports as (
+          select emp_id, first_name || ' ' || last_name as full_name, 0 as depth
+          from employees where emp_id = 2
+          union all
+          select e.emp_id, e.first_name || ' ' || e.last_name, r.depth + 1
+          from employees e
+          join reports r on r.emp_id = e.manager_id
+          where r.depth < 10
+      )
+      select emp_id, full_name, depth
+      from reports
+      where depth > 0
+      order by depth, emp_id
+
+  - prompt: >-
+      For every category, return its full breadcrumb path separated by ' / '
+      and its depth. Columns category_id, depth, path. Order by path.
+    difficulty: Medium
+    hint: >-
+      Anchor on the categories with a NULL parent, and concatenate the name
+      onto the parent's path in the recursive term.
+    solutionSql: |
+      with recursive tree as (
+          select category_id, category_name::text as path, 1 as depth
+          from categories where parent_category_id is null
+          union all
+          select c.category_id, t.path || ' / ' || c.category_name, t.depth + 1
+          from categories c
+          join tree t on t.category_id = c.parent_category_id
+          where t.depth < 10
+      )
+      select category_id, depth, path
+      from tree
+      order by path
+
+  - prompt: >-
+      Generate the integers 1 to 10 with a recursive CTE and return each one
+      with its square. Columns n, square.
+    difficulty: Easy
+    hint: >-
+      Anchor on 1, add 1 each round, and stop with a WHERE in the recursive
+      term.
+    solutionSql: |
+      with recursive nums as (
+          select 1 as n
+          union all
+          select n + 1 from nums where n < 10
+      )
+      select n, n * n as square
+      from nums
+      order by n
+
+checklist:
+  - "Every recursive CTE is anchor, UNION [ALL], recursive term referencing itself"
+  - The self-reference sees only the previous iteration's rows, not the whole result
+  - RECURSIVE appears once after WITH, however many CTEs follow
+  - "UNION ALL is faster; UNION terminates on cycles but only for identical whole rows"
+  - Carry a path array to detect cycles, and a depth column to bound the traversal
+  - Sorting by the path array gives depth-first, readable tree order
+  - An index on the recursion's join column is the main performance lever
+  - "For hot, rarely-changing hierarchies prefer a closure table or materialised path"
+
+related:
+  - i-ctes
+  - j-self-cross
+  - s-relationships
+  - p17-recursive-org-chart
+
+dialect:
+  standard: >-
+    WITH RECURSIVE is standard SQL from SQL:1999, as are the SEARCH and CYCLE
+    clauses added in SQL:1999 and SQL:2023 respectively.
+  postgres: >-
+    Requires the RECURSIVE keyword. Supports arrays, which makes path tracking
+    and cycle detection straightforward, and added the CYCLE and SEARCH clauses
+    in version 14. generate_series makes the series case unnecessary.
+  mysql: >-
+    WITH RECURSIVE arrived in MySQL 8.0, with a cte_max_recursion_depth system
+    variable defaulting to 1000 that aborts a runaway query — a safety net
+    PostgreSQL does not have. No arrays, so path tracking uses a concatenated
+    string and cycle detection uses LOCATE or FIND_IN_SET. SQL Server spells it
+    WITH (no RECURSIVE keyword) and defaults to a maximum recursion of 100.

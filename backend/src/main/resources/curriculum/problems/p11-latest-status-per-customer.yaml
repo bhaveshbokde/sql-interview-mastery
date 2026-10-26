@@ -1,0 +1,292 @@
+id: p11-latest-status-per-customer
+position: 110
+title: Current status from a history table
+slug: latest-status-per-customer
+difficulty: Medium
+topic: Window functions
+tags: [latest-per-group, distinct-on, temporal, scd]
+
+orderSensitive: false
+
+statement: |
+  `account_status_history` is append-only — a status change inserts a row
+  rather than updating one.
+
+  Return each customer's **current** status: the one from their most recent
+  `effective_from`, with `history_id` breaking ties for changes recorded at
+  the same instant. Include how many changes they have had and when the
+  current status took effect.
+
+  Customers with no history rows do not appear.
+
+tables: [account_status_history, customers]
+
+expectedColumns: [customer_id, company_name, current_status, since, changes]
+
+edgeCases:
+  - >-
+    Two rows can share an `effective_from`, so a tiebreak is needed for a
+    reproducible answer — customer 321 has two rows at the same timestamp.
+  - >-
+    Most customers have no history rows at all and must be absent, not shown
+    with NULLs.
+  - >-
+    `max(effective_from)` grouped by customer gives the right timestamp and
+    cannot tell you the status that goes with it.
+  - A customer can return to a status they previously held.
+
+hints:
+  - This is top-1-per-group wearing different column names.
+  - "PostgreSQL has a construct for exactly this, and its ORDER BY is mandatory."
+  - The change count is an aggregate over the whole group, not over the latest row.
+
+solutionSql: |
+  select h.customer_id,
+         c.company_name,
+         h.status         as current_status,
+         h.effective_from as since,
+         t.changes
+  from (
+      select distinct on (customer_id)
+             customer_id, status, effective_from
+      from account_status_history
+      order by customer_id, effective_from desc, history_id desc
+  ) h
+  join customers c on c.customer_id = h.customer_id
+  join (
+      select customer_id, count(*) as changes
+      from account_status_history
+      group by customer_id
+  ) t on t.customer_id = h.customer_id
+  order by h.customer_id
+
+explanation:
+  lineByLine:
+    - clause: "distinct on (customer_id)"
+      note: >-
+        Keeps the first row for each customer. "First" is whatever the ORDER
+        BY says, which is why the ORDER BY is mandatory and must begin with
+        the DISTINCT ON expressions.
+    - clause: "order by customer_id, effective_from desc, history_id desc"
+      note: >-
+        Most recent change first within each customer, with history_id
+        resolving two changes recorded at the same instant. Without that third
+        key the answer is not reproducible for customer 321.
+    - clause: "join customers c"
+      note: >-
+        An inner join. Only customers that appear in the history have a
+        current status, and the question says those without history do not
+        appear.
+    - clause: "join (select customer_id, count(*) ...) t"
+      note: >-
+        The change count is an aggregate over the whole group, which
+        DISTINCT ON cannot produce because it returns one row and discards the
+        rest. Computing it separately and joining is the straightforward fix.
+
+  walkthrough: |
+    Ten customers have history rows. For each, DISTINCT ON keeps the row with
+    the latest `effective_from`.
+
+    Customer 302 has four rows — trial, active, suspended, then active again —
+    so the current status is `active` since March 2024. Only the latest row
+    reveals that; an alphabetical `max(status)` would return `trial` and a
+    `min` would return `active` by accident.
+
+    Customer 305 is `churned` and 310 is `suspended`, both of which have
+    earlier `active` rows. These are exactly the cases where reading the wrong
+    row gives a confidently wrong answer.
+
+    Customer 321 has two rows at the identical timestamp, which is why the
+    `history_id desc` tiebreak is in the ORDER BY rather than being optional
+    tidiness.
+
+  alternatives:
+    - title: ROW_NUMBER, the portable form
+      sql: |
+        with ranked as (
+            select h.customer_id,
+                   h.status,
+                   h.effective_from,
+                   row_number() over (partition by h.customer_id
+                                      order by h.effective_from desc, h.history_id desc) as rn,
+                   count(*)     over (partition by h.customer_id) as changes
+            from account_status_history h
+        )
+        select r.customer_id,
+               c.company_name,
+               r.status         as current_status,
+               r.effective_from as since,
+               r.changes
+        from ranked r
+        join customers c on c.customer_id = r.customer_id
+        where r.rn = 1
+        order by r.customer_id
+      when: >-
+        On any database with window functions, and it is arguably the better
+        answer here — the `count(*) over (partition by customer_id)` gives the
+        change count in the same pass, removing the second join entirely.
+      equivalent: true
+
+    - title: LATERAL with LIMIT 1
+      sql: |
+        select c.customer_id,
+               c.company_name,
+               latest.status         as current_status,
+               latest.effective_from as since,
+               latest.changes
+        from customers c
+        join lateral (
+              select h.status,
+                     h.effective_from,
+                     (select count(*) from account_status_history h2
+                      where h2.customer_id = c.customer_id) as changes
+              from account_status_history h
+              where h.customer_id = c.customer_id
+              order by h.effective_from desc, h.history_id desc
+              limit 1) latest on true
+        order by c.customer_id
+      when: >-
+        When there are many customers and an index on (customer_id,
+        effective_from desc). The subquery seeks straight to each customer's
+        latest row and stops, rather than sorting the whole history table.
+      equivalent: true
+
+  performance: |
+    `DISTINCT ON` sorts the whole history table by `(customer_id,
+    effective_from desc, history_id desc)` and keeps the first row of each
+    group. An index on exactly those columns supplies the order and removes
+    the sort.
+
+    The ROW_NUMBER version has the same cost and computes the change count in
+    the same pass, so it is slightly cheaper overall than the solution shown —
+    which is worth saying plainly rather than defending the DISTINCT ON form
+    on performance grounds.
+
+    The LATERAL version is the one that scales differently: with an index it
+    reads one entry per customer rather than sorting the whole history, so on
+    a history table with millions of rows and thousands of customers it wins
+    by a wide margin.
+
+    On a very hot path, the usual production answer is neither — it is a
+    `current_status` column on `customers`, maintained by a trigger, with this
+    query as the reconciliation check. That is a denormalisation with all the
+    obligations the schema-design module describes.
+
+  wrongApproaches:
+    - title: "max(effective_from) with the status alongside"
+      sql: |
+        select h.customer_id,
+               max(h.effective_from) as since,
+               count(*)              as changes,
+               max(h.status)         as not_the_current_status
+        from account_status_history h
+        group by h.customer_id
+        order by h.customer_id
+      whyWrong: >-
+        `max(status)` is the alphabetically greatest status in the group, not
+        the status at the latest timestamp. For customer 302 it returns
+        `trial`, which was the status in 2022. The two aggregates are computed
+        independently; nothing ties them to the same row. This is the single
+        most common wrong answer to latest-per-entity questions.
+
+    - title: Joining back on the maximum timestamp
+      sql: |
+        select h.customer_id,
+               h.status as current_status,
+               h.effective_from as since
+        from account_status_history h
+        where h.effective_from = (
+              select max(h2.effective_from)
+              from account_status_history h2
+              where h2.customer_id = h.customer_id)
+        order by h.customer_id, h.history_id
+      whyWrong: >-
+        Correct in spirit and wrong on ties — customer 321 has two rows at the
+        same timestamp and both come back, so the result is no longer one row
+        per customer. There is nowhere clean to add a tiebreak, which is
+        exactly why DISTINCT ON and ROW_NUMBER exist.
+
+  extraTests:
+    - name: Minimal history (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt has two customers with history and one without. The
+        customer with none must be absent, and customer 301's two rows must
+        resolve to the later one.
+      sql: |
+        select h.customer_id,
+               c.company_name,
+               h.status         as current_status,
+               h.effective_from as since,
+               t.changes
+        from (
+            select distinct on (customer_id)
+                   customer_id, status, effective_from
+            from account_status_history
+            order by customer_id, effective_from desc, history_id desc
+        ) h
+        join customers c on c.customer_id = h.customer_id
+        join (
+            select customer_id, count(*) as changes
+            from account_status_history
+            group by customer_id
+        ) t on t.customer_id = h.customer_id
+        order by h.customer_id
+
+    - name: Which customers have tied timestamps
+      schema: learning
+      note: >-
+        Finding the ties before writing the query is what tells you a tiebreak
+        is needed. Customer 321 has two rows at one instant; without
+        `history_id desc` the answer for that customer is undefined.
+      sql: |
+        select customer_id,
+               effective_from,
+               count(*)                                        as rows_at_this_instant,
+               string_agg(status, ', ' order by history_id)    as statuses
+        from account_status_history
+        group by customer_id, effective_from
+        having count(*) > 1
+        order by customer_id
+
+  followUps:
+    - question: Why can you not use max() with the other columns?
+      answer: >-
+        Because each aggregate is computed independently over the group, so
+        `max(effective_from)` and `max(status)` come from potentially
+        different rows. The aggregate identifies a **value**, not a row.
+        PostgreSQL rejects selecting an ungrouped `status` outright; MySQL
+        without ONLY_FULL_GROUP_BY accepts it and returns an arbitrary row's
+        value, which is worse because the result looks right.
+
+    - question: How would you find each customer's status as at a given date?
+      answer: >-
+        Add `where effective_from <= :as_of` inside the DISTINCT ON subquery
+        before the ordering. The same construct then returns the latest row
+        **at or before** that moment, which is a point-in-time query over a
+        slowly changing dimension. The ability to ask that question is the
+        whole reason the table is append-only rather than updated in place.
+
+    - question: How would you compute how long each status lasted?
+      answer: >-
+        `lead(effective_from) over (partition by customer_id order by
+        effective_from)` gives the moment the status was superseded, and the
+        difference is its duration. A NULL from LEAD marks the current status,
+        whose duration runs to now. This turns the history table into a set of
+        intervals, which is the standard shape for answering "how long were
+        customers suspended on average".
+
+    - question: When would you denormalise this into a current_status column?
+      answer: >-
+        When the current status is read on every request and the history is
+        only read occasionally — which is the usual ratio. The column is
+        maintained by a trigger on insert, and this query becomes the
+        reconciliation check that runs periodically to confirm the two agree.
+        The obligation that gets skipped is the reconciliation, and skipping
+        it is why denormalised copies eventually lie.
+
+  related:
+    - w-top-n-per-group
+    - w-ranking
+    - s-relationships
+    - p05-department-top-earners

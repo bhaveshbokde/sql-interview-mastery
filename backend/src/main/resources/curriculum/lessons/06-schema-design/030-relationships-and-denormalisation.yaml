@@ -1,0 +1,496 @@
+id: s-relationships
+moduleId: schema-design
+position: 30
+title: Relationships and deliberate denormalisation
+slug: relationships-and-denormalisation
+difficulty: Intermediate
+estimatedMinutes: 25
+summary: >-
+  Modelling one-to-one, one-to-many, many-to-many, hierarchies and polymorphic
+  associations — then the cases where duplicating data is the right answer, and
+  what you take on when you do.
+tags: [relationships, junction-table, hierarchy, denormalisation, data-modelling]
+
+prerequisites:
+  - s-normalisation
+
+objectives:
+  - Model each cardinality and say where the foreign key goes
+  - Design a junction table and decide what attributes belong on it
+  - Compare adjacency list, materialised path and closure table for hierarchies
+  - Name three legitimate reasons to denormalise
+  - State what maintaining a denormalised copy requires
+
+concept: |
+  ## One-to-many
+
+  The default. The foreign key goes on the **many** side, because that is where
+  there is exactly one value to store. `employees.dept_id` points at
+  `departments`; the department does not store a list of employees.
+
+  Whether the key is nullable is the design decision: a nullable
+  `employees.dept_id` says an employee need not have a department, which in
+  this dataset is true of two of them.
+
+  ## Many-to-many
+
+  Needs a third table. `employee_projects(emp_id, project_id)` with a
+  composite primary key.
+
+  The junction table frequently carries attributes of the **relationship** —
+  `role` and `allocation_pct` here. Those belong to the pairing, not to the
+  employee or the project, and having somewhere to put them is a large part of
+  why a junction table is better than an array column.
+
+  ## One-to-one
+
+  Three options, in order of how often they are right:
+
+  1. **Same table.** Usually correct. Two tables in strict one-to-one
+     correspondence are usually one entity.
+  2. **Shared primary key.** `user_profiles.user_id` is both the primary key
+     and a foreign key to `users`. The right shape for splitting off rarely
+     read or large columns, or for optional detail.
+  3. **Unique foreign key.** A nullable FK with a unique constraint, which
+     models "at most one".
+
+  Genuine reasons to split: a large column you rarely select, a group of
+  columns with different access control, or an optional extension that applies
+  to a minority of rows.
+
+  ## Hierarchies
+
+  | Model | Store | Read | Write |
+  |-------|-------|------|-------|
+  | Adjacency list | `parent_id` | recursive CTE | trivial |
+  | Materialised path | `'/1/4/9/'` | prefix LIKE | rewrite subtree |
+  | Closure table | every ancestor-descendant pair | one join | many rows |
+  | Nested set | left/right numbers | range query | renumber everything |
+
+  **Adjacency list** is the default — it is what `categories` and
+  `employees.manager_id` use. Simple, correct, and every traversal is a
+  recursive CTE.
+
+  **Closure table** is the one to reach for when reads vastly outnumber writes
+  and traversals are hot. "All descendants of X" becomes a single indexed
+  lookup. The cost is trigger-maintained rows on every insert or move.
+
+  **Nested set** is a classic that is rarely the right answer now: reads are
+  elegant and any insert renumbers a large part of the tree.
+
+  ## Polymorphic associations
+
+  "A comment belongs to either a post or a photo." Three approaches:
+
+  1. **Two nullable foreign keys** with a CHECK that exactly one is set.
+     Keeps referential integrity. Does not scale past a few parent types.
+  2. **A type column plus an untyped id.** Scales to any number of types and
+     **cannot have a foreign key**, so the database no longer enforces that the
+     parent exists. Popular in ORMs; a source of orphaned rows.
+  3. **A shared parent table** that both posts and photos reference, with the
+     comment pointing at that. Keeps integrity at the cost of an extra table
+     and a join.
+
+  Option 1 for a small fixed set, option 3 when integrity matters, option 2
+  when you have accepted that the application is responsible.
+
+  ## Denormalisation
+
+  Legitimate reasons, all of which are read-performance arguments:
+
+  - **A derived aggregate that is read constantly.** A `comment_count` on the
+    post, rather than counting comments on every page load.
+  - **Breaking up a deep join path** for a query that must be fast and runs
+    everywhere.
+  - **An analytics or reporting store** fed from the transactional one, where
+    a star schema is the appropriate shape.
+
+  Illegitimate reason: "joins are slow". Joins on indexed keys are fast, and
+  the belief that they are not usually traces to a missing index.
+
+  What you take on with every denormalised copy:
+
+  - **Keeping it in sync.** A trigger, a scheduled job, or application code
+    that must never be bypassed.
+  - **A reconciliation story.** How do you detect that the copy has drifted,
+    and what do you do about it? If there is no answer, the copy will drift and
+    nobody will know.
+  - **Write amplification and contention.** One logical write touches several
+    rows, and a counter on a hot parent row serialises its children's writes.
+
+  Say the trade out loud: "this denormalisation makes the dashboard 20× faster
+  and requires a trigger plus a nightly reconciliation job." That is a design
+  decision. "We denormalised for speed" is not.
+
+syntax:
+  - form: "child.parent_id REFERENCES parent(id)"
+    notes: One-to-many. The foreign key always goes on the many side.
+  - form: "junction(a_id, b_id, attrs..., PRIMARY KEY (a_id, b_id))"
+    notes: >-
+      Many-to-many. The composite key enforces "at most one pairing"; relationship
+      attributes live here.
+  - form: "detail.id PRIMARY KEY REFERENCES main(id)"
+    notes: One-to-one by shared primary key.
+  - form: "node.parent_id REFERENCES node(id)"
+    notes: Adjacency list. Traversed with a recursive CTE.
+  - form: "closure(ancestor_id, descendant_id, depth, PRIMARY KEY (ancestor_id, descendant_id))"
+    notes: >-
+      Closure table. One indexed lookup per traversal; maintained by triggers.
+  - form: "CHECK ((post_id IS NOT NULL)::int + (photo_id IS NOT NULL)::int = 1)"
+    notes: >-
+      Exactly-one-of for a polymorphic association with real foreign keys.
+
+sampleTables: [employees, departments, projects, employee_projects, categories, orders, order_items]
+
+examples:
+  - title: A many-to-many relationship with attributes on the pairing
+    sql: |
+      select p.project_name,
+             count(*)                                        as team_size,
+             sum(ep.allocation_pct)                          as total_allocation_pct,
+             round(avg(ep.allocation_pct), 1)                as avg_allocation,
+             string_agg(distinct ep.role, ', ' order by ep.role) as roles
+      from projects p
+      join employee_projects ep on ep.project_id = p.project_id
+      group by p.project_name
+      order by team_size desc, p.project_name
+    walkthrough: |
+      `role` and `allocation_pct` are attributes of the **pairing**. Priya Nair
+      is Tech Lead at 60% on Payments Rewrite and Tech Lead at 40% on Data
+      Platform — the same person, the same role name, different allocations,
+      because the allocation belongs to the assignment rather than to her.
+
+      An array column `employees.project_ids` could record which projects she
+      is on and would have nowhere to put the allocation. That is the practical
+      argument for a junction table over an array, more than any normalisation
+      argument.
+
+      `total_allocation_pct` over 100 for a project is fine — several people
+      each contributing a fraction. The same sum **per employee** going over
+      100 would be a data-quality problem worth a CHECK constraint, and no
+      constraint can express it, because it spans rows. That is a real limit of
+      declarative constraints and the usual reason such rules end up in
+      triggers or in the application.
+
+  - title: An adjacency list, and the cost of traversing it
+    sql: |
+      with recursive descendants as (
+          select category_id, category_name, parent_category_id, 1 as depth
+          from categories
+          where category_id = 1
+          union all
+          select c.category_id, c.category_name, c.parent_category_id, d.depth + 1
+          from categories c
+          join descendants d on d.category_id = c.parent_category_id
+      )
+      select d.depth,
+             d.category_id,
+             d.category_name,
+             count(p.product_id) as products
+      from descendants d
+      left join products p on p.category_id = d.category_id
+      group by d.depth, d.category_id, d.category_name
+      order by d.depth, d.category_id
+    walkthrough: |
+      "Everything under Electronics" costs a recursive CTE: one join per level
+      of the tree, every time the question is asked.
+
+      With a closure table the same question is
+      `where ancestor_id = 1` — one indexed lookup, no recursion, no depth
+      dependency. On a category tree read on every page load and changed
+      monthly, that is the trade worth making.
+
+      Note `count(p.product_id)` rather than `count(*)`, because the LEFT JOIN
+      produces a row for Accessories-with-no-products categories. The same
+      outer-join rule as always.
+
+  - title: What a denormalised counter would save
+    sql: |
+      select o.order_id,
+             o.order_date,
+             o.status,
+             count(oi.product_id)                                            as line_count,
+             sum(oi.quantity)                                                as units,
+             round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2)  as order_total
+      from orders o
+      left join order_items oi on oi.order_id = o.order_id
+      where o.order_date >= date '2024-06-01'
+      group by o.order_id, o.order_date, o.status
+      order by o.order_id
+    walkthrough: |
+      Every page that lists orders runs this aggregate. Storing `line_count`
+      and `order_total` on `orders` would turn it into a plain select with no
+      join and no grouping.
+
+      What that costs: both columns must be updated whenever a line is added,
+      changed or removed. A trigger on `order_items` is the usual mechanism,
+      and it must handle INSERT, UPDATE and DELETE including the case where
+      `order_id` itself changes.
+
+      And it needs a reconciliation query — this very query, compared against
+      the stored columns, run periodically — because a trigger that is
+      disabled during a bulk load, or a path that bypasses it, leaves the copy
+      wrong with nothing to say so.
+
+      That is the full price. It is often worth paying; it is never free, and
+      the reconciliation half is the half people skip.
+
+  - title: Detecting drift between a derived value and its source
+    sql: |
+      select o.order_id,
+             o.status,
+             count(oi.product_id)                                          as actual_lines,
+             sum(oi.quantity)                                              as actual_units,
+             bool_or(oi.product_id is null)                                as has_no_lines
+      from orders o
+      left join order_items oi on oi.order_id = o.order_id
+      group by o.order_id, o.status
+      having count(oi.product_id) = 0
+      order by o.order_id
+    walkthrough: |
+      This is the shape of a reconciliation query: compute the truth from the
+      source of truth and compare it with what is stored. Here there is no
+      stored counter yet, so the query reports the orders with no lines at
+      all — which is the case a naive counter-maintenance trigger would most
+      likely get wrong, since there is no `order_items` row to fire it.
+
+      An order with no lines is also a legitimate data state worth noticing in
+      its own right: a cancelled order whose lines were removed, or an order
+      created but never populated.
+
+      Whenever a design adds a derived column, the reconciliation query should
+      be written at the same time and scheduled. Writing it later means writing
+      it after the first incident.
+
+edgeCases:
+  - title: A nullable foreign key models optional membership
+    body: >-
+      Two employees have no department. That is not missing data to be cleaned
+      up — the CEO and the Chief of Staff genuinely sit outside the
+      departmental structure. A nullable foreign key is the correct way to model
+      "optional", and the alternative, inventing an "Unassigned" department
+      row, adds a fictional entity that every query then has to know about.
+    sql: |
+      select e.emp_id,
+             e.first_name || ' ' || e.last_name as employee,
+             e.job_title,
+             e.dept_id,
+             coalesce(d.dept_name, '(outside the department structure)') as department
+      from employees e
+      left join departments d on d.dept_id = e.dept_id
+      where e.dept_id is null
+      order by e.emp_id
+
+  - title: A self-referencing relationship is just a one-to-many to itself
+    body: >-
+      `manager_id` is an ordinary nullable foreign key that happens to point at
+      the same table. Nothing in the schema marks it as special; the hierarchy
+      is a consequence of the data rather than of a declaration. That is both
+      the simplicity and the weakness of the adjacency list — no constraint
+      prevents a cycle, and only a recursive query or a trigger can detect one.
+    sql: |
+      select count(*)                                  as employees,
+             count(manager_id)                         as with_a_manager,
+             count(*) - count(manager_id)              as roots,
+             count(distinct manager_id)                as distinct_managers,
+             max(reports)                              as largest_span
+      from employees e
+      left join lateral (select count(*) as reports
+                         from employees r
+                         where r.manager_id = e.emp_id) s on true
+
+pitfalls:
+  - mistake: Putting the foreign key on the one side
+    why: >-
+      Storing a list of child ids on the parent requires an array or a
+      delimited string, neither of which can carry a foreign key, so referential
+      integrity is lost.
+    fix: >-
+      The foreign key goes on the many side, always. For many-to-many, a
+      junction table.
+
+  - mistake: Using a type column plus an untyped id for polymorphism
+    why: >-
+      No foreign key is possible, so the database cannot prevent a comment
+      pointing at a deleted post or at a non-existent id. Orphans accumulate
+      silently.
+    fix: >-
+      Nullable foreign keys with an exactly-one CHECK for a small fixed set of
+      parent types, or a shared parent table. Accept option 2 only knowingly.
+
+  - mistake: Denormalising without a synchronisation and reconciliation plan
+    why: >-
+      The copy is correct on the day it is created. Then a bulk load bypasses
+      the trigger, or a code path forgets, and the copy is wrong — and a wrong
+      cached value looks exactly like a right one.
+    fix: >-
+      Write the reconciliation query at the same time as the denormalisation,
+      schedule it, and alert on a mismatch. If that is too much work, the
+      denormalisation is not worth it.
+
+  - mistake: Splitting a table one-to-one "for normalisation"
+    why: >-
+      Normalisation never requires it. Two tables in strict one-to-one
+      correspondence are one entity, and splitting them adds a join to every
+      query for no benefit.
+    fix: >-
+      Split only for a concrete reason — a large rarely-read column, different
+      access control, or optional detail present on a minority of rows.
+
+performance: |
+  A junction table wants indexes on **both** directions. The composite primary
+  key `(emp_id, project_id)` serves lookups by employee; a separate index on
+  `(project_id, emp_id)` serves lookups by project. Without the second one,
+  "who is on this project" is a sequential scan — and this is one of the most
+  common missing indexes in a schema that otherwise looks well designed.
+
+  More generally, every foreign-key column should be indexed in PostgreSQL. The
+  database does not do it for you, and the absence shows up both in joins and
+  in `DELETE` on the parent, which must scan the child to check references.
+
+  A closure table converts recursive traversal into a single indexed lookup —
+  typically a very large read win — at the cost of `O(depth)` rows written per
+  insert and a subtree rewrite on move. Worth it when the read:write ratio
+  justifies it, and you should be able to state what that ratio is.
+
+  Denormalised counters serialise writes on the parent row. Every child insert
+  updates the same parent, so under concurrency they contend on that row's
+  lock. At high write rates the usual answer is to accumulate into a separate
+  rollup table and aggregate periodically, rather than maintaining an exact
+  counter.
+
+interviewQuestions:
+  - question: How do you model a many-to-many relationship?
+    answer: >-
+      With a junction table holding a foreign key to each side and a composite
+      primary key over the pair, which enforces that a given pairing appears at
+      most once. The junction table is also where attributes of the relationship
+      live — a role, an allocation, a start date — which is a large part of why
+      it is preferable to an array column. Index both directions: the primary
+      key serves one, and a second index on the reversed column order serves
+      the other.
+
+  - question: How would you model a hierarchy, and what are the trade-offs?
+    answer: >-
+      An adjacency list with a self-referencing parent_id is the default:
+      trivial writes, and every traversal is a recursive CTE. A closure table
+      stores every ancestor-descendant pair, turning traversal into one indexed
+      lookup at the cost of many rows written per insert and a subtree rewrite
+      on move — right when reads vastly outnumber writes. A materialised path
+      stores the route as a string and supports prefix queries, but moving a
+      subtree rewrites every descendant. Nested sets give elegant reads and
+      renumber much of the tree on any insert, which is why they are rarely
+      chosen now.
+
+  - question: When is denormalisation justified?
+    answer: >-
+      When a specific read is demonstrably too slow and the alternatives have
+      been tried — correct indexes first, since "joins are slow" usually means
+      "a foreign key is unindexed". Legitimate cases are a derived aggregate
+      read constantly, breaking a deep join path for a hot query, and a
+      separate reporting store with a star schema. What you take on is
+      synchronisation, write amplification, contention on the duplicated row,
+      and the obligation to reconcile — and the reconciliation job is the part
+      that gets skipped and the reason the copy eventually lies.
+
+  - question: How do you model a polymorphic association?
+    answer: >-
+      Nullable foreign keys for each possible parent plus a CHECK that exactly
+      one is set keeps full referential integrity and works for a small fixed
+      set of types. A shared parent table that each concrete type references,
+      with the child pointing at that, also keeps integrity and scales to more
+      types at the cost of a join. A type column with an untyped id scales
+      freely and gives up foreign keys entirely, so the database can no longer
+      prevent orphans — which is a legitimate choice only if made knowingly.
+
+exercises:
+  - prompt: >-
+      For each employee on more than one project, return their name, how many
+      projects, and their total allocation across all of them. Columns
+      full_name, projects, total_allocation. Order by total_allocation
+      descending.
+    difficulty: Easy
+    hint: Group employee_projects by emp_id and join to employees for the name.
+    solutionSql: |
+      select e.first_name || ' ' || e.last_name as full_name,
+             count(*)                            as projects,
+             sum(ep.allocation_pct)              as total_allocation
+      from employee_projects ep
+      join employees e on e.emp_id = ep.emp_id
+      group by e.emp_id, e.first_name, e.last_name
+      having count(*) > 1
+      order by total_allocation desc, full_name
+
+  - prompt: >-
+      Build the closure of the category hierarchy — every ancestor-descendant
+      pair with its depth, including each category as its own ancestor at depth
+      0. Columns ancestor_id, descendant_id, depth. Order by ancestor_id then
+      descendant_id.
+    difficulty: Hard
+    hint: >-
+      The anchor is each category paired with itself at depth 0; the recursive
+      term extends each pair by one child.
+    solutionSql: |
+      with recursive closure as (
+          select category_id as ancestor_id,
+                 category_id as descendant_id,
+                 0           as depth
+          from categories
+          union all
+          select cl.ancestor_id,
+                 c.category_id,
+                 cl.depth + 1
+          from closure cl
+          join categories c on c.parent_category_id = cl.descendant_id
+          where cl.depth < 10
+      )
+      select ancestor_id, descendant_id, depth
+      from closure
+      order by ancestor_id, descendant_id
+
+  - prompt: >-
+      Find projects where the sum of allocation percentages exceeds 200,
+      suggesting an over-committed team. Columns project_name, people,
+      total_allocation. Order by total_allocation descending.
+    difficulty: Easy
+    hint: Group the junction table by project and filter on the sum in HAVING.
+    solutionSql: |
+      select p.project_name,
+             count(*)               as people,
+             sum(ep.allocation_pct) as total_allocation
+      from employee_projects ep
+      join projects p on p.project_id = ep.project_id
+      group by p.project_name
+      having sum(ep.allocation_pct) > 200
+      order by total_allocation desc, p.project_name
+
+checklist:
+  - The foreign key goes on the many side, always
+  - A junction table carries the attributes of the relationship itself
+  - Index both directions of a junction table
+  - "One-to-one usually means one table; split only for a concrete reason"
+  - "Adjacency list is the default hierarchy; closure table when reads dominate"
+  - Polymorphic associations with a type column give up referential integrity
+  - "Denormalise for a measured read problem, never because \"joins are slow\""
+  - Every denormalised copy needs a sync mechanism and a reconciliation job
+
+related:
+  - s-normalisation
+  - s-keys-constraints
+  - i-recursive-cte
+  - p-query-patterns
+
+dialect:
+  standard: >-
+    Relationship modelling is relational design and identical everywhere.
+    Foreign keys, composite primary keys and CHECK constraints are standard SQL.
+  postgres: >-
+    Recursive CTEs make the adjacency list genuinely comfortable to query, and
+    the ltree extension provides an indexed materialised-path type. Arrays and
+    JSONB offer tempting shortcuts around junction tables that give up
+    referential integrity.
+  mysql: >-
+    InnoDB indexes foreign keys automatically, so the junction-table index
+    advice is less critical there. Recursive CTEs from 8.0 make adjacency lists
+    practical; older MySQL schemas often used nested sets or application-side
+    traversal because recursion was unavailable.

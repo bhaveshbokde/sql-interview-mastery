@@ -1,0 +1,433 @@
+id: i-json
+moduleId: intermediate
+position: 50
+title: JSON and JSONB
+slug: json-in-postgresql
+difficulty: Intermediate
+estimatedMinutes: 25
+summary: >-
+  Querying semi-structured data without leaving SQL. The operators, the
+  difference between json and jsonb, expanding arrays into rows, building JSON
+  from relational data, and the modelling question of when not to use it.
+tags: [jsonb, json, semi-structured, containment, gin-index]
+
+prerequisites:
+  - f-data-types
+
+objectives:
+  - State the difference between json and jsonb and pick the right one
+  - Extract values with the arrow operators and know which returns text
+  - Expand a JSON array into rows
+  - Use the containment operator and say why it is the indexable one
+  - Decide when a column should be JSONB and when it should be a real column
+
+concept: |
+  ## json versus jsonb
+
+  `json` stores the **exact text** you supplied — whitespace, key order,
+  duplicate keys and all. Every query re-parses it.
+
+  `jsonb` stores a **decomposed binary form**. Parsing happens once on write.
+  Whitespace is discarded, keys are reordered, and duplicates are collapsed to
+  the last one. It supports indexing and the containment operators.
+
+  **Use `jsonb`.** `json` is for the rare case where you must preserve the
+  input byte-for-byte, such as an audit log of received payloads.
+
+  ## The operators
+
+  | Operator | Returns | Example |
+  |----------|---------|---------|
+  | `->` | **jsonb** | `attributes -> 'cpu'` → `"i7"` (with quotes) |
+  | `->>` | **text** | `attributes ->> 'cpu'` → `i7` |
+  | `#>` | jsonb, by path | `data #> '{a,b}'` |
+  | `#>>` | text, by path | `data #>> '{a,b}'` |
+  | `@>` | boolean, contains | `attributes @> '{"cpu":"i7"}'` |
+  | `?` | boolean, has key | `attributes ? 'gpu'` |
+
+  The `->` versus `->>` distinction is the one that catches everyone. `->`
+  gives you JSON, so a string value comes back **with its quotes** and
+  comparing it to `'i7'` fails. `->>` gives you text, which is almost always
+  what you want at the end of a chain.
+
+  Both return **NULL** for a missing key rather than raising an error — which
+  is right, and means a typo in a key name produces a column of NULLs rather
+  than a complaint.
+
+  Chaining is left to right: `data -> 'a' -> 'b' ->> 'c'` uses `->` for the
+  intermediate steps and `->>` for the last.
+
+  ## Containment, and why it is the one to index
+
+  `a @> b` is true when `b` is contained in `a`. It is the natural way to ask
+  "does this document have these keys with these values", it handles nesting
+  and arrays, and crucially it is the operator a **GIN index** supports:
+
+  ```sql
+  create index on products using gin (attributes);
+  select * from products where attributes @> '{"cpu":"i9"}';
+  ```
+
+  An equality test on an extracted value — `(attributes ->> 'cpu') = 'i9'` —
+  means the same thing and **cannot** use that index. It needs its own
+  expression index: `create index on products ((attributes ->> 'cpu'))`.
+
+  So there are two indexing strategies and they serve different queries: a GIN
+  index on the whole column for containment and key-existence over arbitrary
+  keys, and B-tree expression indexes on specific extracted fields for ranges
+  and sorting.
+
+  ## Expanding and building
+
+  `jsonb_array_elements(arr)` turns a JSON array into one row per element;
+  `jsonb_array_elements_text` does the same returning text. `jsonb_each`
+  expands an object into key-value rows. All are set-returning functions, so
+  they go in `FROM` and are implicitly lateral.
+
+  Going the other way, `jsonb_build_object`, `jsonb_agg` and
+  `jsonb_object_agg` construct JSON from relational data — which is how an API
+  endpoint can return a nested document from a single query instead of
+  assembling it in application code.
+
+  ## When not to use JSONB
+
+  JSONB is right for genuinely variable attributes: product specifications that
+  differ by category, third-party webhook payloads, user preferences.
+
+  It is wrong for data you query, join or constrain on regularly. A real
+  column gets a type, a NOT NULL constraint, a foreign key, planner statistics
+  and a cheap index. A JSONB field gets none of those by default. "We will put
+  it in JSONB for flexibility" is how a schema ends up with no schema and a
+  query layer full of casts.
+
+  The honest test: if you find yourself indexing the same extracted field, it
+  should probably be a column.
+
+syntax:
+  - form: "jsonb_col -> 'key'   |   jsonb_col -> 0"
+    notes: Returns jsonb. Integer subscript indexes into an array, 0-based.
+  - form: "jsonb_col ->> 'key'"
+    notes: Returns text, unquoted. Use at the end of a chain.
+  - form: "jsonb_col #>> '{a,b,0}'"
+    notes: Text by path, with the path as a text array.
+  - form: "jsonb_col @> '{\"key\": \"value\"}'"
+    notes: Containment. The GIN-indexable operator.
+  - form: "jsonb_col ? 'key'   |   ?| array[...]   |   ?& array[...]"
+    notes: Key existence — any key, any of, all of.
+  - form: "jsonb_array_elements(arr)   |   jsonb_each(obj)"
+    notes: >-
+      Set-returning. Used in FROM, implicitly lateral, so they can reference
+      the row they expand.
+
+sampleTables: [products, categories]
+
+examples:
+  - title: Arrow operators, and the quoting difference
+    sql: |
+      select product_id,
+             product_name,
+             attributes -> 'cpu'                     as cpu_json,
+             attributes ->> 'cpu'                    as cpu_text,
+             (attributes -> 'cpu')::text = 'i7'      as json_compare_needs_quotes,
+             (attributes ->> 'cpu') = 'i7'           as text_compare_works,
+             attributes ->> 'nonexistent'            as missing_key,
+             (attributes ->> 'warranty_months')::int as warranty_months
+      from products
+      where category_id = 3
+      order by product_id
+    walkthrough: |
+      `-> 'cpu'` returns the JSON value `"i7"` — with the quotes, because that
+      is what the JSON text for a string is. `->> 'cpu'` returns `i7`.
+
+      The two comparison columns make the consequence concrete: comparing the
+      `->` result to `'i7'` is false everywhere, and comparing the `->>` result
+      works. This is the single most common JSONB mistake and it produces a
+      filter that silently matches nothing.
+
+      `missing_key` is NULL rather than an error. Useful, and it means a
+      mistyped key name gives you a column of NULLs with no complaint — worth
+      checking for when a JSON query returns nothing.
+
+      The final cast is needed because `->>` is always text, whatever the
+      underlying JSON type.
+
+  - title: Containment and key existence
+    sql: |
+      select product_id,
+             product_name,
+             attributes
+      from products
+      where attributes @> '{"warranty_months": 24}'
+         or attributes ? 'gpu'
+      order by product_id
+    walkthrough: |
+      `@> '{"warranty_months": 24}'` matches documents containing that key with
+      that value. Note the value in the containment document is the **number**
+      24, not the string "24" — containment is type-aware, and `'{"warranty_
+      months": "24"}'` would match nothing.
+
+      `? 'gpu'` matches documents that have the key at all, whatever its value.
+      Only the gaming laptop does.
+
+      Both operators are supported by a GIN index on `attributes`. The
+      equivalent written as `(attributes ->> 'warranty_months')::int = 24` means
+      the same thing and would need a separate expression index to be fast —
+      which is the practical reason to prefer `@>` when either would do.
+
+  - title: Expanding a JSON array into rows
+    sql: |
+      select p.product_id,
+             p.product_name,
+             colour
+      from products p
+      cross join lateral jsonb_array_elements_text(p.attributes -> 'colours') as colour
+      order by p.product_id, colour
+    walkthrough: |
+      `jsonb_array_elements_text` turns the `colours` array into one row per
+      colour, so a product with two colours appears twice. This is the standard
+      unnesting pattern, and it is how you join JSON array contents to
+      relational data.
+
+      Products with no `colours` key produce NULL from the `->`, and
+      `jsonb_array_elements_text(NULL)` returns no rows — so `CROSS JOIN
+      LATERAL` drops those products entirely. `LEFT JOIN LATERAL ... ON true`
+      keeps them with a NULL colour, which is usually what a report wants.
+
+      The `LATERAL` keyword is optional here, because a set-returning function
+      in `FROM` is implicitly lateral. Writing it makes the correlation
+      visible.
+
+  - title: Aggregating relational rows back into JSON
+    sql: |
+      select c.category_id,
+             c.category_name,
+             count(p.product_id) as products,
+             jsonb_agg(
+                 jsonb_build_object(
+                     'id',    p.product_id,
+                     'name',  p.product_name,
+                     'price', p.unit_price,
+                     'stock', p.units_in_stock)
+                 order by p.product_id) as catalogue
+      from categories c
+      join products p on p.category_id = c.category_id
+      where c.category_id in (4, 5)
+      group by c.category_id, c.category_name
+      order by c.category_id
+    walkthrough: |
+      `jsonb_build_object` constructs one object per row; `jsonb_agg` collects
+      them into an array per group. The result is a nested document produced
+      entirely in SQL.
+
+      The `order by` inside `jsonb_agg` matters for the same reason it matters
+      in `string_agg`: without it the array order is whatever the executor
+      produced, so the same query can return elements in different orders on
+      different runs.
+
+      This pattern lets one query return exactly the shape an API response
+      needs, avoiding the N+1 problem of fetching categories and then querying
+      products per category. The trade-off is that the database is now
+      responsible for a presentation concern, and the query is harder to reuse
+      for anything else.
+
+edgeCases:
+  - title: jsonb normalises; json does not
+    body: >-
+      The same input text, cast to the two types. jsonb discards the whitespace,
+      sorts the keys and keeps only the last of the duplicated keys; json
+      preserves every byte. That normalisation is what makes jsonb comparable
+      and indexable, and it is also why jsonb cannot be used for an audit record
+      that must reproduce exactly what was received.
+    sql: |
+      select '{"b": 1, "a": 2,   "b": 3}'::json   as as_json,
+             '{"b": 1, "a": 2,   "b": 3}'::jsonb  as as_jsonb,
+             '{"a":1}'::jsonb = '{ "a" : 1 }'::jsonb as jsonb_equal
+
+  - title: A missing key and a JSON null are different things
+    body: >-
+      `->>` returns SQL NULL for a key that is absent, and the text `null` for
+      a key whose value is JSON null. Distinguishing the two needs the key
+      existence operator or `jsonb_typeof`. This is the JSON version of the
+      "missing versus empty" distinction and it catches people writing
+      validation queries.
+    sql: |
+      select '{"a": null}'::jsonb ->> 'a'                 as json_null_as_text,
+             '{"a": null}'::jsonb ->> 'a' is null         as looks_like_sql_null,
+             '{"a": null}'::jsonb ? 'a'                   as key_exists,
+             '{}'::jsonb ? 'a'                            as key_missing,
+             jsonb_typeof('{"a": null}'::jsonb -> 'a')    as type_of_present,
+             jsonb_typeof('{}'::jsonb -> 'a')             as type_of_absent
+
+pitfalls:
+  - mistake: "Comparing the result of `->` to a string literal"
+    why: >-
+      `->` returns JSON, so a string value carries its quotes. The comparison is
+      false for every row and the filter silently matches nothing.
+    fix: >-
+      Use `->>` for the final extraction, or compare against a JSON literal:
+      `attributes -> 'cpu' = '"i7"'::jsonb`.
+
+  - mistake: Filtering on an extracted field and expecting a GIN index to help
+    why: >-
+      A GIN index on the column supports `@>`, `?` and the path operators. It
+      does not support `(col ->> 'k') = 'v'`, which is an expression over the
+      column rather than a containment test.
+    fix: >-
+      Use `@>` where the semantics allow it, or create a B-tree expression
+      index on exactly the extraction you filter by.
+
+  - mistake: Putting queryable, constrained data in JSONB
+    why: >-
+      It looks flexible at design time. Later it has no type checking, no
+      foreign key, no NOT NULL, poor planner statistics, and every query needs
+      a cast.
+    fix: >-
+      Real columns for anything you filter, join or constrain on. JSONB for
+      genuinely variable attributes. A field you keep indexing is a column.
+
+  - mistake: Choosing json over jsonb by default
+    why: >-
+      It is the shorter name and it appears first in the documentation. It
+      re-parses on every access and supports none of the useful operators or
+      indexes.
+    fix: >-
+      jsonb unless you specifically need byte-exact preservation of the input.
+
+performance: |
+  A **GIN index** on a jsonb column supports `@>`, `?`, `?|` and `?&`. The
+  default operator class indexes every key and value; `jsonb_path_ops` indexes
+  only value paths, producing a smaller and faster index that supports `@>` but
+  not the key-existence operators. Choosing the restricted class when you only
+  use containment is a worthwhile and frequently missed optimisation.
+
+  A **B-tree expression index** on `((attributes ->> 'cpu'))` serves equality,
+  ranges and ordering on that one field. This is the right tool when a
+  particular key is queried constantly — and when you find yourself creating
+  several of them, that is the signal to promote the fields to columns.
+
+  jsonb values larger than roughly 2 kB are TOASTed — stored out of line and
+  compressed — so reading one key from a large document can mean fetching and
+  decompressing the whole thing. Wide JSONB columns on a frequently scanned
+  table are a genuine cost, and are another argument for keeping hot fields as
+  real columns.
+
+  The planner has very limited statistics for jsonb contents, so selectivity
+  estimates for containment predicates are crude. A query with a JSONB filter
+  and a join can get a poor join order for that reason alone.
+
+interviewQuestions:
+  - question: What is the difference between json and jsonb?
+    answer: >-
+      json stores the original text and re-parses it on every access,
+      preserving whitespace, key order and duplicate keys. jsonb stores a
+      decomposed binary representation parsed once on write, which discards
+      whitespace, reorders keys and keeps only the last duplicate. jsonb
+      supports equality, containment and GIN indexing; json supports none of
+      those. Use jsonb except when you must reproduce the input exactly, as in
+      an audit log of received payloads.
+
+  - question: What is the difference between -> and ->>?
+    answer: >-
+      `->` returns a jsonb value and `->>` returns text. For a string value the
+      jsonb form keeps its quotes, so comparing it to a plain SQL string literal
+      is always false — the most common JSONB bug. The convention is to use `->`
+      for intermediate navigation and `->>` for the final extraction, then cast
+      if a number or date is needed, since `->>` always returns text. Both
+      return NULL for a missing key rather than raising.
+
+  - question: How do you index a JSONB column?
+    answer: >-
+      A GIN index on the column supports the containment operator `@>` and the
+      key-existence operators, which is the right choice when queries ask about
+      arbitrary keys. The jsonb_path_ops operator class is smaller and faster
+      but supports only containment. For a specific field queried constantly,
+      a B-tree index on the extraction expression — `((attributes ->> 'cpu'))` —
+      serves equality, ranges and sorting. The two strategies answer different
+      questions and are not substitutes for each other.
+
+  - question: When should data go in JSONB rather than in columns?
+    answer: >-
+      When the attributes are genuinely variable across rows and are not the
+      basis of regular queries, joins or constraints — product specifications
+      that differ by category, third-party payloads, user preferences. Real
+      columns get types, NOT NULL and foreign-key constraints, good planner
+      statistics and cheap indexes, all of which JSONB lacks by default. A
+      practical test: if you are adding an expression index on a JSONB field,
+      it probably wants to be a column.
+
+exercises:
+  - prompt: >-
+      Return every product that has a warranty of at least 24 months, with the
+      warranty as an integer. Columns product_id, product_name,
+      warranty_months. Order by warranty_months descending then product_id.
+    difficulty: Easy
+    hint: >-
+      `->>` then cast to int. Products without the key give NULL, which the
+      comparison will drop.
+    solutionSql: |
+      select product_id,
+             product_name,
+             (attributes ->> 'warranty_months')::int as warranty_months
+      from products
+      where (attributes ->> 'warranty_months')::int >= 24
+      order by warranty_months desc, product_id
+
+  - prompt: >-
+      Using containment, find the products whose attributes say the
+      connectivity is bluetooth. Columns product_id, product_name, attributes.
+      Order by product_id.
+    difficulty: Easy
+    hint: '`@> ''{"connectivity": "bluetooth"}''` — the value is a JSON string here.'
+    solutionSql: |
+      select product_id, product_name, attributes
+      from products
+      where attributes @> '{"connectivity": "bluetooth"}'
+      order by product_id
+
+  - prompt: >-
+      Count how many products offer each colour, expanding the colours array.
+      Columns colour, products. Order by products descending then colour.
+    difficulty: Medium
+    hint: >-
+      jsonb_array_elements_text in a lateral join, then group by the expanded
+      value.
+    solutionSql: |
+      select colour,
+             count(*) as products
+      from products p
+      cross join lateral jsonb_array_elements_text(p.attributes -> 'colours') as colour
+      group by colour
+      order by products desc, colour
+
+checklist:
+  - "Use jsonb, not json, unless byte-exact preservation is required"
+  - "`->` returns jsonb with quotes; `->>` returns text — the classic bug"
+  - A missing key gives NULL rather than an error
+  - "`@>` is the containment operator and the GIN-indexable one"
+  - "An extracted-field comparison needs its own B-tree expression index"
+  - jsonb_array_elements expands arrays into rows and is implicitly lateral
+  - "jsonb_build_object and jsonb_agg build documents; give jsonb_agg an ORDER BY"
+  - A JSONB field you keep indexing should probably be a real column
+
+related:
+  - f-data-types
+  - pg-jsonb-indexing
+  - i-datetime-string
+  - p-indexes
+
+dialect:
+  standard: >-
+    SQL:2016 defines SQL/JSON with JSON_VALUE, JSON_QUERY, JSON_TABLE and the
+    IS JSON predicate. PostgreSQL implements an increasing amount of it —
+    JSON_TABLE arrived in version 17 — alongside its own older operators.
+  postgres: >-
+    The `->`, `->>`, `#>`, `@>` and `?` operators and the jsonb type with GIN
+    indexing are PostgreSQL's own design and predate the standard. jsonpath
+    expressions with `@@` and `jsonb_path_query` are also supported.
+  mysql: >-
+    Has a single JSON type that behaves like jsonb (binary, normalised) and
+    uses JSON_EXTRACT with the `->` and `->>` shorthands, where `->>` unquotes
+    exactly as in PostgreSQL. MySQL cannot index a JSON column directly;
+    indexing requires a generated column on the extracted value, which is the
+    equivalent of PostgreSQL's expression index and has no equivalent of GIN
+    containment search.

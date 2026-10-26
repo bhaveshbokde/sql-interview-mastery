@@ -1,0 +1,257 @@
+id: p03-duplicate-emails
+position: 30
+title: Find and resolve duplicate emails
+slug: duplicate-emails
+difficulty: Easy
+topic: Aggregation
+tags: [group-by, having, duplicates, data-quality, classic]
+
+source:
+  name: LeetCode 182 — Duplicate Emails
+  url: https://leetcode.com/problems/duplicate-emails/
+
+orderSensitive: false
+
+statement: |
+  The `contacts` table has no unique constraint on `email`, and duplicates
+  have accumulated.
+
+  Return every email that appears more than once, with how many rows it has,
+  the id of the row that should survive a deduplication — the **earliest** by
+  `created_at`, with the lowest `contact_id` as a tiebreak — and the names
+  recorded under it, oldest first.
+
+tables: [contacts]
+
+expectedColumns: [email, occurrences, keep_contact_id, names]
+
+edgeCases:
+  - >-
+    Two rows for the same email can have the same created_at, so the survivor
+    rule needs a deterministic tiebreak or the answer is not reproducible.
+  - >-
+    Emails differing only by case are distinct strings to PostgreSQL under the
+    usual collation. Decide whether they should be treated as duplicates and
+    say so.
+  - An email appearing exactly once must not be returned.
+  - >-
+    Leading or trailing whitespace makes two visually identical emails
+    different. A real deduplication normalises before comparing.
+
+hints:
+  - Duplicates are a group-level property, so the filter belongs in HAVING.
+  - >-
+    To pick a specific row from each group, an ordered array_agg and a
+    subscript works — or a window function and a filter.
+  - string_agg takes an ORDER BY inside its parentheses.
+
+solutionSql: |
+  select email,
+         count(*)                                                        as occurrences,
+         (array_agg(contact_id order by created_at, contact_id))[1]      as keep_contact_id,
+         string_agg(full_name, ' | ' order by created_at, contact_id)    as names
+  from contacts
+  group by email
+  having count(*) > 1
+  order by occurrences desc, email
+
+explanation:
+  lineByLine:
+    - clause: "group by email"
+      note: >-
+        Collapses the table to one row per distinct email, which is the grain
+        the question is asked at.
+    - clause: "having count(*) > 1"
+      note: >-
+        Filters groups rather than rows, so it must be HAVING. A WHERE clause
+        has no groups to count at the point it runs.
+    - clause: "(array_agg(contact_id order by created_at, contact_id))[1]"
+      note: >-
+        Collects the ids in survivor order and takes the first. The ORDER BY
+        inside the aggregate is what makes "first" mean anything; the
+        contact_id second key makes it deterministic when two rows share a
+        created_at.
+    - clause: "string_agg(full_name, ' | ' order by created_at, contact_id)"
+      note: >-
+        The names in the same order, so the survivor's name is first and the
+        reader can see what the duplicates claimed instead.
+    - clause: "order by occurrences desc, email"
+      note: >-
+        Worst offenders first. The email tiebreak keeps the output stable
+        between runs.
+
+  walkthrough: |
+    Grouping twelve contact rows by email produces nine groups. Three of them
+    have more than one row and survive the HAVING.
+
+    `ellen.marsh@northwind.example` has three rows — created in January, March
+    and July 2023, under the names "Ellen Marsh", "E. Marsh" and "Ellen M.".
+    The survivor is contact 9001, the January row.
+
+    `anita.rao@kestrel.example` and `tomas.l@blueharbour.example` have two
+    each. The remaining six emails appear once and are correctly absent.
+
+    Note what the `names` column shows: the duplicates are not identical rows.
+    They are the same person recorded three times with progressively less
+    complete names, which is what real duplicate data looks like and why
+    "delete the newer ones" is a decision rather than a cleanup.
+
+  alternatives:
+    - title: Window function instead of ordered aggregates
+      sql: |
+        with numbered as (
+            select contact_id,
+                   email,
+                   full_name,
+                   created_at,
+                   count(*)     over (partition by email) as occurrences,
+                   row_number() over (partition by email
+                                      order by created_at, contact_id) as rn
+            from contacts
+        )
+        select email,
+               max(occurrences)                                 as occurrences,
+               min(contact_id) filter (where rn = 1)            as keep_contact_id,
+               string_agg(full_name, ' | ' order by rn)         as names
+        from numbered
+        group by email
+        having max(occurrences) > 1
+        order by occurrences desc, email
+      when: >-
+        When the per-row ranking is needed anyway — for instance to produce the
+        list of ids to delete rather than the one to keep. Equivalent, and
+        longer for this particular question.
+      equivalent: true
+
+    - title: Self join to find any duplicate pair
+      sql: |
+        select distinct a.email
+        from contacts a
+        join contacts b
+          on b.email = a.email
+         and b.contact_id > a.contact_id
+        order by a.email
+      when: >-
+        Answers only "which emails are duplicated", not the counts or the
+        survivor. Shown because it is the shape interviewers sometimes ask for
+        explicitly, and because `b.contact_id > a.contact_id` is the standard
+        way to find a pair without matching a row to itself.
+      equivalent: false
+
+  performance: |
+    `contacts` is deliberately unindexed beyond its primary key, so this is a
+    sequential scan followed by a hash aggregate. On twelve rows that is
+    instantaneous; on twelve million it is one full scan, which is the
+    unavoidable cost of asking about every email.
+
+    An index on `email` would let the planner use a GroupAggregate over an
+    index scan instead, avoiding the hash build — but it still reads
+    everything, so the saving is modest. The index earns its place for
+    *lookups* by email, not for this query.
+
+    The ordered aggregates add a per-group sort. With few rows per group that
+    is negligible; with a pathological group of a million rows it is not, and
+    the window-function alternative has the same cost.
+
+    The real fix is upstream. `unique (email)` plus `INSERT ... ON CONFLICT`
+    means this query never has anything to find.
+
+  wrongApproaches:
+    - title: Filtering with WHERE instead of HAVING
+      sql: |
+        select email, count(*) as occurrences
+        from contacts
+        where contact_id > 0
+        group by email
+        order by occurrences desc, email
+      whyWrong: >-
+        `where count(*) > 1` is not valid SQL, because WHERE runs before
+        grouping and there is nothing to count. Writing a row-level condition
+        instead, as here, returns every email including the unique ones — the
+        query runs and answers a different question.
+
+    - title: Counting distinct emails and comparing to the row count
+      sql: |
+        select count(*)                        as rows,
+               count(distinct email)           as distinct_emails,
+               count(*) - count(distinct email) as surplus_rows
+        from contacts
+      whyWrong: >-
+        Tells you that four surplus rows exist but not which emails they
+        belong to, and the arithmetic is easy to misread — three duplicated
+        emails produce four surplus rows, not three. Useful as a summary,
+        wrong as an answer.
+
+  extraTests:
+    - name: Minimal duplicates (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt has three contacts, two of which share an email. The query
+        must return exactly one group with two occurrences and keep contact
+        9001.
+      sql: |
+        select email,
+               count(*)                                                     as occurrences,
+               (array_agg(contact_id order by created_at, contact_id))[1]   as keep_contact_id,
+               string_agg(full_name, ' | ' order by created_at, contact_id) as names
+        from contacts
+        group by email
+        having count(*) > 1
+        order by occurrences desc, email
+
+    - name: Case and whitespace sensitivity
+      schema: learning
+      note: >-
+        Normalising with lower() and trim() before grouping finds the same
+        three groups here, which confirms the data has no case or whitespace
+        variants. On real data the two counts differ, and the difference is the
+        set of duplicates a naive query misses.
+      sql: |
+        select count(*) as groups_raw
+        from (select email from contacts group by email having count(*) > 1) a
+        union all
+        select count(*)
+        from (select lower(trim(email)) from contacts
+              group by lower(trim(email)) having count(*) > 1) b
+
+  followUps:
+    - question: How would you actually delete the duplicates?
+      answer: >-
+        `DELETE FROM contacts a USING contacts b WHERE a.email = b.email AND
+        (b.created_at, b.contact_id) < (a.created_at, a.contact_id)` — delete
+        any row that has an earlier row with the same email. Run the equivalent
+        SELECT first and check the count, do it in a transaction, and add the
+        unique constraint in the same transaction so nothing can be inserted
+        between the cleanup and the constraint.
+
+    - question: How do you prevent this happening again?
+      answer: >-
+        A unique constraint on email, and `INSERT ... ON CONFLICT (email) DO
+        UPDATE` at every insertion point. The constraint is the guarantee; the
+        ON CONFLICT clause is what stops the guarantee turning into an error
+        the application has to handle. If emails should be case-insensitively
+        unique, the constraint goes on `lower(email)` as a unique expression
+        index, and every lookup must use the same expression.
+
+    - question: What if duplicates should be matched case-insensitively?
+      answer: >-
+        Group by `lower(trim(email))` instead, and make the same expression the
+        basis of the unique index so the rule is enforced rather than merely
+        applied in this one query. PostgreSQL also has the citext extension,
+        which gives a case-insensitive text type — tidier, at the cost of a
+        non-standard type that every client has to understand.
+
+    - question: Why is deciding which row to keep harder than it looks?
+      answer: >-
+        Because the rows differ in more than their ids. Here the three Ellen
+        Marsh rows carry three different name spellings, and the earliest is
+        not necessarily the most complete or the most correct. "Keep the
+        oldest" is a convention, not an answer; a real merge may need to take
+        the most complete value per column, which is a business decision and
+        belongs in a reviewed script rather than in a one-line DELETE.
+
+  related:
+    - a-group-by-having
+    - f-nulls
+    - s-keys-constraints
+    - pg-upsert-returning

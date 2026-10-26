@@ -1,0 +1,500 @@
+id: pg-jsonb-indexing
+moduleId: postgres-backend
+position: 20
+title: JSONB indexing, arrays and full-text search
+slug: jsonb-indexing-and-search
+difficulty: Advanced
+estimatedMinutes: 25
+summary: >-
+  The PostgreSQL-specific data features that come up once an interview moves
+  past standard SQL: GIN indexes over JSONB and arrays, jsonpath queries, and
+  tsvector full-text search — the same machinery this application uses for its
+  own content search.
+tags: [jsonb, gin, arrays, full-text-search, tsvector, jsonpath]
+
+prerequisites:
+  - i-json
+  - p-indexes
+
+objectives:
+  - Choose between a GIN index and an expression index for a JSONB query
+  - Explain what jsonb_path_ops trades away and why it is smaller
+  - Query and aggregate array columns, and index them
+  - Build a tsvector, query it with websearch_to_tsquery and rank the results
+  - Say when full-text search is the right tool and when trigrams are
+
+concept: |
+  ## Two ways to index JSONB
+
+  **GIN over the whole column** indexes every key and value:
+
+  ```sql
+  create index on products using gin (attributes);
+  ```
+
+  It supports `@>` (containment), `?`, `?|`, `?&` (key existence) and the
+  jsonpath operators `@?` and `@@`. It is the right choice when queries ask
+  about **arbitrary** keys, which is the usual reason for having a JSONB
+  column at all.
+
+  `jsonb_path_ops` is the restricted operator class:
+
+  ```sql
+  create index on products using gin (attributes jsonb_path_ops);
+  ```
+
+  It indexes only value paths rather than every key and value separately, so
+  it is **substantially smaller and faster** — and supports only `@>`. When
+  containment is all you use, it is a clear win, and it is routinely
+  overlooked.
+
+  **A B-tree expression index** on one extracted field:
+
+  ```sql
+  create index on products (((attributes ->> 'cpu')));
+  ```
+
+  Supports equality, ranges and ordering on that one field, which GIN cannot
+  do. The query must use the identical expression.
+
+  The two strategies answer different questions and are not substitutes. And
+  if you find yourself adding several expression indexes, that is the signal
+  those fields should be real columns.
+
+  ## jsonpath
+
+  PostgreSQL 12 added SQL/JSON path expressions:
+
+  ```sql
+  where attributes @? '$.ram_gb ? (@ > 16)'
+  where attributes @@ '$.cpu == "i9"'
+  select jsonb_path_query(attributes, '$.colours[*]')
+  ```
+
+  `@?` tests whether the path matches anything; `@@` evaluates a predicate to
+  a boolean. Both are GIN-indexable with the default operator class. jsonpath
+  is more expressive than the operators — it does comparisons, filters and
+  array traversal — and more verbose, so the operators remain the right
+  choice for simple containment.
+
+  ## Arrays
+
+  A native array column is the right model when the elements are genuinely a
+  property of the row, have no attributes of their own, and are not joined to
+  anything. Tags are the canonical case, and this application's own
+  `app.lesson.tags` column is one.
+
+  ```sql
+  where 'window-functions' = any (tags)   -- membership
+  where tags @> array['joins', 'null']    -- contains all
+  where tags && array['joins', 'null']    -- overlaps
+  ```
+
+  `@>` and `&&` are GIN-indexable; `= any(...)` is not, which is a useful
+  thing to know because `= any` is the more natural way to write it.
+
+  `unnest(arr)` expands an array into rows, and `array_agg` goes back. The
+  round trip through `unnest` and `array_agg` is how you sort, filter or
+  deduplicate array contents.
+
+  The limits are real: no foreign keys into array elements, no per-element
+  constraints, and no attributes on elements. The moment any of those is
+  needed, it wants to be a junction table.
+
+  ## Full-text search
+
+  Three pieces:
+
+  - **`tsvector`** — a document reduced to normalised lexemes with positions.
+    `to_tsvector('english', text)` stems words, strips stop words and
+    lowercases.
+  - **`tsquery`** — the search expression. `websearch_to_tsquery` accepts what
+    users actually type, including quoted phrases and `or`, and never throws a
+    syntax error on a stray apostrophe. `plainto_tsquery` ANDs everything;
+    `to_tsquery` takes operator syntax and is strict.
+  - **`@@`** — the match operator, backed by a GIN index on the tsvector.
+
+  `setweight` assigns A to D importance to parts of a document, and `ts_rank`
+  uses those weights to order results. A generated column keeps the vector in
+  step with the source automatically:
+
+  ```sql
+  search_vector tsvector generated always as (
+      setweight(to_tsvector('english', title), 'A') ||
+      setweight(to_tsvector('english', body),  'B')
+  ) stored
+  ```
+
+  That is exactly what `app.lesson` in this application does, which is why
+  searching the curriculum ranks a title match above a body match.
+
+  ### Full text or trigram?
+
+  Full-text search matches **words**, with stemming — "running" finds "run".
+  It cannot do substring or fuzzy matching.
+
+  Trigram search (`pg_trgm`) matches **character sequences**, so it handles
+  `LIKE '%abc%'`, misspellings and similarity ranking. It has no concept of a
+  word.
+
+  Autocomplete and typo tolerance want trigrams. Document search wants full
+  text. Several applications need both, on the same column, with two indexes.
+
+syntax:
+  - form: "CREATE INDEX ON t USING gin (jsonb_col)"
+    notes: "Supports @>, ?, ?|, ?& and the jsonpath operators."
+  - form: "CREATE INDEX ON t USING gin (jsonb_col jsonb_path_ops)"
+    notes: Smaller and faster, supports @> only.
+  - form: "CREATE INDEX ON t ((jsonb_col ->> 'key'))"
+    notes: >-
+      B-tree on one extracted field. Equality, ranges and ordering. The query
+      must use the identical expression.
+  - form: "jsonb_col @? '$.a ? (@ > 5)'   |   jsonb_col @@ '$.a == 5'"
+    notes: jsonpath existence and predicate. GIN-indexable with the default class.
+  - form: "arr @> array[...]   |   arr && array[...]   |   x = ANY(arr)"
+    notes: >-
+      Contains all, overlaps, membership. The first two are GIN-indexable; the
+      third is not.
+  - form: "to_tsvector('english', txt) @@ websearch_to_tsquery('english', q)"
+    notes: >-
+      The match. websearch_to_tsquery handles user input safely; index the
+      tsvector with GIN.
+  - form: "ts_rank(vector, query)   |   ts_headline(txt, query)"
+    notes: Relevance ordering and a highlighted snippet.
+
+sampleTables: [products, categories, customers]
+
+examples:
+  - title: Containment, which a GIN index serves
+    sql: |
+      select product_id,
+             product_name,
+             attributes ->> 'cpu'              as cpu,
+             attributes ->> 'ram_gb'           as ram_gb,
+             attributes ->> 'warranty_months'  as warranty
+      from products
+      where attributes @> '{"cpu": "i9"}'
+         or attributes @> '{"ram_gb": 32}'
+      order by product_id
+    walkthrough: |
+      Two containment tests, both of which a `gin (attributes)` index answers
+      directly without reading the table.
+
+      Note the types in the containment documents. `"i9"` is a JSON string and
+      `32` is a JSON number, and containment is type-aware — `'{"ram_gb":
+      "32"}'` with the number quoted would match nothing. That is a silent
+      failure mode, and the usual cause of "my containment query returns
+      nothing".
+
+      Writing the same conditions as `(attributes ->> 'cpu') = 'i9'` would
+      produce identical rows and could not use the GIN index. Prefer `@>`
+      whenever either form works.
+
+  - title: jsonpath for comparisons the operators cannot express
+    sql: |
+      select product_id,
+             product_name,
+             attributes ->> 'ram_gb'   as ram_gb,
+             attributes ->> 'cpu'      as cpu
+      from products
+      where jsonb_path_exists(attributes, '$.ram_gb ? (@ >= 16)')
+      order by (attributes ->> 'ram_gb')::int desc, product_id
+    walkthrough: |
+      `@>` can only test for an exact value. "RAM of at least 16" is a
+      comparison, and that is what jsonpath is for.
+
+      `$.ram_gb ? (@ >= 16)` reads as: at the path `ram_gb`, filter to values
+      where the value itself is at least 16. `@` inside the filter refers to
+      the value at the current path, which is the piece of the syntax that
+      needs explaining once.
+
+      `jsonb_path_exists(col, path)` is the function spelling of the `@?`
+      operator, and they are interchangeable — the function form is used here
+      because this playground's SQL parser does not recognise the `@?`
+      operator. Both are GIN-indexable with the default operator class,
+      though not with `jsonb_path_ops`, which supports only `@>`. That is the
+      trade the restricted class makes, and it is worth checking which
+      operators your queries actually use before choosing it.
+
+      The `ORDER BY` still needs an explicit cast, because `->>` returns text
+      and text sorts lexicographically — "8" after "32".
+
+  - title: Expanding and re-aggregating a JSON array
+    sql: |
+      select p.product_id,
+             p.product_name,
+             jsonb_array_length(p.attributes -> 'colours')                  as colour_count,
+             (select string_agg(c, ', ' order by c)
+              from jsonb_array_elements_text(p.attributes -> 'colours') c)  as colours
+      from products p
+      where p.attributes ? 'colours'
+      order by colour_count desc, p.product_id
+    walkthrough: |
+      `? 'colours'` filters to products that have the key at all — a
+      GIN-indexable key-existence test, and necessary here because
+      `jsonb_array_length(NULL)` would error on the products without it.
+
+      The correlated subquery unnests the array, sorts it and joins it back
+      into a string. The `order by c` inside `string_agg` matters for the same
+      reason it always does: without it the order is whatever the executor
+      produced.
+
+      This is also the moment to ask whether colours should be a JSONB array
+      at all. They have no attributes, are never joined, and are only ever
+      read as a set — so yes. If a colour needed a hex code or a stock level,
+      the answer would change to a table.
+
+  - title: Full-text search, the way this application does it
+    sql: |
+      select c.customer_id,
+             c.company_name,
+             c.country,
+             ts_rank(
+                 setweight(to_tsvector('english', c.company_name), 'A')
+                 || setweight(to_tsvector('english', coalesce(c.contact_name, '')), 'B')
+                 || setweight(to_tsvector('english', c.country || ' ' || coalesce(c.city, '')), 'C'),
+                 websearch_to_tsquery('english', 'retail or trading')
+             ) as rank
+      from customers c
+      where (setweight(to_tsvector('english', c.company_name), 'A')
+             || setweight(to_tsvector('english', coalesce(c.contact_name, '')), 'B')
+             || setweight(to_tsvector('english', c.country || ' ' || coalesce(c.city, '')), 'C'))
+            @@ websearch_to_tsquery('english', 'retail or trading')
+      order by rank desc, c.customer_id
+    walkthrough: |
+      The vector is built from three fields with descending weights, so a
+      match in the company name outranks one in the city. `ts_rank` turns
+      those weights into a number to sort by.
+
+      `websearch_to_tsquery` is the right entry point for user input: it
+      understands `or`, quoted phrases and a leading `-` for exclusion, and it
+      never raises a syntax error on whatever someone types. `to_tsquery`
+      would reject `retail or trading` outright.
+
+      Computing the vector in both the `WHERE` and the `ORDER BY` is the
+      expensive part, and it is why real systems store it. `app.lesson` in
+      this application has a `search_vector` column declared
+      `generated always as (...) stored` with a GIN index on it, so the vector
+      is computed once on write and the search is an index lookup. That is the
+      shape to copy.
+
+      `coalesce(..., '')` around the nullable fields is essential:
+      `to_tsvector('english', NULL)` is NULL, and concatenating NULL into the
+      vector would blank the whole thing.
+
+edgeCases:
+  - title: Containment is type-aware
+    body: >-
+      The number 24 and the string "24" are different JSON values, so only one
+      of these containment tests matches. There is no coercion and no warning —
+      the query simply returns nothing, which is indistinguishable from "no
+      such product". Checking the actual type with jsonb_typeof is the quickest
+      way to settle it.
+    sql: |
+      select count(*) filter (where attributes @> '{"warranty_months": 24}')   as as_number,
+             count(*) filter (where attributes @> '{"warranty_months": "24"}') as as_string,
+             count(*) filter (where jsonb_typeof(attributes -> 'warranty_months') = 'number') as stored_as_number,
+             count(*) filter (where jsonb_typeof(attributes -> 'warranty_months') = 'string') as stored_as_string
+      from products
+
+  - title: Stemming is why full text is not LIKE
+    body: >-
+      to_tsvector reduces words to their stems and drops stop words, so
+      "running" and "runs" become the same lexeme and "the" disappears
+      entirely. That is what makes a search for one form find the others — and
+      also why full-text search cannot do substring matching, since "unn" is
+      not a word. Trigram search is the tool for that.
+    sql: |
+      select to_tsvector('english', 'The running laptops were run and are runnable')::text as stemmed,
+             to_tsvector('english', 'Resonance Bookshelf Speakers')::text                  as product_vector,
+             websearch_to_tsquery('english', 'speaker')::text                              as query,
+             to_tsvector('english', 'Resonance Bookshelf Speakers')
+               @@ websearch_to_tsquery('english', 'speaker')                               as matches
+
+pitfalls:
+  - mistake: Expecting a GIN index to serve an extracted-field comparison
+    why: >-
+      `gin (attributes)` indexes the document's keys and values for
+      containment. `(attributes ->> 'cpu') = 'i9'` is an expression over the
+      column, which is a different thing, and the planner falls back to a scan.
+    fix: >-
+      Use `@>` where the semantics allow, or create a B-tree expression index
+      on exactly the extraction used.
+
+  - mistake: Quoting a number in a containment document
+    why: >-
+      Containment is type-aware, so `'{"n": "5"}'` never matches a stored
+      number 5. The query returns no rows and looks like a data problem.
+    fix: >-
+      Match the stored type. `jsonb_typeof(col -> 'key')` tells you what it is.
+
+  - mistake: Using to_tsquery on user input
+    why: >-
+      It expects operator syntax and raises a syntax error on ordinary text —
+      an apostrophe or a bare `or` is enough. The error surfaces as a 500.
+    fix: >-
+      `websearch_to_tsquery` for anything a user typed. `plainto_tsquery` when
+      you want everything ANDed with no operator interpretation.
+
+  - mistake: Computing a tsvector at query time on every row
+    why: >-
+      No index can help, so every search is a sequential scan that builds a
+      vector per row. It is fast on a thousand rows and unusable on a million.
+    fix: >-
+      Store the vector in a generated column with a GIN index. The vector is
+      then computed once per write and the search is an index lookup.
+
+performance: |
+  **GIN** indexes are fast to search and slow to update, because one row
+  produces many index entries. The `fastupdate` mechanism buffers insertions
+  in a pending list and flushes them in batches, which makes writes
+  acceptable at the cost of occasional slow statements when the list is
+  flushed and slightly slower reads while it is non-empty.
+
+  `jsonb_path_ops` typically produces an index a third the size of the
+  default class with correspondingly faster searches, because it hashes whole
+  paths rather than indexing every key and value separately. It supports only
+  `@>`. If your queries use key-existence or jsonpath operators, you need the
+  default class.
+
+  **TOAST** matters for both JSONB and text. Values over roughly 2 kB are
+  stored out of line and compressed, so reading one key from a large document
+  means fetching and decompressing the whole thing. A wide JSONB column on a
+  frequently scanned table is a real cost, and promoting hot fields to real
+  columns is the fix.
+
+  **Statistics for JSONB are weak.** The planner has no histogram for a
+  document's contents, so selectivity estimates for containment predicates are
+  crude, and a query combining a JSONB filter with a join can get a poor join
+  order for that reason alone. An expression index on an extracted field gives
+  the planner real statistics for that field, which is an under-appreciated
+  second benefit of creating one.
+
+interviewQuestions:
+  - question: How do you index a JSONB column, and what are the options?
+    answer: >-
+      A GIN index on the whole column supports containment with `@>`, the
+      key-existence operators and jsonpath, which is right when queries ask
+      about arbitrary keys. The jsonb_path_ops operator class is roughly a
+      third the size and faster but supports only `@>`. For one specific field
+      queried constantly, a B-tree index on the extraction expression supports
+      equality, ranges and ordering, which GIN cannot — and it also gives the
+      planner real statistics for that field. The strategies are complementary;
+      needing several expression indexes is a sign the fields should be
+      columns.
+
+  - question: When would you use an array column instead of a junction table?
+    answer: >-
+      When the elements are a simple property of the row, have no attributes
+      of their own, and are never joined to anything — tags being the
+      canonical case. Arrays support containment and overlap operators that
+      GIN can index, so membership queries are fast. The limits are that you
+      cannot have a foreign key into an array element, cannot constrain
+      elements individually, and cannot attach data to an element. As soon as
+      any of those is needed, it is a junction table.
+
+  - question: Explain how full-text search works in PostgreSQL.
+    answer: >-
+      Text is converted to a tsvector — normalised, stemmed lexemes with
+      positions and optional weights — and queries to a tsquery, matched with
+      the `@@` operator and backed by a GIN index. Weights set with setweight
+      let ts_rank order results so a title match beats a body match. For user
+      input, websearch_to_tsquery is the right parser because it handles
+      phrases and operators without ever raising a syntax error. The vector
+      should be a stored generated column, so it is computed on write rather
+      than on every search.
+
+  - question: Full-text search or trigram search?
+    answer: >-
+      Full-text search matches words with stemming, so "running" finds "run",
+      and it handles ranking and phrases. It cannot do substring or fuzzy
+      matching, because it operates on lexemes. Trigram search via pg_trgm
+      matches character sequences, so it supports LIKE with leading wildcards,
+      similarity scoring and typo tolerance, with no concept of a word.
+      Document search wants full text; autocomplete and misspelling tolerance
+      want trigrams. Plenty of applications index the same column both ways.
+
+exercises:
+  - prompt: >-
+      Using containment, find products with a 24-month warranty. Columns
+      product_id, product_name, warranty. Order by product_id.
+    difficulty: Easy
+    hint: "The stored value is a number, so the containment document must use 24, not \"24\"."
+    solutionSql: |
+      select product_id,
+             product_name,
+             attributes ->> 'warranty_months' as warranty
+      from products
+      where attributes @> '{"warranty_months": 24}'
+      order by product_id
+
+  - prompt: >-
+      Using jsonpath, find products whose unit_price exceeds 50000 and whose
+      attributes record a cpu. Columns product_id, product_name, unit_price,
+      cpu. Order by unit_price descending.
+    difficulty: Medium
+    hint: >-
+      `jsonb_path_exists(attributes, '$.cpu')` tests that the path exists; the
+      price filter is ordinary SQL.
+    solutionSql: |
+      select product_id,
+             product_name,
+             unit_price,
+             attributes ->> 'cpu' as cpu
+      from products
+      where jsonb_path_exists(attributes, '$.cpu')
+        and unit_price > 50000
+      order by unit_price desc, product_id
+
+  - prompt: >-
+      Search customers for the words "systems" or "analytics" using
+      websearch_to_tsquery over the company name, ranked. Columns
+      customer_id, company_name, rank. Order by rank descending.
+    difficulty: Medium
+    hint: >-
+      Build the vector from company_name alone and use the same expression in
+      WHERE and in ts_rank.
+    solutionSql: |
+      select customer_id,
+             company_name,
+             round(ts_rank(to_tsvector('english', company_name),
+                           websearch_to_tsquery('english', 'systems or analytics'))::numeric, 4) as rank
+      from customers
+      where to_tsvector('english', company_name)
+            @@ websearch_to_tsquery('english', 'systems or analytics')
+      order by rank desc, customer_id
+
+checklist:
+  - "GIN over the whole JSONB column serves @>, ?, ?| , ?& and jsonpath"
+  - "jsonb_path_ops is much smaller and supports only @>"
+  - A B-tree expression index serves ranges and ordering on one extracted field
+  - Containment is type-aware — a quoted number matches nothing
+  - "Arrays suit attribute-free elements; anything more wants a junction table"
+  - "`@>` and `&&` on arrays are GIN-indexable; `= any()` is not"
+  - "Store the tsvector in a generated column with a GIN index, never compute it per query"
+  - "websearch_to_tsquery for user input; full text matches words, trigrams match characters"
+
+related:
+  - i-json
+  - p-indexes
+  - pg-advanced-features
+  - i-datetime-string
+
+dialect:
+  standard: >-
+    SQL:2016 defines SQL/JSON including jsonpath, JSON_VALUE and JSON_QUERY,
+    and SQL:2023 adds JSON_TABLE. Arrays are standard SQL. Full-text search is
+    not in the standard at all.
+  postgres: >-
+    jsonb with GIN indexing and two operator classes, native arrays with
+    containment operators, tsvector/tsquery full-text search with weighting and
+    ranking, and pg_trgm for trigram similarity. All of it is built in rather
+    than requiring an external search service, which is a large part of why
+    PostgreSQL displaces one in small and medium systems.
+  mysql: >-
+    Has a JSON type but cannot index it directly — indexing requires a
+    generated column on the extracted value, equivalent to PostgreSQL's
+    expression index, with no equivalent of GIN containment search. No array
+    type; the usual substitute is a JSON array or a junction table. MySQL has
+    FULLTEXT indexes on InnoDB with boolean and natural-language modes, which
+    is less flexible than tsvector but covers the common cases.

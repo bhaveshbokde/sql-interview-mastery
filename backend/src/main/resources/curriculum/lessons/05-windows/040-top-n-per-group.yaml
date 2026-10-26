@@ -1,0 +1,509 @@
+id: w-top-n-per-group
+moduleId: windows
+position: 40
+title: Top N per group and gaps and islands
+slug: top-n-per-group
+difficulty: Advanced
+estimatedMinutes: 30
+summary: >-
+  Two patterns that together cover a large share of hard SQL interview
+  questions: the top N rows within each group, and finding runs of consecutive
+  values. Both have a standard shape worth knowing by heart.
+tags: [top-n, gaps-and-islands, latest-per-group, interview-favourite]
+
+prerequisites:
+  - w-frames
+
+objectives:
+  - Write top-N-per-group with ROW_NUMBER and choose the right ranking function
+  - Compare the window, LATERAL and DISTINCT ON solutions and say when each wins
+  - Find the latest record per entity, a special case of top-1
+  - Recognise a gaps-and-islands problem from its description
+  - Apply the row_number difference trick to find consecutive runs
+
+concept: |
+  ## Top N per group: the standard shape
+
+  ```sql
+  with ranked as (
+      select *,
+             row_number() over (partition by group_key
+                                order by sort_key desc, tiebreak) as rn
+      from t
+  )
+  select * from ranked where rn <= 3;
+  ```
+
+  Two steps, always. The window function cannot be filtered in `WHERE`, so the
+  ranking goes in a CTE and the filter goes outside.
+
+  **Choosing the function** is where the requirement does the work:
+
+  - `ROW_NUMBER() <= 3` — exactly three rows per group, ties broken
+    arbitrarily (so add a tiebreak to the ORDER BY).
+  - `RANK() <= 3` — the top three positions, so four rows if two tie for
+    third.
+  - `DENSE_RANK() <= 3` — everyone with one of the top three **distinct**
+    values, which can be many rows.
+
+  "Top 3 employees by salary in each department" is ambiguous in English and
+  precise in SQL, and the interview is usually testing whether you notice.
+
+  ## The three implementations
+
+  **Window function.** Computes a rank for every row and discards most.
+  Portable, reads well, one scan of the table.
+
+  **LATERAL with LIMIT.** For each group, fetch n rows and stop. With an index
+  on `(group_key, sort_key DESC)` this touches only n rows per group. Needs a
+  table of groups to drive it.
+
+  **`DISTINCT ON`.** PostgreSQL only, and only for n = 1. The shortest
+  spelling of "the latest row per entity".
+
+  Which wins depends on the shape: many groups with a small n favours
+  `LATERAL`, because it never looks at the rows it does not need; few groups
+  with a large table favours the window function, because the per-group
+  overhead of `LATERAL` adds up. For n = 1 on PostgreSQL, `DISTINCT ON` is the
+  one to write unless the index makes `LATERAL` dramatically better.
+
+  ## Latest record per entity
+
+  A top-1 problem, and it appears constantly: current account status from a
+  history table, most recent order per customer, last known price.
+
+  The wrong answer that everyone writes first is:
+
+  ```sql
+  select customer_id, max(effective_from), status   -- NOT this
+  from account_status_history group by customer_id
+  ```
+
+  which is not valid SQL (status is not grouped) and, in databases that permit
+  it, returns the max date next to an **arbitrary** status. The aggregate picks
+  the maximum of one column and tells you nothing about which row it came from.
+
+  ## Gaps and islands
+
+  The family of problems about **runs of consecutive values**: consecutive
+  login days, uninterrupted periods of a status, ranges of unused ids.
+
+  The standard trick: for a sequence that increments by one, subtract a row
+  number from the value. Within a run the difference is **constant**; at a gap
+  it changes. Group by that difference and each group is one island.
+
+  ```sql
+  select customer_id,
+         activity_date - (row_number() over (partition by customer_id
+                                             order by activity_date))::int as grp
+  from distinct_activity
+  ```
+
+  `date - integer` gives a date, which works as a grouping key. For integers
+  the same subtraction gives an integer.
+
+  Two prerequisites that are easy to miss: the values must be **distinct**
+  within the partition (deduplicate first, or the row numbers outrun the
+  values), and the sequence must increment by a constant step.
+
+  Once grouped, `min` and `max` of each island give its start and end, and
+  `count(*)` its length.
+
+syntax:
+  - form: "WITH r AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY g ORDER BY s DESC, pk) rn FROM t) SELECT * FROM r WHERE rn <= n"
+    notes: The portable top-N-per-group. Always two steps.
+  - form: "SELECT DISTINCT ON (g) * FROM t ORDER BY g, s DESC, pk"
+    notes: >-
+      PostgreSQL's top-1 per group. The ORDER BY must start with the DISTINCT
+      ON expressions.
+  - form: "FROM groups g CROSS JOIN LATERAL (SELECT ... WHERE x.g = g.id ORDER BY s DESC LIMIT n) t"
+    notes: >-
+      Fetches only n rows per group. Best with an index on (group_key,
+      sort_key DESC) and many groups.
+  - form: "value - ROW_NUMBER() OVER (PARTITION BY k ORDER BY value)"
+    notes: >-
+      The gaps-and-islands key. Constant within a run of consecutive values.
+      Requires distinct values and a constant step.
+
+sampleTables: [employees, departments, orders, customers, user_activity, account_status_history]
+
+examples:
+  - title: Top 3 per group, three ranking functions compared
+    sql: |
+      with ranked as (
+          select e.dept_id,
+                 e.first_name || ' ' || e.last_name as employee,
+                 e.salary,
+                 row_number() over w as rn,
+                 rank()       over w as rnk,
+                 dense_rank() over w as dr
+          from employees e
+          where e.dept_id is not null
+          window w as (partition by e.dept_id order by e.salary desc, e.emp_id)
+      )
+      select dept_id, employee, salary, rn, rnk, dr
+      from ranked
+      where dr <= 3
+      order by dept_id, salary desc, employee
+    walkthrough: |
+      The filter is on `dr` — `dense_rank` — so this returns everyone earning
+      one of the top three distinct salaries in their department. Department 30
+      has two people on 97000, and both appear.
+
+      Change the filter to `rn <= 3` and department 30 loses one of them, at
+      an arbitrary choice broken only by the `emp_id` tiebreak. Change it to
+      `rnk <= 3` and both appear, because they share rank 3 — the same answer
+      as `dense_rank` here, and a different one when the tie is higher up.
+
+      All three columns are computed from one shared window, so there is one
+      sort. Keeping them visible side by side is how you check you picked the
+      right filter.
+
+  - title: The same answer with LATERAL
+    sql: |
+      select d.dept_id,
+             d.dept_name,
+             top.employee,
+             top.salary,
+             top.rn
+      from departments d
+      cross join lateral (
+            select e.first_name || ' ' || e.last_name as employee,
+                   e.salary,
+                   row_number() over (order by e.salary desc, e.emp_id) as rn
+            from employees e
+            where e.dept_id = d.dept_id
+            order by e.salary desc, e.emp_id
+            limit 3) top
+      order by d.dept_id, top.rn
+    walkthrough: |
+      For each department, the inner query runs with `d.dept_id` bound, sorts
+      that department's employees and stops after three.
+
+      The difference from the window version is what gets touched. With an
+      index on `(dept_id, salary desc)` this reads three index entries per
+      department — fifteen rows total — while the window version sorts all 38.
+      On a table of ten million rows and a thousand departments, that gap is
+      the whole query.
+
+      The cost is that `LATERAL` needs a driving table of groups, and the
+      departments table conveniently is one. Where no such table exists, a
+      `select distinct group_key` subquery supplies it, and then the advantage
+      is much smaller because that distinct scan is itself a full pass.
+
+      `CROSS JOIN LATERAL` drops Research, which has no employees. `LEFT JOIN
+      LATERAL ... ON true` would keep it.
+
+  - title: The latest record per entity
+    sql: |
+      select distinct on (h.customer_id)
+             h.customer_id,
+             c.company_name,
+             h.status           as current_status,
+             h.effective_from   as since
+      from account_status_history h
+      join customers c on c.customer_id = h.customer_id
+      order by h.customer_id, h.effective_from desc, h.history_id desc
+    walkthrough: |
+      `DISTINCT ON (customer_id)` keeps the first row per customer, and the
+      `ORDER BY` defines "first" as the most recent `effective_from`, with
+      `history_id` as a tiebreak for two changes recorded at the same instant.
+
+      This is the shortest correct answer to "what is each customer's current
+      status" in PostgreSQL. The portable form is `ROW_NUMBER() ... = 1` in a
+      CTE; both are correct and the window version is the one to write if the
+      query may ever move to another database.
+
+      Customer 305 is `churned` and 310 is `suspended` — states that only the
+      latest row reveals, since both have earlier `active` rows. An aggregate
+      like `max(status)` would return the alphabetically largest status, which
+      is meaningless, and `max(effective_from)` with `status` in the select
+      list is not even valid SQL.
+
+  - title: Gaps and islands — consecutive activity days
+    sql: |
+      with distinct_days as (
+          select distinct customer_id, activity_date
+          from user_activity
+      ),
+      grouped as (
+          select customer_id,
+                 activity_date,
+                 activity_date - (row_number() over (partition by customer_id
+                                                     order by activity_date))::int as island_key
+          from distinct_days
+      )
+      select customer_id,
+             min(activity_date) as run_start,
+             max(activity_date) as run_end,
+             count(*)           as consecutive_days
+      from grouped
+      group by customer_id, island_key
+      having count(*) >= 3
+      order by consecutive_days desc, customer_id, run_start
+    walkthrough: |
+      Three steps. Deduplicate, because a customer can have several activities
+      on one day and the trick requires distinct dates. Compute the island key.
+      Group by it.
+
+      The key works because within a run of consecutive dates the date and the
+      row number increase together, so their difference is constant. The moment
+      a day is skipped, the date jumps ahead of the row number and the
+      difference changes, starting a new group.
+
+      `having count(*) >= 3` then answers "who was active at least three days
+      in a row", which is the shape of a very common interview question.
+
+      The `::int` cast is needed because `row_number()` returns `bigint` and
+      `date - bigint` has no operator; `date - integer` does.
+
+edgeCases:
+  - title: Forgetting to deduplicate breaks the island key
+    body: >-
+      Without the DISTINCT step the row numbers advance faster than the dates
+      on any day with several activities, so the difference changes within what
+      should be one run and the islands fragment. Customer 301 has single
+      activities per day in this data, so compare the two columns for a
+      customer that does not — the duplicate-sensitive key is the one that
+      drifts.
+    sql: |
+      select customer_id,
+             activity_date,
+             activity_type,
+             activity_date - (row_number() over (partition by customer_id
+                                                 order by activity_date))::int as key_with_duplicates,
+             count(*) over (partition by customer_id, activity_date) as rows_that_day
+      from user_activity
+      where customer_id in (301, 302)
+      order by customer_id, activity_date, activity_id
+
+  - title: Top-1 with max() does not tell you which row
+    body: >-
+      The first two columns are a correct maximum and a correct count. The
+      third is what people try to write next and cannot: there is no single
+      status per customer, so the aggregate has nothing to return. The query
+      shown works only because it uses an explicit correlated subquery to fetch
+      the row the maximum came from — which is exactly the work DISTINCT ON and
+      ROW_NUMBER do more directly.
+    sql: |
+      select h.customer_id,
+             max(h.effective_from) as latest_change,
+             count(*)              as changes,
+             (select h2.status
+              from account_status_history h2
+              where h2.customer_id = h.customer_id
+              order by h2.effective_from desc, h2.history_id desc
+              limit 1)             as current_status
+      from account_status_history h
+      group by h.customer_id
+      order by h.customer_id
+
+pitfalls:
+  - mistake: Filtering a window function in WHERE
+    why: >-
+      `where row_number() over (...) <= 3` is a syntax error. Window functions
+      are evaluated after WHERE.
+    fix: >-
+      The two-step CTE shape. There is no one-step version and there does not
+      need to be — the CTE is inlined and costs nothing.
+
+  - mistake: Using ROW_NUMBER when the requirement implies ties should be kept
+    why: >-
+      "Top 3 by salary" usually means "the three highest salaries", and when
+      two people share third place both belong in the answer. ROW_NUMBER
+      arbitrarily drops one.
+    fix: >-
+      RANK for "top N positions including ties", DENSE_RANK for "top N distinct
+      values". Ask the question explicitly in an interview; it shows you noticed.
+
+  - mistake: Answering latest-per-entity with max() and other columns
+    why: >-
+      The aggregate maximises one column and says nothing about the rest of
+      that row. PostgreSQL rejects the query; MySQL without ONLY_FULL_GROUP_BY
+      accepts it and returns a value from an arbitrary row, which is worse.
+    fix: >-
+      DISTINCT ON, or ROW_NUMBER = 1, or a LATERAL with LIMIT 1. All three
+      identify a row rather than a value.
+
+  - mistake: Applying the gaps-and-islands trick to non-distinct or non-unit-step data
+    why: >-
+      The trick depends on the value and the row number advancing in lockstep.
+      Duplicates make the row number advance faster; a step other than 1 makes
+      the value advance faster. Either way the key drifts within a run.
+    fix: >-
+      Deduplicate first. For a non-unit step, divide the value by the step
+      before subtracting, or rank the distinct values and difference against
+      that.
+
+performance: |
+  The window-function solution sorts the whole table once per distinct window
+  specification and then discards most rows. Cost is roughly one sort of
+  everything, which an index on `(partition_key, sort_key DESC)` can remove.
+
+  The `LATERAL` solution costs one index seek plus n index entries per group.
+  With `g` groups and a small `n`, that is `g × n` rows touched instead of the
+  whole table — frequently orders of magnitude less. It loses when `g` is large
+  relative to the table, because the per-group setup dominates, and when no
+  index supports the inner `ORDER BY`, because then each iteration is a sort.
+
+  `DISTINCT ON` is implemented as a sort followed by a scan keeping the first
+  row of each group, so it performs like the window version and is usually
+  marginally cheaper.
+
+  The honest answer to "which is fastest" is that it depends on the number of
+  groups, the value of n, and whether the index exists — and that the way to
+  find out is `EXPLAIN (ANALYZE, BUFFERS)` on all three, which takes two
+  minutes.
+
+  Gaps and islands is dominated by the sort for the row numbering. The
+  deduplication step adds another aggregation; combining it into the same query
+  with `DISTINCT` rather than a separate CTE pass does not usually change the
+  plan.
+
+interviewQuestions:
+  - question: How do you get the top 3 rows per group?
+    answer: >-
+      Rank within each group with a window function in a CTE or subquery, then
+      filter on the rank in the outer query — window functions cannot appear in
+      WHERE. Which ranking function depends on ties: ROW_NUMBER gives exactly
+      three rows and breaks ties arbitrarily, RANK gives the top three
+      positions so can return more, and DENSE_RANK gives everyone with a top
+      three distinct value. On PostgreSQL with many groups and a supporting
+      index, a LATERAL join with LIMIT 3 per group can be far faster because it
+      never reads the rows it does not need.
+
+  - question: How do you find the most recent record for each entity?
+    answer: >-
+      It is top-1 per group. DISTINCT ON (entity_id) with ORDER BY entity_id,
+      timestamp DESC is the PostgreSQL spelling; ROW_NUMBER() = 1 in a CTE is
+      the portable one; LATERAL with LIMIT 1 is the fastest when an index on
+      (entity_id, timestamp DESC) exists. What does not work is grouping and
+      taking max(timestamp) alongside other columns — the aggregate maximises
+      one column and tells you nothing about which row it came from. A
+      deterministic tiebreak matters, since two rows can share a timestamp.
+
+  - question: Explain the gaps-and-islands problem and the standard solution.
+    answer: >-
+      Finding runs of consecutive values — consecutive login days, unbroken
+      periods of a status. The standard solution subtracts a row number,
+      ordered by the value, from the value itself: within a consecutive run the
+      two increase together so the difference is constant, and at a gap it
+      changes. Grouping by that difference makes each group one island, and
+      min, max and count over the group give its start, end and length. Two
+      prerequisites: the values must be distinct within the partition, so
+      deduplicate first, and the step must be constant.
+
+  - question: When is LATERAL faster than a window function for top-N-per-group?
+    answer: >-
+      When there are many groups, N is small, and an index exists on (group
+      key, sort key descending). LATERAL then seeks to each group and reads N
+      index entries, touching roughly groups × N rows, while the window
+      function sorts the entire table to compute a rank it mostly discards. It
+      loses when there is no supporting index — each iteration becomes a sort —
+      or when the number of groups approaches the number of rows, where the
+      per-iteration overhead dominates. Both plans are worth measuring rather
+      than assumed.
+
+exercises:
+  - prompt: >-
+      Return the two most expensive products in each category. Columns
+      category_id, product_name, unit_price. Use ROW_NUMBER with a
+      deterministic tiebreak. Order by category_id then unit_price descending.
+    difficulty: Medium
+    hint: Rank in a CTE, filter rn <= 2 outside.
+    solutionSql: |
+      with ranked as (
+          select category_id,
+                 product_name,
+                 unit_price,
+                 row_number() over (partition by category_id
+                                    order by unit_price desc, product_id) as rn
+          from products
+          where category_id is not null
+      )
+      select category_id, product_name, unit_price
+      from ranked
+      where rn <= 2
+      order by category_id, unit_price desc, product_name
+
+  - prompt: >-
+      For each customer who has ordered, return their most recent order.
+      Columns customer_id, order_id, order_date, status. Order by customer_id.
+    difficulty: Medium
+    hint: DISTINCT ON, with order_id as the tiebreak for same-day orders.
+    solutionSql: |
+      select distinct on (customer_id)
+             customer_id, order_id, order_date, status
+      from orders
+      order by customer_id, order_date desc, order_id desc
+
+  - prompt: >-
+      Find each customer's longest run of consecutive active days in
+      user_activity. Columns customer_id, run_start, run_end, days. Return one
+      row per customer — their longest run — ordered by days descending then
+      customer_id.
+    difficulty: Hard
+    hint: >-
+      Deduplicate, compute the island key, group to get runs, then rank the
+      runs per customer and keep the first.
+    solutionSql: |
+      with distinct_days as (
+          select distinct customer_id, activity_date from user_activity
+      ),
+      grouped as (
+          select customer_id,
+                 activity_date,
+                 activity_date - (row_number() over (partition by customer_id
+                                                     order by activity_date))::int as island_key
+          from distinct_days
+      ),
+      runs as (
+          select customer_id,
+                 min(activity_date) as run_start,
+                 max(activity_date) as run_end,
+                 count(*)           as days
+          from grouped
+          group by customer_id, island_key
+      ),
+      ranked as (
+          select runs.*,
+                 row_number() over (partition by customer_id
+                                    order by days desc, run_start) as rn
+          from runs
+      )
+      select customer_id, run_start, run_end, days
+      from ranked
+      where rn = 1
+      order by days desc, customer_id
+
+checklist:
+  - "Top-N-per-group is always two steps: rank in a CTE, filter outside"
+  - "ROW_NUMBER for exactly N, RANK for N positions, DENSE_RANK for N distinct values"
+  - Always give ROW_NUMBER a unique tiebreak
+  - "Latest-per-entity is top-1: DISTINCT ON, ROW_NUMBER = 1, or LATERAL LIMIT 1"
+  - "max(date) with other columns identifies a value, not a row"
+  - LATERAL with LIMIT wins when there are many groups and a supporting index
+  - "Gaps and islands: subtract a row number from the value and group by the difference"
+  - The island trick needs distinct values and a constant step
+
+related:
+  - w-ranking
+  - w-frames
+  - j-self-cross
+  - p07-consecutive-login-days
+
+dialect:
+  standard: >-
+    The window-function solution to top-N-per-group is standard SQL and works
+    everywhere window functions do. The gaps-and-islands row-number trick is
+    likewise standard.
+  postgres: >-
+    Adds DISTINCT ON for the top-1 case and LATERAL for the per-group LIMIT
+    form. Date minus integer yields a date, which makes the island key
+    directly usable as a grouping column.
+  mysql: >-
+    Window functions from 8.0 make the standard solution available; LATERAL
+    from 8.0.14. No DISTINCT ON. Older MySQL code solves latest-per-entity with
+    a self-join against a grouped subquery, which is portable and more verbose.
+    Date arithmetic differs — DATEDIFF rather than subtraction — so the island
+    key is usually written as `DATE_SUB(d, INTERVAL rn DAY)`.

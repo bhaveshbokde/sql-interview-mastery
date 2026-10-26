@@ -1,0 +1,291 @@
+id: p02-nth-highest-salary
+position: 20
+title: Nth highest salary in each department
+slug: nth-highest-salary-per-department
+difficulty: Medium
+topic: Window functions
+tags: [ranking, top-n-per-group, partition-by, dense-rank]
+
+source:
+  name: LeetCode 185 — Department Top Three Salaries
+  url: https://leetcode.com/problems/department-top-three-salaries/
+
+orderSensitive: false
+
+statement: |
+  For every department, return the employees earning one of the **three
+  highest distinct salaries** in that department.
+
+  If several employees share one of those three salaries, return all of them —
+  so a department can return more than three rows.
+
+  Departments with no employees do not appear. Employees with no department
+  are not in any department's ranking.
+
+tables: [employees, departments]
+
+expectedColumns: [dept_name, full_name, salary, salary_rank]
+
+edgeCases:
+  - A department with fewer than three distinct salaries returns everyone it has.
+  - >-
+    A department with ties inside the top three returns more than three rows —
+    department 30 has two people on 97000.
+  - Research has no employees at all and must not appear.
+  - >-
+    The two employees with a NULL dept_id belong to no department and must be
+    excluded, not grouped together.
+
+hints:
+  - The ranking must restart for each department. Which clause of OVER does that?
+  - >-
+    "Three highest distinct salaries" and "three highest-paid employees" are
+    different questions. Which ranking function answers the first?
+  - Window functions cannot be filtered in WHERE — rank in a CTE, filter outside.
+
+solutionSql: |
+  with ranked as (
+      select e.dept_id,
+             e.emp_id,
+             e.first_name || ' ' || e.last_name as full_name,
+             e.salary,
+             dense_rank() over (partition by e.dept_id order by e.salary desc) as salary_rank
+      from employees e
+      where e.dept_id is not null
+  )
+  select d.dept_name,
+         r.full_name,
+         r.salary,
+         r.salary_rank
+  from ranked r
+  join departments d on d.dept_id = r.dept_id
+  where r.salary_rank <= 3
+  order by d.dept_name, r.salary_rank, r.full_name
+
+explanation:
+  lineByLine:
+    - clause: "partition by e.dept_id"
+      note: >-
+        Restarts the ranking for each department, so every department has its
+        own rank 1. This single clause is what turns "top three" into "top
+        three per group".
+    - clause: "order by e.salary desc"
+      note: >-
+        Defines what "highest" means within each partition. Without it the
+        ranking has no basis and PostgreSQL would reject the call.
+    - clause: "dense_rank()"
+      note: >-
+        Ranks distinct salary values, so two people on the same salary share a
+        rank and the next distinct value is the following number — which is
+        what "three highest distinct salaries" asks for.
+    - clause: "where e.dept_id is not null"
+      note: >-
+        Excludes the two employees with no department. Without it they would
+        form their own NULL partition and be ranked against each other, since
+        PARTITION BY groups all NULLs together.
+    - clause: "where r.salary_rank <= 3"
+      note: >-
+        Applied in the outer query because a window function cannot appear in
+        WHERE. The CTE is inlined, so this costs nothing.
+    - clause: "join departments d"
+      note: >-
+        Attaches the department name. An inner join is correct here: a
+        department with no employees produces no ranked rows and should not
+        appear.
+
+  walkthrough: |
+    `ranked` numbers each department's employees by descending salary,
+    restarting at 1 for each department.
+
+    Engineering has 13 employees with distinct salaries at the top, so ranks 1,
+    2 and 3 are Vikram Shetty on 245000, Priya Nair on 198000 and Arjun
+    Deshpande on 186000 — three rows.
+
+    Marketing is the interesting one. Meera Iyer at 211000 is rank 1, Imran
+    Qureshi at 205000 is rank 2, and Ishaan Kapoor at 104000 is rank 3. Had the
+    tie at 97000 fallen inside the top three, both content strategists would
+    have appeared and the department would have returned four rows — which is
+    what the question requires and what `ROW_NUMBER` would have got wrong.
+
+    Research produces no rows because it has no employees, and the inner join
+    to `departments` drops it, which is the specified behaviour.
+
+  alternatives:
+    - title: LATERAL with a per-department LIMIT
+      sql: |
+        select d.dept_name,
+               top.full_name,
+               top.salary,
+               top.rn as salary_rank
+        from departments d
+        cross join lateral (
+              select e.first_name || ' ' || e.last_name as full_name,
+                     e.salary,
+                     row_number() over (order by e.salary desc, e.emp_id) as rn
+              from employees e
+              where e.dept_id = d.dept_id
+              order by e.salary desc, e.emp_id
+              limit 3) top
+        order by d.dept_name, top.rn
+      when: >-
+        When there are many groups and an index on (dept_id, salary desc).
+        LATERAL reads three index entries per department instead of sorting
+        every employee. It is **not** equivalent here: LIMIT 3 takes three
+        rows, so it drops one of a tied pair rather than returning both.
+      equivalent: false
+
+    - title: Correlated count of higher distinct salaries
+      sql: |
+        select d.dept_name,
+               e.first_name || ' ' || e.last_name as full_name,
+               e.salary,
+               (select count(distinct e2.salary)
+                from employees e2
+                where e2.dept_id = e.dept_id
+                  and e2.salary > e.salary) + 1 as salary_rank
+        from employees e
+        join departments d on d.dept_id = e.dept_id
+        where (select count(distinct e2.salary)
+               from employees e2
+               where e2.dept_id = e.dept_id
+                 and e2.salary > e.salary) < 3
+        order by d.dept_name, salary_rank, full_name
+      when: >-
+        The pre-window-function answer, and still the one to reach for on a
+        database without them. It is genuinely equivalent to DENSE_RANK —
+        counting distinct higher values is the definition of a dense rank — but
+        it executes a correlated subquery per row, twice.
+      equivalent: true
+
+  performance: |
+    The window version sorts the employees table once, partitioned by
+    department. An index on `(dept_id, salary desc)` supplies that order and
+    removes the Sort node.
+
+    The LATERAL version costs one index seek plus three entries per
+    department, so with `g` departments it touches roughly `3g` rows rather
+    than all of them. On a thousand departments and ten million employees the
+    difference is decisive — but it answers a slightly different question,
+    because a per-group LIMIT cannot keep ties.
+
+    The correlated-subquery version runs two subqueries per employee and is
+    the slowest by a wide margin on any real table. It is worth knowing
+    because it is portable, not because it is fast.
+
+  wrongApproaches:
+    - title: ROW_NUMBER instead of DENSE_RANK
+      sql: |
+        with ranked as (
+            select e.dept_id, e.emp_id,
+                   e.first_name || ' ' || e.last_name as full_name,
+                   e.salary,
+                   row_number() over (partition by e.dept_id
+                                      order by e.salary desc, e.emp_id) as salary_rank
+            from employees e
+            where e.dept_id is not null
+        )
+        select d.dept_name, r.full_name, r.salary, r.salary_rank
+        from ranked r join departments d on d.dept_id = r.dept_id
+        where r.salary_rank <= 3
+        order by d.dept_name, r.salary_rank
+      whyWrong: >-
+        Returns exactly three rows per department, arbitrarily dropping one of
+        any tied pair at the boundary. The question asks for the three highest
+        distinct salaries, which can be more than three employees.
+
+    - title: Forgetting to exclude NULL departments
+      sql: |
+        with ranked as (
+            select e.dept_id, e.emp_id,
+                   e.first_name || ' ' || e.last_name as full_name,
+                   e.salary,
+                   dense_rank() over (partition by e.dept_id order by e.salary desc) as salary_rank
+            from employees e
+        )
+        select coalesce(d.dept_name, '(none)') as dept_name,
+               r.full_name, r.salary, r.salary_rank
+        from ranked r
+        left join departments d on d.dept_id = r.dept_id
+        where r.salary_rank <= 3
+        order by dept_name, r.salary_rank, r.full_name
+      whyWrong: >-
+        PARTITION BY puts all NULL dept_ids in one partition, so the CEO and
+        the Chief of Staff are ranked against each other as though they were a
+        department. The LEFT JOIN then lets that phantom group into the result.
+
+  extraTests:
+    - name: Ties inside the top three (alternate dataset)
+      schema: learning_alt
+      note: >-
+        In learning_alt, department 20 has Grace Hopper and Edsger Dijkstra
+        both on 150000. DENSE_RANK gives them the same rank and both are
+        returned; the LATERAL and ROW_NUMBER versions would return only one.
+      sql: |
+        with ranked as (
+            select e.dept_id,
+                   e.emp_id,
+                   e.first_name || ' ' || e.last_name as full_name,
+                   e.salary,
+                   dense_rank() over (partition by e.dept_id order by e.salary desc) as salary_rank
+            from employees e
+            where e.dept_id is not null
+        )
+        select d.dept_name, r.full_name, r.salary, r.salary_rank
+        from ranked r
+        join departments d on d.dept_id = r.dept_id
+        where r.salary_rank <= 3
+        order by d.dept_name, r.salary_rank, r.full_name
+
+    - name: A department with fewer than three distinct salaries
+      schema: learning_alt
+      note: >-
+        Department 30 in learning_alt has no employees and department 10 has
+        two. The query returns what exists rather than padding or failing,
+        which is the correct behaviour and worth confirming rather than
+        assuming.
+      sql: |
+        select e.dept_id,
+               count(*)                       as employees,
+               count(distinct e.salary)       as distinct_salaries
+        from employees e
+        where e.dept_id is not null
+        group by e.dept_id
+        order by e.dept_id
+
+  followUps:
+    - question: How would you return exactly three rows per department instead?
+      answer: >-
+        Use ROW_NUMBER with a deterministic tiebreak in the window's ORDER BY,
+        or LATERAL with LIMIT 3. Both pick arbitrarily among ties, so the
+        tiebreak column is what makes the choice reproducible rather than
+        correct — there is no correct answer to "which of two equal salaries
+        is third" and the question should be clarified.
+
+    - question: What if a department can have no employees and must still appear?
+      answer: >-
+        Change the inner join to a LEFT JOIN from departments and move the
+        ranking into a lateral subquery or a left-joined CTE, so the department
+        row survives with NULLs. Then count a column from the employee side
+        rather than using count(*), for the usual outer-join reason.
+
+    - question: How would this change for the top N by total project allocation rather than salary?
+      answer: >-
+        Aggregate first, then rank. A CTE sums allocation_pct per employee from
+        employee_projects, and the window then ranks over that aggregate.
+        Ranking an aggregate is the common second step, and the mistake to
+        avoid is ranking before aggregating, which ranks individual rows rather
+        than totals.
+
+    - question: Which index would you create?
+      answer: >-
+        `(dept_id, salary desc)`. It supplies the window's partition and
+        ordering so the Sort node disappears, and it is also exactly what the
+        LATERAL alternative needs to seek per department. Including emp_id as a
+        third column would additionally cover the tiebreak and could enable an
+        index-only scan if no other columns were selected.
+
+  related:
+    - w-ranking
+    - w-top-n-per-group
+    - j-self-cross
+    - p01-second-highest-salary

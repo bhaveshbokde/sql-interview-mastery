@@ -1,0 +1,398 @@
+id: f-select-basics
+moduleId: foundations
+position: 20
+title: SELECT, expressions and aliases
+slug: select-basics
+difficulty: Beginner
+estimatedMinutes: 20
+summary: >-
+  The select list is not just a list of columns — it is a list of expressions
+  evaluated once per row. Once you see it that way, computed columns, aliases
+  and the reason you cannot reuse an alias in WHERE all stop being arbitrary.
+tags: [select, expressions, aliases, basics]
+
+prerequisites:
+  - f-relational-model
+
+objectives:
+  - Write a SELECT that returns computed values rather than stored ones
+  - Explain what an alias is and when double quotes are required
+  - Say why an alias defined in the select list cannot be used in WHERE
+  - Use DISTINCT correctly, and say what it applies to
+  - Read a result and tell a text column from a numeric one by its alignment
+
+concept: |
+  ## The select list is a list of expressions
+
+  A beginner reads `select first_name, salary from employees` as "give me these
+  two columns". That is true but it is the special case. What SQL actually does
+  is evaluate a list of **expressions**, once per row of the result, and a bare
+  column name is simply the simplest expression there is.
+
+  Everything else follows from that. These are all legal:
+
+  ```sql
+  select 1                                  -- a constant, no table needed
+  select salary * 12                        -- arithmetic
+  select upper(last_name)                   -- a function call
+  select salary > 100000                    -- a boolean
+  select first_name || ' ' || last_name     -- concatenation
+  ```
+
+  There is no rule that an expression must mention a column, which is why
+  `select 1` works and why `select count(*) from employees` returns a row even
+  though no employee row is returned.
+
+  ## Aliases
+
+  Every output column has a name. If you do not supply one, PostgreSQL invents
+  one: the column name for a bare column, the function name for a function
+  call, and `?column?` when it has nothing to go on.
+
+  ```sql
+  select salary * 12 as annual_salary
+  select salary * 12 annual_salary   -- AS is optional; include it anyway
+  select salary * 12 as "Annual Salary (INR)"
+  ```
+
+  Double quotes make an identifier **case-sensitive and punctuation-tolerant**.
+  Without them PostgreSQL folds identifiers to lower case, so `AS AnnualSalary`
+  produces a column called `annualsalary`. This is one of the few places the
+  standard and the major implementations genuinely disagree — PostgreSQL folds
+  to lower case, the standard says upper, and quoted identifiers are preserved
+  exactly in both.
+
+  Double quotes are for identifiers. Single quotes are for string literals.
+  Mixing them up produces `column "Engineering" does not exist`, which is one
+  of the most common early errors and reads as nonsense until you know this.
+
+  ## Where an alias can be used
+
+  This fails:
+
+  ```sql
+  select salary * 12 as annual
+  from employees
+  where annual > 2000000      -- ERROR: column "annual" does not exist
+  ```
+
+  This works:
+
+  ```sql
+  select salary * 12 as annual
+  from employees
+  order by annual
+  ```
+
+  The reason is the logical order of evaluation, covered properly in its own
+  lesson: `WHERE` is evaluated before the select list, so the alias does not
+  exist yet. `ORDER BY` is evaluated after it, so it does. `GROUP BY` and
+  `HAVING` sit in between, and PostgreSQL permits an alias in `GROUP BY` as an
+  extension while most other databases do not.
+
+  The portable fix is to repeat the expression, or to wrap the query in a
+  subquery or CTE so the alias becomes a real column of an intermediate result.
+
+  ## DISTINCT
+
+  `DISTINCT` removes duplicate **rows**, not duplicate values of one column. It
+  applies to the entire select list, which is the single most common
+  misunderstanding:
+
+  ```sql
+  select distinct dept_id, job_title from employees
+  ```
+
+  returns distinct *pairs*. There is no way to make it dedupe only `dept_id`
+  while still showing `job_title`, because the question is ill-posed — which
+  job title would it keep? PostgreSQL offers `DISTINCT ON` for exactly that
+  question, and it requires you to answer it with an `ORDER BY`.
+
+  `DISTINCT` is not free: it requires a sort or a hash over the whole result.
+  Reaching for it to make duplicates go away, when the duplicates came from a
+  join that fans out, hides the bug rather than fixing it.
+
+syntax:
+  - form: "SELECT expr [AS alias] [, expr [AS alias]]... [FROM table]"
+    notes: >-
+      FROM is optional. `select now()` and `select 2 + 2` are complete queries.
+  - form: "SELECT DISTINCT expr_list FROM table"
+    notes: >-
+      Deduplicates whole rows of the select list. Two NULLs count as equal here,
+      which is the one context where that is true.
+  - form: "SELECT DISTINCT ON (expr) ... ORDER BY expr, tiebreak"
+    notes: >-
+      PostgreSQL-only. Keeps the first row for each value of the parenthesised
+      expression, where "first" is decided by the ORDER BY — which must start
+      with the same expression.
+  - form: "expr::type  or  CAST(expr AS type)"
+    notes: >-
+      `::` is the PostgreSQL spelling and `CAST` is the standard one. They do the
+      same thing; the standard one survives a port.
+
+sampleTables: [employees, departments, products]
+
+examples:
+  - title: Compute, do not just retrieve
+    sql: |
+      select emp_id,
+             first_name || ' ' || last_name as full_name,
+             salary,
+             salary * 12                    as annual_salary,
+             round(salary / 12, 2)          as monthly_salary,
+             upper(job_title)               as title_shouting
+      from employees
+      where emp_id <= 6
+      order by emp_id
+    walkthrough: |
+      Six expressions, evaluated once per row. Only two of them — `emp_id` and
+      `salary` — are stored values; the rest are computed at query time and
+      exist nowhere on disk.
+
+      `round(salary / 12, 2)` is worth a second look. `salary` is
+      `numeric(10,2)`, and dividing a `numeric` by an integer gives a `numeric`
+      with a lot of decimal places, so the explicit `round` is doing real work.
+      Had `salary` been an `integer`, `salary / 12` would have been **integer
+      division** and silently truncated — a bug that produces plausible numbers.
+
+  - title: Aliases, quoted and unquoted
+    sql: |
+      select dept_name          as department,
+             budget             as "Budget (INR)",
+             budget / 100000    as "budget_lakhs",
+             location
+      from departments
+      order by budget desc
+    walkthrough: |
+      `as department` gives a plain lower-case name. `as "Budget (INR)"` keeps
+      the capitals and the brackets, because it is quoted — without the quotes
+      it would be a syntax error at the space.
+
+      Notice that the quoted alias is now awkward to refer to elsewhere: any
+      later reference needs the quotes and the exact capitalisation. That is the
+      practical argument against decorative aliases in anything but the final
+      presentation query.
+
+  - title: DISTINCT applies to the whole row
+    sql: |
+      select distinct dept_id, job_title
+      from employees
+      where dept_id in (10, 20)
+      order by dept_id, job_title
+    walkthrough: |
+      Distinct **pairs**, not distinct departments. Department 10 appears many
+      times because it has many different job titles, and that is correct
+      behaviour rather than a failure of DISTINCT.
+
+      If the question were "which departments are there?", the answer is
+      `select distinct dept_id from employees` with `job_title` dropped. If the
+      question were "one representative job title per department", that is
+      `DISTINCT ON`, and it forces you to say which one.
+
+  - title: DISTINCT ON picks a representative row
+    sql: |
+      select distinct on (dept_id)
+             dept_id,
+             first_name || ' ' || last_name as highest_paid,
+             salary
+      from employees
+      where dept_id is not null
+      order by dept_id, salary desc, emp_id
+    walkthrough: |
+      For each `dept_id`, PostgreSQL keeps the first row it sees, and the
+      `ORDER BY` decides what "first" means: highest salary, with `emp_id` as a
+      tiebreak so the answer is deterministic when two people earn the same.
+
+      The `ORDER BY` **must** begin with the `DISTINCT ON` expressions. That is
+      not a quirk; without it, "first" has no meaning. The `emp_id` tiebreak is
+      not required by the syntax but is required by anyone who wants the same
+      answer twice — department 10 has a genuine salary tie further down, and
+      ties are where non-deterministic queries hide.
+
+      The portable equivalent of this query uses a window function, and the
+      window-functions module writes it both ways.
+
+edgeCases:
+  - title: A query needs no table
+    body: >-
+      `FROM` is optional. The select list is evaluated once and one row comes
+      back. This is how you test an expression without involving data, and it is
+      how `select 1` became the canonical connection-liveness check.
+    sql: |
+      select 2 + 2                     as arithmetic,
+             'a' || 'b'                as concatenation,
+             length('interview')       as length,
+             10 / 3                    as integer_division,
+             10.0 / 3                  as numeric_division,
+             null = null               as null_equals_null
+
+  - title: An expression with no name
+    body: >-
+      PostgreSQL cannot invent a name for an arbitrary expression, so it labels
+      the column `?column?`. It is not an error and the query works — but it is
+      a sign that the query is not finished, and code that reads results by
+      column name will not find it.
+    sql: |
+      select 42, salary * 0.1
+      from employees
+      where emp_id = 1
+
+pitfalls:
+  - mistake: Using double quotes for a string value
+    why: >-
+      Most languages accept either quote character for a string, so `where
+      dept_name = "Engineering"` looks right. SQL does not: double quotes mean
+      "this is an identifier", so PostgreSQL goes looking for a column called
+      Engineering and reports that it does not exist.
+    fix: >-
+      Single quotes for values, double quotes for identifiers, and double quotes
+      only when you actually need them. To put a single quote inside a string,
+      double it — `'O''Connor'`.
+
+  - mistake: Expecting a select-list alias to work in WHERE
+    why: >-
+      Reading order suggests the alias is defined before WHERE is reached.
+      Evaluation order is the other way round.
+    fix: >-
+      Repeat the expression in WHERE, or wrap the query in a CTE and filter the
+      CTE. The second is better when the expression is long, because repeating
+      it twice means maintaining it twice.
+
+  - mistake: Adding DISTINCT to make duplicate rows go away
+    why: >-
+      Duplicates nearly always come from a join that matched more rows than
+      expected. DISTINCT hides the symptom, and it hides it unevenly — it
+      collapses exact duplicates while leaving near-duplicates behind, so a
+      count that was wrong by a factor of three becomes wrong by an unpredictable
+      amount instead.
+    fix: >-
+      Find out where the fan-out came from. Count the rows before and after the
+      join, or run the join without the aggregate and look at what came back.
+
+performance: |
+  `DISTINCT` and `GROUP BY` over the same columns usually produce the same plan
+  in PostgreSQL, so choosing between them is a readability decision rather than
+  a performance one. Both require either a sort or a hash aggregate over the
+  whole input.
+
+  Computed columns in the select list are evaluated once per **returned** row,
+  not once per scanned row, so an expensive expression in the select list costs
+  less than the same expression in `WHERE`, where it runs against everything the
+  filter examines. If you need the same expensive expression in both places, a
+  CTE or a subquery computes it once.
+
+interviewQuestions:
+  - question: What is the difference between `DISTINCT` and `GROUP BY`?
+    answer: >-
+      For deduplication alone they are equivalent and PostgreSQL typically
+      produces the same plan. The difference is capability: GROUP BY establishes
+      groups that aggregate functions can then be applied to, so it can answer
+      "how many per department", while DISTINCT only removes duplicate rows.
+      GROUP BY is also the only one of the two that can be followed by HAVING.
+      Use DISTINCT when you want to deduplicate and GROUP BY when you want to
+      aggregate; writing GROUP BY with no aggregate is a hint that DISTINCT was
+      meant.
+
+  - question: Why can you use a column alias in ORDER BY but not in WHERE?
+    answer: >-
+      Because of the logical order of evaluation. FROM and WHERE are processed
+      before the select list, so when WHERE runs, the alias has not been created.
+      ORDER BY is processed after the select list, so by then it has. It is not a
+      parser limitation but a consequence of what each clause operates on: WHERE
+      filters input rows, ORDER BY sorts output rows.
+
+  - question: What does `SELECT DISTINCT a, b` actually deduplicate?
+    answer: >-
+      Entire rows of the select list — distinct `(a, b)` pairs. It does not
+      deduplicate on `a` alone. Candidates frequently expect a single column to
+      be deduplicated while other columns come along; that question has no
+      well-defined answer, which is why PostgreSQL requires `DISTINCT ON (a)`
+      plus an `ORDER BY` that specifies which row to keep. Two NULLs are treated
+      as equal for DISTINCT, which is the one place where NULL behaves like a
+      value you can compare.
+
+  - question: What is `?column?` in result output?
+    answer: >-
+      PostgreSQL's placeholder for an output column it could not name — an
+      expression with no alias that is not a plain column reference or a simple
+      function call. It is not an error, but it means a client reading the result
+      by column name will fail, so it should be treated as an unfinished query.
+
+exercises:
+  - prompt: >-
+      For every active employee in department 10, return their full name
+      (first and last joined by a space) as full_name, their salary, and their
+      salary expressed as a percentage of 200000 rounded to one decimal place as
+      pct_of_band. Order by salary descending.
+    difficulty: Easy
+    hint: >-
+      `round(x, 1)` needs a numeric argument. `salary` already is one, so
+      `round(salary * 100 / 200000, 1)` works without a cast.
+    solutionSql: |
+      select first_name || ' ' || last_name          as full_name,
+             salary,
+             round(salary * 100 / 200000, 1)         as pct_of_band
+      from employees
+      where dept_id = 10
+        and is_active
+      order by salary desc
+
+  - prompt: >-
+      Return one row per department id showing the job title of its
+      longest-serving employee. Columns: dept_id, job_title, hire_date. Ignore
+      employees with no department.
+    difficulty: Medium
+    hint: >-
+      DISTINCT ON (dept_id), with an ORDER BY that starts with dept_id and then
+      sorts by hire_date ascending. Add a tiebreak so two people hired on the
+      same day give a stable answer.
+    solutionSql: |
+      select distinct on (dept_id)
+             dept_id, job_title, hire_date
+      from employees
+      where dept_id is not null
+      order by dept_id, hire_date, emp_id
+
+  - prompt: >-
+      List the distinct combinations of country and segment among customers,
+      ordered by country then segment.
+    difficulty: Easy
+    hint: >-
+      DISTINCT applies to the whole select list, so naming both columns is all
+      that is needed.
+    solutionSql: |
+      select distinct country, segment
+      from customers
+      order by country, segment
+
+checklist:
+  - The select list is a list of expressions evaluated once per row, not a list of columns
+  - Single quotes are values; double quotes are identifiers and make them case-sensitive
+  - Unquoted identifiers fold to lower case in PostgreSQL
+  - An alias is visible in ORDER BY and GROUP BY but not in WHERE, because of evaluation order
+  - DISTINCT deduplicates the whole select list, never a single column
+  - DISTINCT ON is PostgreSQL-only and requires a matching leading ORDER BY
+  - Integer division truncates; cast or use a numeric literal to avoid it
+  - "?column? means an output column that has no name, and the query is not finished"
+
+related:
+  - f-relational-model
+  - f-filtering
+  - f-logical-order
+  - w-ranking
+
+dialect:
+  standard: >-
+    SELECT, AS, DISTINCT, CAST and the `||` concatenation operator are all
+    standard. The standard folds unquoted identifiers to upper case.
+  postgres: >-
+    Folds unquoted identifiers to lower case instead, adds the `::` cast
+    shorthand, and adds DISTINCT ON, which has no standard equivalent — the
+    portable spelling is a window function with ROW_NUMBER. PostgreSQL also
+    allows a select-list alias in GROUP BY, which the standard does not.
+  mysql: >-
+    `||` is logical OR unless ANSI mode is enabled; use CONCAT(). MySQL has no
+    DISTINCT ON. Historically MySQL allowed a select-list alias in HAVING and in
+    some WHERE positions, which is a portability trap in the other direction.
+    Identifier case sensitivity on MySQL depends on the operating system's file
+    system, which PostgreSQL's never does.

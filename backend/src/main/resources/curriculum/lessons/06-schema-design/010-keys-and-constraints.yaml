@@ -1,0 +1,469 @@
+id: s-keys-constraints
+moduleId: schema-design
+position: 10
+title: Keys and constraints
+slug: keys-and-constraints
+difficulty: Intermediate
+estimatedMinutes: 25
+summary: >-
+  Primary, candidate, surrogate and natural keys; NOT NULL, UNIQUE, CHECK and
+  foreign keys with their referential actions. The constraints are where
+  correctness is enforced, because the database is the only component every
+  writer goes through.
+tags: [keys, constraints, foreign-keys, primary-key, referential-integrity]
+
+prerequisites:
+  - f-relational-model
+
+objectives:
+  - Distinguish candidate, primary, surrogate, natural and composite keys
+  - Name the five constraint types and what each guarantees
+  - Choose a referential action and justify it
+  - Explain how UNIQUE and NULL interact
+  - Read a table's constraints out of the catalogue
+
+concept: |
+  ## Kinds of key
+
+  - A **candidate key** is any minimal set of columns that uniquely identifies
+    a row. A table can have several.
+  - The **primary key** is the candidate key you nominated. It implies NOT NULL
+    and UNIQUE, and it is what foreign keys point at by convention.
+  - A **natural key** is made of real-world data — an ISBN, an email address,
+    a country code.
+  - A **surrogate key** is a meaningless generated number or UUID.
+  - A **composite key** spans several columns. `employee_projects` here has
+    `(emp_id, project_id)`, which is the normal shape for a junction table.
+
+  **Natural versus surrogate** is a genuine trade-off, not a rule:
+
+  A natural key needs no extra column, makes the child table readable, and
+  often removes a join — if `order_items` carries the ISBN you may not need to
+  visit `books`. Against that: real-world identifiers change (people change
+  email addresses, companies reissue product codes), and a key change cascades
+  through every referencing row.
+
+  A surrogate key never changes and is compact. Against it: every query needs
+  a join to find out what a row is about, and nothing stops two rows with
+  identical real-world data from both existing — unless you add the unique
+  constraint on the natural key anyway, which is the standard advice: surrogate
+  primary key **plus** a unique constraint on the natural key.
+
+  ## The constraints
+
+  - **`NOT NULL`** — the value must be present. The cheapest and most
+    under-used constraint.
+  - **`UNIQUE`** — no two rows share this value. Implemented with an index.
+  - **`PRIMARY KEY`** — NOT NULL plus UNIQUE, one per table.
+  - **`CHECK`** — an arbitrary boolean condition on a row. Remember it rejects
+    only `false`, so a NULL passes.
+  - **`FOREIGN KEY`** — the value must exist in the referenced table.
+
+  Plus `EXCLUDE`, which is PostgreSQL's generalisation of UNIQUE to any
+  operator — the standard way to prevent overlapping bookings with a range
+  type.
+
+  ## UNIQUE and NULL
+
+  By the standard, NULLs are not equal to each other, so a UNIQUE constraint
+  permits **any number of NULL rows**. That is the behaviour PostgreSQL has
+  always had, and it surprises people who expect "unique" to mean "at most one
+  of anything".
+
+  PostgreSQL 15 added `UNIQUE NULLS NOT DISTINCT`, which treats NULLs as equal
+  and allows only one. Before that the workaround is a partial unique index or
+  a sentinel value.
+
+  ## Referential actions
+
+  When a referenced row is deleted or its key updated, the foreign key decides
+  what happens:
+
+  | Action | Effect |
+  |--------|--------|
+  | `NO ACTION` (default) | Error, checked at the end of the statement |
+  | `RESTRICT` | Error, checked immediately |
+  | `CASCADE` | Delete or update the children too |
+  | `SET NULL` | Set the child's FK to NULL |
+  | `SET DEFAULT` | Set it to the column default |
+
+  `CASCADE` is right for genuinely owned children — order lines belong to an
+  order and have no meaning without it. It is dangerous for anything else,
+  because one delete can silently remove a great deal, and it operates
+  without the application knowing.
+
+  `SET NULL` requires the column to be nullable, and models "the parent is
+  gone but the child still exists" — an employee whose department was
+  dissolved.
+
+  The default, `NO ACTION`, is usually the right choice: it forces the
+  application to decide.
+
+  ## Deferrable constraints
+
+  `DEFERRABLE INITIALLY DEFERRED` moves the check to commit time, which is
+  what makes circular references possible — two tables each requiring the
+  other's row to exist. Rare and occasionally essential.
+
+  ## Why constraints, not application code
+
+  Because the database is the only component that every writer goes through.
+  An application validates its own inserts; it does not validate the other
+  service, the migration script, the data fix run at two in the morning, or
+  the bug in its own retry logic. A constraint holds for all of them.
+
+  A constraint is also documentation that cannot drift from the truth.
+
+syntax:
+  - form: "col type PRIMARY KEY  |  PRIMARY KEY (col1, col2)"
+    notes: >-
+      Implies NOT NULL and UNIQUE. The table-level form is required for
+      composite keys.
+  - form: "col type UNIQUE  |  UNIQUE NULLS NOT DISTINCT (col)"
+    notes: >-
+      Standard UNIQUE permits many NULLs. NULLS NOT DISTINCT, from PostgreSQL
+      15, permits only one.
+  - form: "CHECK (condition)"
+    notes: Rejects only when the condition is false, so NULL passes.
+  - form: "FOREIGN KEY (col) REFERENCES parent(col) ON DELETE action ON UPDATE action"
+    notes: >-
+      Default is NO ACTION on both. CASCADE for owned children only.
+  - form: "CONSTRAINT name ... DEFERRABLE INITIALLY DEFERRED"
+    notes: Checked at commit instead of per statement. Enables circular references.
+  - form: "EXCLUDE USING gist (room WITH =, period WITH &&)"
+    notes: >-
+      PostgreSQL-only. The standard way to forbid overlapping ranges, such as
+      double-booking a room.
+
+sampleTables: [employees, departments, order_items, employee_projects, contacts]
+
+examples:
+  - title: Reading a table's constraints from the catalogue
+    sql: |
+      select tc.constraint_type,
+             tc.constraint_name,
+             string_agg(kcu.column_name, ', ' order by kcu.ordinal_position) as columns
+      from information_schema.table_constraints tc
+      left join information_schema.key_column_usage kcu
+             on kcu.constraint_name = tc.constraint_name
+            and kcu.table_schema    = tc.table_schema
+      where tc.table_schema = 'learning'
+        and tc.table_name   = 'employees'
+      group by tc.constraint_type, tc.constraint_name
+      order by tc.constraint_type, tc.constraint_name
+    walkthrough: |
+      Every constraint on `employees`, read out of the standard catalogue
+      views. The primary key on `emp_id`, the unique constraint on `email`, the
+      two foreign keys to `departments` and back to `employees`, and the CHECK
+      constraints.
+
+      Note that the CHECK list is longer than the one written in the migration:
+      PostgreSQL creates an implicit `_not_null` check entry for every NOT NULL
+      column in `information_schema`. That is a quirk of the view rather than
+      of the table.
+
+      Being able to answer "what does this table actually enforce?" with a
+      query rather than by reading a migration file is a genuinely useful
+      skill, especially on a database somebody else built.
+
+  - title: Every foreign key in the schema, and its direction
+    sql: |
+      select kcu.table_name    as child_table,
+             kcu.column_name   as child_column,
+             ccu.table_name    as parent_table,
+             ccu.column_name   as parent_column,
+             rc.delete_rule,
+             rc.update_rule
+      from information_schema.referential_constraints rc
+      join information_schema.key_column_usage kcu
+        on kcu.constraint_name = rc.constraint_name
+       and kcu.constraint_schema = rc.constraint_schema
+      join information_schema.constraint_column_usage ccu
+        on ccu.constraint_name = rc.constraint_name
+       and ccu.constraint_schema = rc.constraint_schema
+      where kcu.table_schema = 'learning'
+      order by child_table, child_column
+    walkthrough: |
+      The dependency graph of the whole schema in one result. `child_table`
+      depends on `parent_table`; you can delete a child freely and cannot
+      delete a parent that still has children.
+
+      Every `delete_rule` here is `NO ACTION`, which is the default and the
+      right default for a dataset meant to be explored — a `CASCADE` would let
+      one deletion remove a surprising amount.
+
+      `employees` appears as both child and parent of itself, which is the
+      self-referencing manager hierarchy showing up in the catalogue. Spotting
+      that in an unfamiliar schema immediately tells you there is a tree in it.
+
+  - title: A composite key, and what it allows
+    sql: |
+      select ep.emp_id,
+             e.first_name || ' ' || e.last_name as employee,
+             ep.project_id,
+             p.project_name,
+             ep.role,
+             ep.allocation_pct,
+             count(*) over (partition by ep.emp_id)     as projects_for_employee,
+             count(*) over (partition by ep.project_id) as people_on_project
+      from employee_projects ep
+      join employees e on e.emp_id = ep.emp_id
+      join projects  p on p.project_id = ep.project_id
+      where ep.emp_id in (8, 35, 36)
+      order by ep.emp_id, ep.project_id
+    walkthrough: |
+      The primary key of `employee_projects` is `(emp_id, project_id)`, which
+      says precisely: an employee may be on many projects, a project may have
+      many employees, and an employee may appear on a given project **once**.
+
+      Employee 8 is on two projects and employee 35 on two as well, which the
+      composite key permits. A second row for (8, 101) would be rejected.
+
+      Note that `role` and `allocation_pct` are attributes of the
+      *relationship*, not of the employee or the project. That is the reason a
+      junction table is a table rather than an array column: relationships can
+      carry their own data.
+
+  - title: Where a UNIQUE constraint is absent, and what that permits
+    sql: |
+      select email,
+             count(*)                                   as rows,
+             string_agg(full_name, ' / ' order by created_at) as names,
+             min(created_at)                            as first_seen,
+             max(created_at)                            as last_seen
+      from contacts
+      group by email
+      having count(*) > 1
+      order by rows desc, email
+    walkthrough: |
+      `contacts` deliberately has no unique constraint on `email`, and the
+      result shows what that permits: three rows for Ellen Marsh under three
+      spellings of her name, two for Anita Rao, two for Tomas Lindqvist.
+
+      This is the shape of every real duplicate-data problem, and it exists
+      because nobody added `unique (email)` at the start. Adding it later means
+      first deciding which row survives — which is a business decision, not a
+      technical one, and is why the constraint is so much cheaper on day one.
+
+      `employees.email` does have the constraint, which is why there is no
+      equivalent mess there.
+
+edgeCases:
+  - title: UNIQUE permits any number of NULLs
+    body: >-
+      Two employees have a NULL `dept_id`. If `dept_id` carried a UNIQUE
+      constraint, both rows would still be allowed, because NULLs are not equal
+      to each other and a UNIQUE constraint only forbids equal values. This
+      catches people who use UNIQUE to mean "at most one of anything". From
+      PostgreSQL 15, `UNIQUE NULLS NOT DISTINCT` gives the other behaviour.
+    sql: |
+      select count(*)                          as employees,
+             count(dept_id)                    as with_department,
+             count(*) - count(dept_id)         as null_departments,
+             count(distinct dept_id)           as distinct_departments
+      from employees
+
+  - title: A CHECK constraint accepts NULL
+    body: >-
+      `employees.salary` carries `check (salary > 0)` and is also NOT NULL, so
+      the question never arises there. Had it been nullable, a NULL salary
+      would pass the check — because a CHECK rejects only when the condition is
+      false, and `NULL > 0` is NULL. Enforcing presence needs NOT NULL; the
+      CHECK only constrains the values that are present.
+    sql: |
+      select (null > 0)                     as null_gt_zero,
+             (null > 0) is not false        as passes_a_check_constraint,
+             (0 > 0)                        as zero_gt_zero,
+             (0 > 0) is not false           as zero_passes_a_check
+
+pitfalls:
+  - mistake: Enforcing invariants only in application code
+    why: >-
+      The application is one of several writers. Migrations, admin scripts,
+      other services and manual fixes all bypass it, and each of those is a
+      route by which invalid data arrives.
+    fix: >-
+      Put the invariant in the database as a constraint, and keep the
+      application check too for a better error message. The two are not
+      alternatives.
+
+  - mistake: Using ON DELETE CASCADE by default
+    why: >-
+      One delete can silently remove a large subtree, including rows the person
+      running the delete did not know existed, with no application involvement
+      and no audit trail.
+    fix: >-
+      CASCADE only for genuinely owned children — order lines, junction rows.
+      Leave everything else at NO ACTION so the deletion fails and the
+      application has to decide.
+
+  - mistake: Expecting UNIQUE to allow only one NULL
+    why: >-
+      The word implies it and the standard says otherwise, because NULL is not
+      equal to NULL.
+    fix: >-
+      NOT NULL plus UNIQUE if the value is required and unique. `UNIQUE NULLS
+      NOT DISTINCT` on PostgreSQL 15+, or a partial unique index, if NULLs must
+      be limited to one.
+
+  - mistake: Choosing a natural key for data that can change
+    why: >-
+      An email address or a product code is unique today and mutable
+      tomorrow, and changing it means updating every referencing row —
+      assuming ON UPDATE CASCADE was set, and a broken reference if not.
+    fix: >-
+      Surrogate primary key, plus a unique constraint on the natural key so the
+      real-world uniqueness is still enforced. You get stability and
+      correctness.
+
+performance: |
+  `UNIQUE` and `PRIMARY KEY` are implemented with a B-tree index, so they cost
+  index maintenance on write and provide a lookup path for free on read. The
+  index is not optional and cannot be dropped separately.
+
+  **Foreign keys are not indexed automatically in PostgreSQL.** Only the
+  parent's key is indexed, by its own primary key or unique constraint. The
+  child's referencing column has no index unless you create one, and without it
+  every `DELETE` on the parent scans the child table to check for references —
+  and every join from parent to child is a sequential scan. This is one of the
+  most common and most easily fixed performance problems in a PostgreSQL
+  schema, and it differs from MySQL's InnoDB, which indexes foreign keys
+  automatically.
+
+  `CHECK` constraints cost a boolean evaluation per write and nothing on read.
+  They can also help the planner: a CHECK that restricts a column's range is
+  used in constraint exclusion for partitioned tables.
+
+  Validating a new constraint on a large table locks it. `ALTER TABLE ... ADD
+  CONSTRAINT ... NOT VALID` followed by `VALIDATE CONSTRAINT` splits that into
+  a brief lock and a slow background scan, which is how constraints get added
+  to production tables without an outage.
+
+interviewQuestions:
+  - question: What is the difference between a primary key and a unique constraint?
+    answer: >-
+      A primary key is a unique constraint that also implies NOT NULL, and
+      there is exactly one per table. A unique constraint permits NULLs — any
+      number of them by default, since NULLs are not equal to each other — and
+      a table may have several. Both are implemented with a B-tree index.
+      Conventionally foreign keys reference the primary key, though PostgreSQL
+      allows referencing any unique constraint. Choosing the primary key is
+      choosing which candidate key is the canonical identity of a row.
+
+  - question: Natural key or surrogate key?
+    answer: >-
+      Surrogate keys are stable, compact and never need cascading updates;
+      natural keys are self-describing and can eliminate joins. The decisive
+      argument is usually mutability — real-world identifiers change more often
+      than people expect, and a changing primary key propagates through every
+      referencing table. The common practice is both: a surrogate primary key
+      for stability, plus a unique constraint on the natural key so the
+      real-world uniqueness is still enforced by the database rather than
+      assumed.
+
+  - question: When would you use ON DELETE CASCADE?
+    answer: >-
+      When the child rows are genuinely owned by the parent and have no
+      independent meaning — order line items, junction-table rows, attachments
+      to a document. For anything with independent existence, cascading is
+      dangerous: a single delete can remove a large subtree silently, without
+      the application knowing and without an audit trail. The default NO ACTION
+      forces the deletion to fail, which makes the application decide
+      explicitly. SET NULL is the middle option, for "the parent is gone but
+      the child remains".
+
+  - question: Why enforce constraints in the database rather than the application?
+    answer: >-
+      Because the database is the only component every writer passes through.
+      Application validation does not cover migrations, admin scripts, other
+      services, bulk loads or manual fixes, and each of those is a real route
+      for invalid data. A database constraint also documents the invariant in a
+      way that cannot drift from the truth, and it lets the planner reason
+      about the data. The application check is still worth keeping for a better
+      error message, but as a convenience rather than as the guarantee.
+
+exercises:
+  - prompt: >-
+      List every column in the learning schema that is NOT NULL and has a
+      default. Columns table_name, column_name, column_default. Order by
+      table_name then column_name.
+    difficulty: Easy
+    hint: information_schema.columns has is_nullable and column_default.
+    solutionSql: |
+      select table_name, column_name, column_default
+      from information_schema.columns
+      where table_schema = 'learning'
+        and is_nullable  = 'NO'
+        and column_default is not null
+      order by table_name, column_name
+
+  - prompt: >-
+      Find the tables in the learning schema that have a composite primary key,
+      with the number of columns in it. Columns table_name, key_columns. Order
+      by table_name.
+    difficulty: Medium
+    hint: >-
+      Join table_constraints to key_column_usage, filter on PRIMARY KEY, group
+      and keep groups with more than one column.
+    solutionSql: |
+      select tc.table_name,
+             count(*) as key_columns
+      from information_schema.table_constraints tc
+      join information_schema.key_column_usage kcu
+        on kcu.constraint_name = tc.constraint_name
+       and kcu.table_schema    = tc.table_schema
+      where tc.table_schema   = 'learning'
+        and tc.constraint_type = 'PRIMARY KEY'
+      group by tc.table_name
+      having count(*) > 1
+      order by tc.table_name
+
+  - prompt: >-
+      Identify duplicate contacts by email, keeping the earliest row as the
+      survivor. Return email, the contact_id to keep, and the count of rows to
+      remove. Columns email, keep_id, to_remove. Order by to_remove descending
+      then email.
+    difficulty: Medium
+    hint: >-
+      Group by email, use min(created_at) to pick the survivor — or a window
+      function if two share a created_at.
+    solutionSql: |
+      select email,
+             (array_agg(contact_id order by created_at, contact_id))[1] as keep_id,
+             count(*) - 1                                               as to_remove
+      from contacts
+      group by email
+      having count(*) > 1
+      order by to_remove desc, email
+
+checklist:
+  - "A candidate key uniquely identifies a row; the primary key is the one you nominated"
+  - "Surrogate keys are stable; natural keys are self-describing — commonly use both"
+  - PRIMARY KEY is NOT NULL plus UNIQUE, one per table
+  - UNIQUE permits any number of NULLs unless NULLS NOT DISTINCT is specified
+  - CHECK rejects only false, so NULL always passes it
+  - "CASCADE for owned children only; NO ACTION makes the application decide"
+  - PostgreSQL does not index foreign-key columns automatically
+  - Constraints belong in the database because every writer goes through it
+
+related:
+  - f-relational-model
+  - s-normalisation
+  - s-relationships
+  - p-indexes
+
+dialect:
+  standard: >-
+    PRIMARY KEY, UNIQUE, NOT NULL, CHECK, FOREIGN KEY with all five referential
+    actions, deferrable constraints, and the information_schema views are all
+    standard SQL.
+  postgres: >-
+    Adds EXCLUDE constraints, partial unique indexes, UNIQUE NULLS NOT DISTINCT
+    from version 15, and NOT VALID / VALIDATE CONSTRAINT for adding constraints
+    without a long lock. Does not index foreign-key columns automatically.
+  mysql: >-
+    InnoDB creates an index on every foreign-key column automatically, so the
+    missing-FK-index problem does not arise — and advice from MySQL experience
+    does not transfer. MySQL ignored CHECK constraints entirely before 8.0.16,
+    parsing and discarding them, which left a lot of schemas with constraints
+    that were never enforced. MySQL has no deferrable constraints.

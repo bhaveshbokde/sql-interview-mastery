@@ -1,0 +1,15 @@
+# The "record" profile: execute every statement in the curriculum, write down
+# what it returned, and exit.
+#
+#   bash scripts/record-sql.sh
+#
+# No web server, because this is a batch job. Without it the process would
+# serve HTTP forever after the recording finished.
+spring:
+  main:
+    web-application-type: none
+logging:
+  level:
+    root: WARN
+    com.bhavesh.sqlmastery: INFO
+    org.flywaydb: WARN

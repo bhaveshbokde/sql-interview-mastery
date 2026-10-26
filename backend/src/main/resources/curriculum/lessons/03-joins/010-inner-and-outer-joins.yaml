@@ -1,0 +1,459 @@
+id: j-inner-outer
+moduleId: joins
+position: 10
+title: Inner and outer joins
+slug: inner-and-outer-joins
+difficulty: Beginner
+estimatedMinutes: 30
+summary: >-
+  The four join types, what each does with rows that have no match, why a join
+  can return more rows than either input, and the ON-versus-WHERE distinction
+  that silently turns a LEFT JOIN into an inner one.
+tags: [joins, left-join, outer-join, fan-out, interview-favourite]
+
+prerequisites:
+  - f-logical-order
+
+objectives:
+  - Predict the row count of each join type on a given pair of tables
+  - Explain why a join can produce more rows than either input table
+  - Place a condition in ON or in WHERE and justify the choice
+  - Use an anti-join to find rows with no match
+  - Recognise a fan-out bug from a total that is too large
+
+concept: |
+  ## What a join does
+
+  A join pairs each row of one table with rows of another according to a
+  condition, and produces one output row per pair. Everything else is a
+  variation on what happens to rows that find no partner.
+
+  | Type | Unmatched left rows | Unmatched right rows |
+  |------|--------------------|----------------------|
+  | `INNER JOIN` | dropped | dropped |
+  | `LEFT [OUTER] JOIN` | **kept**, right side NULL | dropped |
+  | `RIGHT [OUTER] JOIN` | dropped | **kept**, left side NULL |
+  | `FULL [OUTER] JOIN` | kept | kept |
+
+  `RIGHT JOIN` is `LEFT JOIN` with the tables swapped. Most codebases use
+  `LEFT` exclusively, because a query is easier to read when "the table that
+  keeps all its rows" is always the one mentioned first.
+
+  ## A join can return more rows than either table
+
+  This is the part that surprises people. If the join key is not unique on the
+  right-hand side, one left row pairs with several right rows and appears
+  several times in the output.
+
+  `orders` has 151 rows and `order_items` has 372. Joining them gives 372 rows:
+  every order line, with its order's details repeated. That is correct, and it
+  is also a trap, because an aggregate over an order-level column now counts
+  each order once per line.
+
+  The rule: **a join multiplies by the number of matches.** Before aggregating
+  across a join, know whether the key is unique on the other side. If it is
+  not, aggregate each level separately and join the results.
+
+  ## ON versus WHERE
+
+  For an **inner** join, a condition means the same thing in `ON` and in
+  `WHERE`. For an **outer** join it does not, and the difference is the single
+  most common join bug.
+
+  ```sql
+  -- keeps departments with no high earner
+  left join employees e on e.dept_id = d.dept_id and e.salary > 200000
+
+  -- silently becomes an inner join
+  left join employees e on e.dept_id = d.dept_id
+  where e.salary > 200000
+  ```
+
+  The second query produces the NULL-extended rows and then discards them,
+  because `NULL > 200000` is NULL, which is not true.
+
+  The rule that always works: conditions about **how rows match** go in `ON`;
+  conditions about **which result rows survive** go in `WHERE`. Needing a
+  genuine post-join filter on the outer side is rare, and when it happens it
+  needs `(cond OR right_table.key IS NULL)`.
+
+  ## Anti-joins
+
+  "Rows with no match" is a question joins answer well. Three spellings:
+
+  ```sql
+  -- LEFT JOIN / IS NULL
+  from customers c
+  left join orders o on o.customer_id = c.customer_id
+  where o.order_id is null
+
+  -- NOT EXISTS  (usually the clearest, and NULL-safe)
+  from customers c
+  where not exists (select 1 from orders o where o.customer_id = c.customer_id)
+
+  -- NOT IN  (dangerous when the subquery column is nullable)
+  ```
+
+  PostgreSQL recognises the first two and executes both as an **anti-join**, so
+  the choice is about readability and NULL-safety rather than speed. `NOT IN`
+  is the one to avoid; the EXISTS lesson explains why.
+
+  Note the `where o.order_id is null` in the first form: it must name a column
+  that is **NOT NULL in the right-hand table**, otherwise a genuine NULL in the
+  data is indistinguishable from a non-match.
+
+  ## USING and NATURAL JOIN
+
+  `USING (dept_id)` is shorthand for `ON a.dept_id = b.dept_id`, and it merges
+  the two columns into one in the output. It is tidy when the names genuinely
+  match.
+
+  `NATURAL JOIN` joins on *every* commonly-named column, automatically. Avoid
+  it: adding a `created_at` column to both tables silently changes the join
+  condition, and the query returns different rows with no change to its text.
+
+syntax:
+  - form: "FROM a JOIN b ON condition"
+    notes: INNER is the default and is usually omitted.
+  - form: "FROM a LEFT JOIN b ON condition"
+    notes: >-
+      Every row of `a` appears at least once. Columns of `b` are NULL where
+      there was no match.
+  - form: "FROM a FULL JOIN b ON condition"
+    notes: >-
+      Both sides preserved. Useful for reconciliation — what exists on one side
+      and not the other, in both directions at once.
+  - form: "FROM a JOIN b USING (col)"
+    notes: Equi-join on identically-named columns, merged into one output column.
+  - form: "FROM a LEFT JOIN b ON ... WHERE b.not_null_col IS NULL"
+    notes: >-
+      The anti-join idiom. The tested column must be non-nullable in `b`, or a
+      real NULL looks like a non-match.
+
+sampleTables: [employees, departments, customers, orders, order_items]
+
+examples:
+  - title: The four join types, counted
+    sql: |
+      select 'inner' as join_type,
+             count(*) as rows
+      from departments d
+      join employees e on e.dept_id = d.dept_id
+      union all
+      select 'left', count(*)
+      from departments d
+      left join employees e on e.dept_id = d.dept_id
+      union all
+      select 'right', count(*)
+      from departments d
+      right join employees e on e.dept_id = d.dept_id
+      union all
+      select 'full', count(*)
+      from departments d
+      full join employees e on e.dept_id = d.dept_id
+      order by join_type
+    walkthrough: |
+      Four numbers that tell the whole story. There are 6 departments and 40
+      employees. 38 employees have a department and 5 departments have
+      employees.
+
+      `inner` is 38 — only the matching pairs. `left` is 39: the same 38, plus
+      one row for Research, which has no employees. `right` is 40: the 38, plus
+      the two employees with no department. `full` is 41: all three groups at
+      once.
+
+      Those differences are small here and they are the entire semantics. On a
+      real table the same arithmetic explains a report that is short by
+      thousands of rows.
+
+  - title: A join that returns more rows than either table
+    sql: |
+      select (select count(*) from orders)                        as orders,
+             (select count(*) from order_items)                   as order_items,
+             (select count(*) from orders o
+                join order_items oi on oi.order_id = o.order_id)  as joined,
+             (select count(distinct o.order_id) from orders o
+                join order_items oi on oi.order_id = o.order_id)  as distinct_orders
+    walkthrough: |
+      The join produces 372 rows from a 151-row table and a 372-row table. Each
+      order appears once per line it contains.
+
+      `distinct_orders` is 151, which tells you something the raw counts do not:
+      every order has at least one line, so the inner join loses nothing here.
+      Had it come back lower, the difference would be orders with no lines —
+      silently dropped by the inner join and missing from any total computed
+      over it.
+
+      Those two numbers together are the check worth running every time you
+      aggregate over a join: the output row count tells you about fan-out, and
+      the distinct count of the driving key tells you whether anything was lost.
+      A number you cannot explain is a bug you have not found yet.
+
+  - title: The ON-versus-WHERE difference, side by side
+    sql: |
+      select d.dept_name,
+             count(*)                                   as rows_from_join,
+             count(e.emp_id)                            as matched_employees,
+             coalesce(max(e.salary), 0)                 as top_salary
+      from departments d
+      left join employees e
+             on e.dept_id = d.dept_id
+            and e.salary > 200000
+      group by d.dept_name
+      order by d.dept_name
+    walkthrough: |
+      All six departments appear, including the two with nobody earning over
+      200000 — they show `matched_employees = 0` and `top_salary = 0`.
+
+      Move `and e.salary > 200000` down into a `WHERE` clause and those two rows
+      vanish. The join still produces the NULL-extended rows; `WHERE` then
+      evaluates `NULL > 200000`, gets NULL, and drops them.
+
+      Note `count(e.emp_id)` rather than `count(*)`: the NULL-extended row is
+      still a row, so `count(*)` would report 1 for every empty department. The
+      two mistakes compound — an outer join with `count(*)` and a filter in
+      `WHERE` produces a report that is wrong in two directions.
+
+  - title: An anti-join, three ways
+    sql: |
+      select 'left join / is null' as method, count(*) as customers_with_no_orders
+      from customers c
+      left join orders o on o.customer_id = c.customer_id
+      where o.order_id is null
+      union all
+      select 'not exists', count(*)
+      from customers c
+      where not exists (select 1 from orders o where o.customer_id = c.customer_id)
+      union all
+      select 'except', count(*)
+      from (select customer_id from customers
+            except
+            select customer_id from orders) t
+    walkthrough: |
+      Three spellings, one answer. PostgreSQL plans the first two identically —
+      as an anti-join — so the choice is about what reads most clearly to the
+      next person.
+
+      `NOT EXISTS` is the one to default to. It states the question directly, it
+      is immune to the NULL problem that breaks `NOT IN`, and it does not depend
+      on picking a non-nullable column for the `IS NULL` test.
+
+      The `EXCEPT` form is included because it is sometimes the clearest when
+      the comparison is between two whole result sets rather than two tables,
+      but it deduplicates, which the others do not.
+
+edgeCases:
+  - title: FULL JOIN for reconciliation
+    body: >-
+      A FULL JOIN with an `IS NULL` test on each side finds rows present in one
+      input and absent from the other, in both directions, in one pass. This is
+      the standard shape of a reconciliation query — comparing two systems that
+      should agree — and it is the one case where FULL JOIN is clearly the right
+      tool rather than a curiosity.
+    sql: |
+      select coalesce(d.dept_id, e.dept_id)                 as dept_id,
+             d.dept_name,
+             count(e.emp_id)                                as employees,
+             bool_or(d.dept_id is null)                     as employee_without_department,
+             bool_or(e.emp_id is null)                      as department_without_employees
+      from departments d
+      full join employees e on e.dept_id = d.dept_id
+      group by coalesce(d.dept_id, e.dept_id), d.dept_name
+      order by dept_id nulls last
+
+  - title: Joining on a nullable column never matches the NULLs
+    body: >-
+      Join conditions use ordinary equality, and `NULL = NULL` is NULL, so rows
+      with a NULL key never match — not even each other. This is why the two
+      employees with no department vanish from an inner join, and why an outer
+      join is the only way to see them. `IS NOT DISTINCT FROM` can be used as a
+      join condition when matching NULLs to each other is genuinely wanted, at
+      the cost of index usage.
+    sql: |
+      select e.emp_id, e.first_name, e.dept_id, d.dept_name
+      from employees e
+      left join departments d on d.dept_id = e.dept_id
+      where e.dept_id is null
+      order by e.emp_id
+
+pitfalls:
+  - mistake: Filtering the outer side of a LEFT JOIN in WHERE
+    why: >-
+      The NULL-extended rows fail the filter and disappear, so the outer join
+      becomes an inner join. Nothing warns you; the result is just smaller.
+    fix: >-
+      Put the condition in ON. If it genuinely must run after the join, write
+      `(cond or right_table.pk is null)`.
+
+  - mistake: Using count(*) with an outer join
+    why: >-
+      The unmatched left rows are still rows, so every empty group counts as 1.
+      "Every department has at least one employee" is then a conclusion drawn
+      from an artefact.
+    fix: >-
+      Count a non-nullable column from the right-hand table. Use COALESCE around
+      sums for the same reason.
+
+  - mistake: Aggregating over a join without checking fan-out
+    why: >-
+      Joining a one-row-per-order table to a many-rows-per-order table repeats
+      the order-level values, so sums are multiplied by the line count. The
+      figure is plausible and too big, which is the worst combination.
+    fix: >-
+      Aggregate each grain in its own CTE and join the aggregates, or confirm
+      the join key is unique on the other side before aggregating.
+
+  - mistake: Using NATURAL JOIN
+    why: >-
+      It joins on every column the two tables happen to share. Adding a
+      `created_at` or `updated_at` column to both silently adds it to the join
+      condition, and the query starts returning different rows without being
+      edited.
+    fix: >-
+      Write the ON clause out, or use USING with an explicit column list.
+
+performance: |
+  PostgreSQL has three join algorithms and chooses between them:
+
+  - **Nested loop** — for each outer row, look up matching inner rows. Best when
+    the outer side is small and the inner side is indexed on the join key.
+  - **Hash join** — build a hash table on the smaller side, probe with the
+    larger. Best for large unindexed equi-joins. Needs memory; spills to disk
+    when the hash exceeds `work_mem`.
+  - **Merge join** — sort both sides and walk them together. Best when both
+    inputs are already sorted on the join key, usually from an index.
+
+  An index on the **foreign-key side** is what makes nested-loop joins fast, and
+  PostgreSQL does not create one automatically — it indexes primary keys and
+  unique constraints only. A missing index on a foreign key is one of the most
+  common and most easily fixed causes of a slow join.
+
+  Anti-joins written as `NOT EXISTS` or `LEFT JOIN ... IS NULL` are both
+  recognised and planned as a true anti-join, which can stop as soon as one
+  match is found.
+
+interviewQuestions:
+  - question: What is the difference between a LEFT JOIN and an INNER JOIN?
+    answer: >-
+      An inner join returns only pairs that matched. A left join returns every
+      row of the left table at least once, filling the right-hand columns with
+      NULL where nothing matched. The practical consequence is that a left join
+      never loses left-hand rows, which is what makes it correct for "show every
+      category, including the empty ones". The cost is that the result contains
+      NULLs that must be handled — count a right-hand column rather than using
+      count(*), and COALESCE any sums.
+
+  - question: Why does putting a condition on the right table in WHERE break a LEFT JOIN?
+    answer: >-
+      Because of the evaluation order. The join runs first and produces
+      NULL-extended rows for unmatched left rows; WHERE then tests those rows,
+      and any comparison against the NULL columns evaluates to NULL rather than
+      true, so they are dropped. The result is identical to an inner join. The
+      condition belongs in ON, where it participates in matching rather than in
+      filtering. For inner joins the two placements are equivalent, which is how
+      the habit forms in the wrong direction.
+
+  - question: How can a join return more rows than both tables combined?
+    answer: >-
+      When the join key is not unique on either side, every matching pair
+      produces a row, so the output is the sum over keys of left-count times
+      right-count. Three left rows and four right rows with the same key give
+      twelve output rows. This fan-out is the mechanism behind inflated sums in
+      reports that aggregate across several one-to-many relationships at once.
+      The defence is to aggregate each grain separately before joining.
+
+  - question: How do you find rows in one table with no match in another?
+    answer: >-
+      `NOT EXISTS` with a correlated subquery is the clearest and is NULL-safe.
+      `LEFT JOIN ... WHERE right.not_null_column IS NULL` is equivalent and
+      plans the same way in PostgreSQL, but requires choosing a column that
+      cannot be NULL in the data. `NOT IN` is the one to avoid, because a single
+      NULL in the subquery makes the predicate unsatisfiable and the query
+      returns nothing. `EXCEPT` works when comparing whole result sets, but it
+      also deduplicates.
+
+exercises:
+  - prompt: >-
+      List every department with its employee count, including departments with
+      none. Columns dept_name, employees. Order by employees descending then
+      dept_name.
+    difficulty: Easy
+    hint: >-
+      LEFT JOIN from departments, and count a column from employees rather than
+      count(*).
+    solutionSql: |
+      select d.dept_name,
+             count(e.emp_id) as employees
+      from departments d
+      left join employees e on e.dept_id = d.dept_id
+      group by d.dept_name
+      order by employees desc, d.dept_name
+
+  - prompt: >-
+      Find every customer who has never placed an order. Return customer_id and
+      company_name, ordered by customer_id. Use NOT EXISTS.
+    difficulty: Easy
+    hint: >-
+      The correlated subquery needs no select list of consequence — `select 1`
+      is conventional.
+    solutionSql: |
+      select c.customer_id, c.company_name
+      from customers c
+      where not exists (
+            select 1 from orders o
+            where o.customer_id = c.customer_id)
+      order by c.customer_id
+
+  - prompt: >-
+      For each order placed in January 2023, show order_id, the customer's
+      company name, the number of line items, and the line revenue total
+      rounded to 2 decimals — including orders that have no line items at all.
+      Columns order_id, company_name, lines, revenue. Order by order_id.
+    difficulty: Medium
+    hint: >-
+      Inner join to customers (every order has one) and LEFT JOIN to
+      order_items. Count order_items.product_id and COALESCE the sum.
+    solutionSql: |
+      select o.order_id,
+             c.company_name,
+             count(oi.product_id)                                            as lines,
+             coalesce(round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2), 0) as revenue
+      from orders o
+      join customers c       on c.customer_id = o.customer_id
+      left join order_items oi on oi.order_id = o.order_id
+      where o.order_date >= date '2023-01-01'
+        and o.order_date <  date '2023-02-01'
+      group by o.order_id, c.company_name
+      order by o.order_id
+
+checklist:
+  - "INNER drops unmatched rows on both sides; LEFT keeps the left; FULL keeps both"
+  - A join multiplies by the number of matches, so it can return more rows than either table
+  - ON controls matching, WHERE controls survival — the distinction only matters for outer joins
+  - A filter on the outer side placed in WHERE converts the join to an inner join
+  - "With an outer join, count a right-hand column and COALESCE the sums"
+  - "Joins use ordinary equality, so NULL keys never match — not even each other"
+  - "NOT EXISTS is the default anti-join: clear, NULL-safe and planned as an anti-join"
+  - Avoid NATURAL JOIN — its condition changes when the schema does
+
+related:
+  - f-logical-order
+  - j-self-cross
+  - j-exists-in
+  - p06-customers-who-never-ordered
+
+dialect:
+  standard: >-
+    All four join types, ON, USING and NATURAL JOIN are standard SQL. So is the
+    rule that an outer join's ON clause affects matching rather than filtering.
+  postgres: >-
+    Supports all join types including FULL OUTER, plans NOT EXISTS and LEFT
+    JOIN/IS NULL as anti-joins, and adds LATERAL joins. Does not index foreign
+    keys automatically — only primary keys and unique constraints.
+  mysql: >-
+    Has no FULL OUTER JOIN; it is emulated with a UNION of a LEFT and a RIGHT
+    join. InnoDB creates an index on every foreign key automatically, so the
+    "missing FK index" problem does not arise there — which means advice from
+    MySQL experience does not transfer to PostgreSQL. MySQL also historically
+    lacked hash joins, relying on nested loops, which made join-order and
+    index choices far more critical.

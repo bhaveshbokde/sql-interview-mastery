@@ -1,0 +1,257 @@
+id: p04-employees-earning-more-than-manager
+position: 40
+title: Employees earning more than their manager
+slug: employees-earning-more-than-manager
+difficulty: Easy
+topic: Joins
+tags: [self-join, hierarchy, classic, null-handling]
+
+source:
+  name: LeetCode 181 — Employees Earning More Than Their Managers
+  url: https://leetcode.com/problems/employees-earning-more-than-their-managers/
+
+orderSensitive: false
+
+statement: |
+  Return every employee who earns strictly more than their direct manager,
+  with both salaries and the difference.
+
+  An employee with no manager has nothing to compare against and must not
+  appear.
+
+tables: [employees]
+
+expectedColumns: [employee, employee_salary, manager, manager_salary, difference]
+
+edgeCases:
+  - >-
+    The CEO has a NULL manager_id. The comparison is undefined rather than
+    false, and an inner join handles that correctly without a special case.
+  - Equal salaries do not qualify — the comparison is strict.
+  - >-
+    An employee whose manager_id points at a row that no longer exists would
+    also drop out of an inner join. A foreign key prevents that here.
+  - >-
+    "Manager" means direct manager. An employee out-earning their skip-level
+    manager but not their direct one does not qualify.
+
+hints:
+  - The same table has to appear twice, under two different aliases.
+  - Join the employee's manager_id to the manager's emp_id, not the reverse.
+  - Think about whether the join should be inner or outer, and why.
+
+solutionSql: |
+  select e.first_name || ' ' || e.last_name as employee,
+         e.salary                           as employee_salary,
+         m.first_name || ' ' || m.last_name as manager,
+         m.salary                           as manager_salary,
+         e.salary - m.salary                as difference
+  from employees e
+  join employees m on m.emp_id = e.manager_id
+  where e.salary > m.salary
+  order by difference desc, employee
+
+explanation:
+  lineByLine:
+    - clause: "from employees e join employees m"
+      note: >-
+        The same table twice. The aliases are not optional — without them
+        every column reference is ambiguous and the statement will not parse.
+    - clause: "on m.emp_id = e.manager_id"
+      note: >-
+        The direction matters. `e` is the employee and `m` is their manager, so
+        the employee's manager_id must match the manager's emp_id. Reversing it
+        gives each manager joined to their reports, which answers a different
+        question.
+    - clause: "where e.salary > m.salary"
+      note: >-
+        Strictly greater, so equal salaries are excluded. If the question
+        meant "at least as much", this is the one character that changes.
+    - clause: "join rather than left join"
+      note: >-
+        An employee with no manager produces no match, and an inner join drops
+        them — which is correct, because "earns more than their manager" is
+        undefined when there is no manager, not false.
+
+  walkthrough: |
+    The join pairs each employee with the row their `manager_id` points at.
+    The CEO's `manager_id` is NULL, which matches nothing, so she is dropped
+    by the join before the WHERE clause is reached.
+
+    Two employees qualify. Daniel Fernandes, the Enterprise Account Lead on
+    251000, reports to Neha Kulkarni, VP Sales on 238000 — a difference of
+    13000. Meera Iyer, Brand Director on 211000, reports to Imran Qureshi, VP
+    Marketing on 205000 — a difference of 6000.
+
+    Both are plausible in a real organisation: a high-performing individual
+    contributor on commission can out-earn their line manager. That is the
+    reason the question is asked of data rather than treated as an anomaly to
+    be corrected.
+
+  alternatives:
+    - title: Correlated subquery
+      sql: |
+        select e.first_name || ' ' || e.last_name as employee,
+               e.salary                           as employee_salary,
+               (select m.first_name || ' ' || m.last_name
+                from employees m where m.emp_id = e.manager_id) as manager,
+               (select m.salary from employees m where m.emp_id = e.manager_id) as manager_salary,
+               e.salary - (select m.salary from employees m where m.emp_id = e.manager_id) as difference
+        from employees e
+        where e.salary > (select m.salary from employees m where m.emp_id = e.manager_id)
+        order by difference desc, employee
+      when: >-
+        Never, for this question. It is shown because candidates often reach
+        for it first — it executes four correlated lookups per row where the
+        join does one pass, and it is harder to read. It is equivalent because
+        a scalar subquery over a primary key cannot return more than one row.
+      equivalent: true
+
+    - title: Window function over the manager's partition
+      sql: |
+        select employee, employee_salary, manager, manager_salary, difference
+        from (
+            select e.first_name || ' ' || e.last_name as employee,
+                   e.salary                           as employee_salary,
+                   m.first_name || ' ' || m.last_name as manager,
+                   m.salary                           as manager_salary,
+                   e.salary - m.salary                as difference,
+                   rank() over (partition by m.emp_id order by e.salary desc) as rank_in_team
+            from employees e
+            join employees m on m.emp_id = e.manager_id
+        ) t
+        where difference > 0
+        order by difference desc, employee
+      when: >-
+        When the question extends to "and where do they rank within their
+        manager's team", which is the usual follow-up. The extra column comes
+        free once the join is written.
+      equivalent: true
+
+  performance: |
+    A self join is an ordinary join. The index that matters is on the column
+    being joined **to** — here `employees.emp_id`, which is the primary key and
+    therefore already indexed, so the plan is a hash join or a nested loop with
+    an index scan depending on table size.
+
+    `idx_employees_manager` on `manager_id` exists in this schema and helps the
+    reverse direction — finding an employee's reports — rather than this query.
+    It is worth knowing which of the two indexes a given self join actually
+    uses, because the answer is often not the one that seems related.
+
+    The correlated-subquery alternative executes four lookups per employee.
+    Each is a primary-key probe and therefore cheap, but four times forty
+    thousand probes is not, and the planner cannot always collapse them into
+    one join.
+
+  wrongApproaches:
+    - title: Joining in the wrong direction
+      sql: |
+        select m.first_name || ' ' || m.last_name as employee,
+               m.salary                           as employee_salary,
+               e.first_name || ' ' || e.last_name as manager,
+               e.salary                           as manager_salary,
+               m.salary - e.salary                as difference
+        from employees e
+        join employees m on m.manager_id = e.emp_id
+        where m.salary > e.salary
+        order by difference desc, employee
+      whyWrong: >-
+        This joins each employee to their **reports** rather than to their
+        manager, so the aliases mean the opposite of what they say. It happens
+        to produce the same two pairs here because the relation is symmetric
+        when you swap the labels — which is exactly what makes the mistake hard
+        to spot. The column meanings are wrong even when the rows are right.
+
+    - title: LEFT JOIN, which lets the CEO through the join
+      sql: |
+        select e.first_name || ' ' || e.last_name as employee,
+               e.salary                           as employee_salary,
+               coalesce(m.first_name || ' ' || m.last_name, '(no manager)') as manager,
+               m.salary                           as manager_salary,
+               e.salary - coalesce(m.salary, 0)   as difference
+        from employees e
+        left join employees m on m.emp_id = e.manager_id
+        where e.salary > coalesce(m.salary, 0)
+        order by difference desc, employee
+      whyWrong: >-
+        `coalesce(m.salary, 0)` treats a missing manager as earning zero, so
+        the CEO qualifies as out-earning a manager who does not exist. The
+        substitution turns an undefined comparison into a false one, and
+        false-but-plausible is the worst kind of answer.
+
+  extraTests:
+    - name: Flat hierarchy with equal salaries (alternate dataset)
+      schema: learning_alt
+      note: >-
+        In learning_alt, Alan Turing earns exactly the same as Ada Lovelace,
+        his manager, and Edsger Dijkstra exactly the same as Grace Hopper.
+        A strict `>` correctly returns nobody, which confirms the comparison is
+        strict rather than `>=`.
+      sql: |
+        select e.first_name || ' ' || e.last_name as employee,
+               e.salary                           as employee_salary,
+               m.first_name || ' ' || m.last_name as manager,
+               m.salary                           as manager_salary,
+               e.salary - m.salary                as difference
+        from employees e
+        join employees m on m.emp_id = e.manager_id
+        where e.salary > m.salary
+        order by difference desc, employee
+
+    - name: How many rows each join direction produces
+      schema: learning
+      note: >-
+        The inner join produces 39 rows — every employee except the CEO, whose
+        NULL manager_id matches nothing. Confirming the row count before
+        applying the filter is the quickest way to check a self join is
+        oriented correctly.
+      sql: |
+        select count(*)                                   as joined_rows,
+               (select count(*) from employees)           as all_employees,
+               (select count(*) from employees
+                where manager_id is null)                 as without_manager
+        from employees e
+        join employees m on m.emp_id = e.manager_id
+
+  followUps:
+    - question: How would you find employees earning more than anyone in their management chain?
+      answer: >-
+        A recursive CTE that walks upwards from each employee collecting every
+        ancestor's salary, then a comparison against the maximum of those. The
+        anchor is the employee paired with their direct manager and the
+        recursive term climbs one level per iteration, terminating at the NULL
+        manager_id. It is substantially more work than the single self join,
+        which is the point of asking it as a follow-up.
+
+    - question: How would you include the CEO with a NULL comparison instead of excluding her?
+      answer: >-
+        Use a LEFT JOIN and leave `m.salary` as NULL rather than coalescing it,
+        then filter with `e.salary > m.salary` — which is NULL for the CEO and
+        therefore not true, so she is excluded from the result but visible in
+        an unfiltered version. The distinction matters when the output is a
+        report that should show every employee with a blank in the comparison
+        column rather than omitting them.
+
+    - question: What if managers and employees were in separate tables?
+      answer: >-
+        Nothing about the logic changes — it stops being a self join and
+        becomes an ordinary one. The self join is an artefact of the adjacency
+        list storing the hierarchy in one table, not of the question. It is
+        worth saying this explicitly in an interview, because it shows the
+        self join is understood as a storage consequence rather than a
+        technique in itself.
+
+    - question: How would you rank each employee against their team's average?
+      answer: >-
+        `avg(salary) over (partition by manager_id)` gives each employee their
+        team's average without a join at all, because the team is defined by
+        the shared manager_id. That is often the better tool when the
+        comparison is against a group statistic rather than against one
+        specific row, and it is one pass rather than two.
+
+  related:
+    - j-self-cross
+    - j-inner-outer
+    - f-nulls
+    - i-recursive-cte

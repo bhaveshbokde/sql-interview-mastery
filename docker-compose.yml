@@ -1,0 +1,105 @@
+# Local startup with Docker.
+#
+#   docker compose up -d db     # just PostgreSQL, run the app from your IDE
+#   docker compose up           # everything
+#
+# WHY THE DATABASE IS A SEPARATE PROFILE FROM THE APP
+# ---------------------------------------------------
+# Most of the time you want the database in a container and the backend in
+# your IDE with a debugger attached. `up -d db` does exactly that and is the
+# common case; the full stack is for checking that a fresh clone starts.
+#
+# WHY THIS IS NOT THE ONLY WAY TO RUN IT
+# --------------------------------------
+# Docker is not usable on every machine — an unreachable daemon socket is
+# enough to stop `docker compose up`, and on a locked-down laptop that is not
+# something you can fix. So scripts/db.sh runs an identical PostgreSQL 16
+# cluster entirely in the user's home directory with no root and no Docker,
+# and the README documents both. Neither path is the "real" one.
+#
+# Port 5433 is published rather than 5432 so this cannot collide with a
+# system PostgreSQL, which is a thing developers have and forget about.
+
+name: sql-interview-mastery
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: sqlmastery-db
+    environment:
+      POSTGRES_USER: sqlmastery_admin
+      # Used only to bootstrap the container. The application and learner
+      # roles are created by scripts/provision-db.sh with generated
+      # passwords, and neither of them is this one.
+      POSTGRES_PASSWORD: ${SQLMASTERY_BOOTSTRAP_PASSWORD:-bootstrap-only-change-me}
+      POSTGRES_DB: sqlmastery_db
+      # Deterministic collation, so ORDER BY on text sorts the same here as
+      # it does for everyone else. Without this the container inherits the
+      # host locale and two developers get different lesson output.
+      LANG: C.UTF-8
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C.UTF-8'
+    ports:
+      - '5433:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Creates the roles and the test database on first start, so the
+      # container is usable without running the provisioning script. It is
+      # idempotent and is ignored on subsequent starts.
+      - ./scripts/docker-initdb.sql:/docker-entrypoint-initdb.d/10-roles.sql:ro
+    healthcheck:
+      # The app waits for this rather than for the port, because PostgreSQL
+      # opens the port before it is ready to accept queries and a backend
+      # that connects in that window fails its first migration.
+      test: ['CMD-SHELL', 'pg_isready -U sqlmastery_admin -d sqlmastery_db']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sqlmastery-backend
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SQLMASTERY_DB_HOST: db
+      SQLMASTERY_DB_PORT: '5432'
+      SQLMASTERY_DB_NAME: sqlmastery_db
+      SQLMASTERY_TEST_DB_NAME: sqlmastery_test_db
+      SQLMASTERY_APP_USERNAME: sqlmastery_app
+      SQLMASTERY_APP_PASSWORD: ${SQLMASTERY_APP_PASSWORD:-compose-app-password}
+      SQLMASTERY_LEARNER_USERNAME: sqlmastery_learner
+      SQLMASTERY_LEARNER_PASSWORD: ${SQLMASTERY_LEARNER_PASSWORD:-compose-learner-password}
+      SQLMASTERY_SERVER_PORT: '8085'
+      # The frontend container serves on 5173 and the browser talks to it
+      # from the host, so the origin the backend sees is the host's.
+      SQLMASTERY_CORS_ALLOWED_ORIGINS: 'http://localhost:5173,http://127.0.0.1:5173'
+    ports:
+      - '8085:8085'
+    healthcheck:
+      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:8085/actuator/health']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sqlmastery-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - '5173:80'
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    name: sqlmastery-pgdata

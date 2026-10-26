@@ -1,0 +1,261 @@
+id: p01-second-highest-salary
+position: 10
+title: Second-highest salary
+slug: second-highest-salary
+difficulty: Easy
+topic: Window functions
+tags: [ranking, dense-rank, ties, classic]
+
+source:
+  name: LeetCode 176 — Second Highest Salary
+  url: https://leetcode.com/problems/second-highest-salary/
+
+orderSensitive: false
+
+statement: |
+  Return the second-highest **distinct** salary in the company, together with
+  every employee who earns it.
+
+  "Second highest" means the second distinct salary value, not the second row
+  when sorted. If two people share the top salary, the second-highest value is
+  the next value below it — and both of them are top earners, not runners-up.
+
+  If there is no second distinct salary, return no rows.
+
+tables: [employees]
+
+expectedColumns: [salary, full_name]
+
+edgeCases:
+  - Several employees may share the second-highest salary — return all of them.
+  - >-
+    Ties at the **top** change the answer — with two people on the highest
+    salary, the second-highest value is still the next one down.
+  - A table with only one distinct salary has no answer. Decide whether that
+    should be no rows or a single NULL row, and say which your query produces.
+  - NULL salaries cannot occur here, since the column is NOT NULL — but a
+    nullable salary column would need thinking about, since aggregates skip
+    NULLs and comparisons with them are never true.
+
+hints:
+  - The three ranking functions differ only in how they treat ties. Which one
+    numbers *distinct values* rather than rows?
+  - A window function cannot be filtered in WHERE. Compute the rank in a CTE
+    and filter in the outer query.
+  - Think about what your answer does when two people share the top salary.
+    Try it against the alternate dataset, where that is exactly the case.
+
+solutionSql: |
+  with ranked as (
+      select salary,
+             first_name || ' ' || last_name as full_name,
+             dense_rank() over (order by salary desc) as rnk
+      from employees
+  )
+  select salary, full_name
+  from ranked
+  where rnk = 2
+  order by full_name
+
+explanation:
+  lineByLine:
+    - clause: "dense_rank() over (order by salary desc)"
+      note: >-
+        Numbers distinct salary values from the top. Ties share a number and
+        nothing is skipped, so the second distinct value is always rank 2 —
+        which is exactly what the question asks for.
+    - clause: "with ranked as (...)"
+      note: >-
+        The rank has to be computed before it can be filtered, because window
+        functions are evaluated after WHERE. This two-step shape is forced by
+        the language rather than chosen.
+    - clause: "where rnk = 2"
+      note: >-
+        Selects every row at the second distinct value. If three people share
+        it, all three come back, which the question requires.
+    - clause: "order by full_name"
+      note: >-
+        Row order is not part of the answer, but a deterministic order makes
+        the result reproducible and comparable.
+
+  walkthrough: |
+    The distinct salaries in descending order begin 320000, 251000, 245000,
+    238000, 212000. `DENSE_RANK` assigns 1 to 320000 and 2 to 251000.
+
+    Only Daniel Fernandes earns 251000, so one row comes back. That is a
+    property of this data and not of the query — had two people been on
+    251000, both would be returned, and the query needs no change for that.
+
+    The reason the question is asked so often is that three plausible answers
+    disagree the moment there is a tie at the top, and only one of them is
+    right.
+
+  alternatives:
+    - title: Max of the salaries below the max
+      sql: |
+        select max(salary) as salary,
+               (select string_agg(first_name || ' ' || last_name, ', ' order by last_name)
+                from employees
+                where salary = (select max(salary) from employees
+                                where salary < (select max(salary) from employees))) as full_name
+        from employees
+        where salary < (select max(salary) from employees)
+      when: >-
+        When window functions are unavailable, or when the interviewer asks for
+        a version without them. Note that it returns a single NULL row rather
+        than no rows when there is no second salary, which is a real behavioural
+        difference worth stating.
+      equivalent: false
+
+    - title: OFFSET over distinct salaries
+      sql: |
+        select d.salary,
+               e.first_name || ' ' || e.last_name as full_name
+        from (select distinct salary from employees order by salary desc offset 1 limit 1) d
+        join employees e on e.salary = d.salary
+        order by full_name
+      when: >-
+        Short and readable. Correct here because DISTINCT is applied before the
+        OFFSET, so ties at the top collapse to one row first. The same query
+        without DISTINCT is the classic wrong answer.
+      equivalent: true
+
+  performance: |
+    The window-function solution sorts the whole table once. On a large
+    employees table that is the dominant cost, and an index on `salary` can
+    supply the order and remove the sort.
+
+    The `max`-based alternative does two or three separate scans but each can
+    be answered from the end of an index on `salary` in constant time, so on a
+    very large table with that index it is actually the cheaper plan. This is a
+    rare case where the less elegant answer wins on cost, and it is worth
+    saying so rather than defending the window function on performance grounds
+    it does not have.
+
+    Neither approach can avoid reading the table at least once without an index
+    on `salary`.
+
+  wrongApproaches:
+    - title: "ORDER BY salary DESC LIMIT 1 OFFSET 1"
+      sql: |
+        select salary,
+               first_name || ' ' || last_name as full_name
+        from employees
+        order by salary desc, emp_id
+        limit 1 offset 1
+      whyWrong: >-
+        Skips the second **row**, not the second distinct **value**. With two
+        employees on the top salary it returns the other top earner, which is
+        the wrong answer to the question asked. It also returns only one row
+        when several people share the second-highest salary. It happens to be
+        right on this dataset, which is precisely why it survives review.
+
+    - title: "ROW_NUMBER() = 2"
+      sql: |
+        with ranked as (
+            select salary,
+                   first_name || ' ' || last_name as full_name,
+                   row_number() over (order by salary desc, emp_id) as rn
+            from employees
+        )
+        select salary, full_name from ranked where rn = 2
+      whyWrong: >-
+        Identical problem to OFFSET, written with a window function.
+        ROW_NUMBER numbers rows, so a tie at the top pushes the real
+        second-highest value out of position 2 and the query returns another
+        top earner.
+
+    - title: "RANK() = 2"
+      sql: |
+        with ranked as (
+            select salary,
+                   first_name || ' ' || last_name as full_name,
+                   rank() over (order by salary desc) as rnk
+            from employees
+        )
+        select salary, full_name from ranked where rnk = 2
+      whyWrong: >-
+        RANK skips after a tie, so if two employees share the top salary there
+        is no rank 2 at all and the query returns **nothing**. Returning an
+        empty result for a question that has an answer is worse than returning
+        the wrong row, because it looks like missing data.
+
+  extraTests:
+    - name: Ties at the top (alternate dataset)
+      schema: learning_alt
+      note: >-
+        Ada Lovelace and Alan Turing both earn 180000. DENSE_RANK puts both at
+        rank 1 and returns the genuine runner-up at rank 2. The OFFSET,
+        ROW_NUMBER and RANK versions all give a different answer here, which is
+        the whole point of the problem.
+      sql: |
+        with ranked as (
+            select salary,
+                   first_name || ' ' || last_name as full_name,
+                   dense_rank() over (order by salary desc) as rnk
+            from employees
+        )
+        select salary, full_name
+        from ranked
+        where rnk = 2
+        order by full_name
+
+    - name: What RANK returns on the same tied data
+      schema: learning_alt
+      note: >-
+        Run for contrast: rank 2 is skipped entirely because two rows occupy
+        ranks 1 and 2, so this returns no rows at all on data where the
+        question does have an answer.
+      sql: |
+        with ranked as (
+            select salary,
+                   first_name || ' ' || last_name as full_name,
+                   rank() over (order by salary desc) as rnk
+            from employees
+        )
+        select salary, full_name
+        from ranked
+        where rnk = 2
+        order by full_name
+
+  followUps:
+    - question: How would you generalise this to the Nth highest salary?
+      answer: >-
+        Replace the literal 2 with a parameter — `where rnk = ?` — and nothing
+        else changes, which is one of the advantages of the DENSE_RANK form
+        over OFFSET. The OFFSET version generalises to `OFFSET n-1 LIMIT 1`
+        over a DISTINCT subquery, and still returns one row rather than all the
+        rows sharing that salary. Be explicit about what happens when N exceeds
+        the number of distinct salaries: the rank version returns no rows,
+        which is usually the honest answer.
+
+    - question: What if the question asked for the second-highest salary per department?
+      answer: >-
+        Add `partition by dept_id` to the window. The CTE then ranks within
+        each department independently and the outer filter still reads
+        `where rnk = 2`. That is the standard top-N-per-group shape, and the
+        fact that it needs only a partition clause is the main argument for
+        learning the window-function form first.
+
+    - question: How would you handle a nullable salary column?
+      answer: >-
+        DENSE_RANK with `ORDER BY salary DESC` puts NULLs first by default in
+        PostgreSQL, so an employee with an unknown salary would occupy rank 1
+        and shift everything. Either add `NULLS LAST` to the window's ORDER BY
+        or filter with `where salary is not null`. The second states the intent
+        more clearly: an unknown salary is not a candidate for the
+        second-highest.
+
+    - question: Would an index help?
+      answer: >-
+        An index on `salary` lets the window function's sort be satisfied by an
+        index scan, removing the Sort node. It helps the max-based alternative
+        far more, because `max(salary)` can be read from the end of the index
+        in constant time — so with the index the alternative becomes
+        substantially cheaper than the window version on a large table.
+
+  related:
+    - w-ranking
+    - w-top-n-per-group
+    - f-sorting-paging
+    - p02-nth-highest-salary

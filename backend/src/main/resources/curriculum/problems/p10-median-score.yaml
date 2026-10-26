@@ -1,0 +1,304 @@
+id: p10-median-score
+position: 100
+title: Median score per subject
+slug: median-score
+difficulty: Medium
+topic: Aggregation
+tags: [median, percentile, ordered-set-aggregate, odd-and-even]
+
+orderSensitive: false
+
+statement: |
+  For each subject in `exam_scores`, return the number of students, the mean
+  score and the median.
+
+  The median of an even number of values is the mean of the two middle ones;
+  of an odd number, the middle one. Return both the interpolated median
+  (`percentile_cont`) and the nearest actual observed value
+  (`percentile_disc`), because they differ and the difference matters.
+
+tables: [exam_scores]
+
+expectedColumns: [subject, students, mean_score, median_cont, median_disc, spread]
+
+edgeCases:
+  - >-
+    Mathematics has nine students (odd) and Chemistry eight (even), so both
+    cases are exercised by the same query.
+  - >-
+    `percentile_cont` interpolates and can return a value nobody scored;
+    `percentile_disc` returns an actual observation.
+  - >-
+    SQL has no `median()` function. Writing one is a legitimate answer and is
+    not the expected one.
+  - Ties around the middle do not affect either function, but they do affect
+    hand-rolled row-numbering solutions.
+
+hints:
+  - PostgreSQL has an ordered-set aggregate for this. It uses WITHIN GROUP.
+  - >-
+    There are two percentile functions and they answer slightly different
+    questions.
+  - >-
+    The hand-rolled version needs to handle an even count, which is where
+    most attempts go wrong.
+
+solutionSql: |
+  select subject,
+         count(*)                                                              as students,
+         round(avg(score), 2)                                                  as mean_score,
+         round(percentile_cont(0.5) within group (order by score)::numeric, 2) as median_cont,
+         percentile_disc(0.5) within group (order by score)                    as median_disc,
+         max(score) - min(score)                                               as spread
+  from exam_scores
+  group by subject
+  order by subject
+
+explanation:
+  lineByLine:
+    - clause: "percentile_cont(0.5) within group (order by score)"
+      note: >-
+        An ordered-set aggregate. The `within group (order by ...)` clause is
+        not optional — a percentile is meaningless without an ordering, so
+        the grammar requires it. 0.5 is the median; 0.25 and 0.75 give the
+        quartiles.
+    - clause: "::numeric before round"
+      note: >-
+        `percentile_cont` returns double precision, and the two-argument
+        `round` exists only for numeric. Without the cast PostgreSQL reports
+        that `round(double precision, integer)` does not exist, which is a
+        confusing message for a type mismatch.
+    - clause: "percentile_disc(0.5) within group (order by score)"
+      note: >-
+        Returns an actual value from the data rather than interpolating. For
+        an even count it takes the lower of the two middle values rather than
+        averaging them, which is why the two columns differ.
+    - clause: "group by subject"
+      note: >-
+        Ordered-set aggregates group exactly like any other aggregate, so the
+        median is computed independently per subject.
+
+  walkthrough: |
+    Mathematics has nine scores, so there is a single middle value and both
+    percentile functions return it.
+
+    Chemistry has eight. Sorted, the two middle values differ, so
+    `percentile_cont` averages them and `percentile_disc` returns the lower
+    one. That is the distinction the question is really about: the two columns
+    disagree on even-sized groups and agree on odd-sized ones.
+
+    Physics has ten scores including a tie at 74. Ties do not trouble either
+    function — they operate on the sorted sequence of values, and a repeated
+    value simply occupies two positions.
+
+    Compare `mean_score` with the medians. Where they diverge, the
+    distribution is skewed, which is the reason the median is asked for at
+    all.
+
+  alternatives:
+    - title: Hand-rolled with ROW_NUMBER, handling both parities
+      sql: |
+        with numbered as (
+            select subject,
+                   score,
+                   row_number() over (partition by subject order by score) as rn,
+                   count(*)     over (partition by subject)                as n
+            from exam_scores
+        )
+        select subject,
+               max(n)                 as students,
+               round(avg(score), 2)   as median_manual
+        from numbered
+        where rn in ((n + 1) / 2, (n + 2) / 2)
+        group by subject
+        order by subject
+      when: >-
+        On a database without ordered-set aggregates. The `(n+1)/2` and
+        `(n+2)/2` pair is the standard trick: with integer division both
+        expressions give the same middle row for an odd count and the two
+        middle rows for an even one, so averaging handles both cases without
+        a CASE.
+      equivalent: true
+
+    - title: Several percentiles at once
+      sql: |
+        select subject,
+               count(*)                                                                as students,
+               round(percentile_cont(0.25) within group (order by score)::numeric, 2)  as q1,
+               round(percentile_cont(0.50) within group (order by score)::numeric, 2)  as median,
+               round(percentile_cont(0.75) within group (order by score)::numeric, 2)  as q3,
+               round((percentile_cont(0.75) within group (order by score)
+                    - percentile_cont(0.25) within group (order by score))::numeric, 2) as iqr
+        from exam_scores
+        group by subject
+        order by subject
+      when: >-
+        Whenever the median is wanted, really — quartiles and the
+        interquartile range describe a distribution far better than a median
+        alone, and they cost nothing extra because each is one more
+        ordered-set aggregate over the same sorted input.
+      equivalent: false
+
+  performance: |
+    An ordered-set aggregate must materialise and sort each group's values, so
+    it cannot be computed incrementally the way `sum` or `avg` can. On a large
+    table this is the expensive part, and an index on `(subject, score)`
+    supplies the ordering so the sort can be skipped.
+
+    Several percentiles over the **same** `within group (order by ...)` share
+    one sort, which is why asking for the quartiles alongside the median is
+    nearly free. Percentiles over different orderings need separate sorts.
+
+    The hand-rolled ROW_NUMBER version also sorts, so the two are comparable
+    in cost; the ordered-set aggregate is shorter and harder to get wrong.
+
+    For an approximate median over a very large table, `percentile_disc` on a
+    `TABLESAMPLE`d subset is a reasonable trade, and for a true streaming
+    approximation the `tdigest` extension exists.
+
+  wrongApproaches:
+    - title: Taking the average and calling it the median
+      sql: |
+        select subject,
+               count(*)             as students,
+               round(avg(score), 2) as not_the_median
+        from exam_scores
+        group by subject
+        order by subject
+      whyWrong: >-
+        The mean and the median coincide only for a symmetric distribution.
+        The whole reason to ask for a median is that it resists outliers and
+        the mean does not — so substituting one for the other removes the
+        property that motivated the question.
+
+    - title: "LIMIT 1 OFFSET n/2, which fails on even counts"
+      sql: |
+        select subject,
+               count(*) as students,
+               min(score) filter (where score is not null) as lowest
+        from exam_scores
+        group by subject
+        order by subject
+      whyWrong: >-
+        The offset approach cannot be expressed per group in a single grouped
+        query at all — it needs a lateral subquery per subject — and even then
+        it returns one row, so an even-sized group gets one of the two middle
+        values rather than their mean. The query shown here is what people
+        fall back to when that does not work, and it answers a different
+        question entirely.
+
+    - title: Averaging only the single middle row
+      sql: |
+        with numbered as (
+            select subject, score,
+                   row_number() over (partition by subject order by score) as rn,
+                   count(*)     over (partition by subject)                as n
+            from exam_scores
+        )
+        select subject, max(n) as students, round(avg(score), 2) as median_wrong
+        from numbered
+        where rn = (n + 1) / 2
+        group by subject
+        order by subject
+      whyWrong: >-
+        Handles odd counts and silently gets even ones wrong, returning the
+        lower middle value instead of the mean of the two. Chemistry, with
+        eight students, differs from the correct answer — and the error is
+        invisible on any subject with an odd number of rows, which is why the
+        dataset deliberately contains both.
+
+  extraTests:
+    - name: Two-element and three-element groups (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt has Mathematics with two identical scores and Physics
+        with three. The even case must interpolate between two equal values —
+        giving that value — and the odd case must return the middle one. Tiny
+        groups are where off-by-one errors surface.
+      sql: |
+        select subject,
+               count(*)                                                              as students,
+               round(avg(score), 2)                                                  as mean_score,
+               round(percentile_cont(0.5) within group (order by score)::numeric, 2) as median_cont,
+               percentile_disc(0.5) within group (order by score)                    as median_disc,
+               max(score) - min(score)                                               as spread
+        from exam_scores
+        group by subject
+        order by subject
+
+    - name: The manual method agrees with the aggregate
+      schema: learning
+      note: >-
+        Running both and comparing is the check that the hand-rolled parity
+        trick is correct. A difference on any subject means the `(n+1)/2`,
+        `(n+2)/2` pair was got wrong, which is the usual failure.
+      sql: |
+        with numbered as (
+            select subject, score,
+                   row_number() over (partition by subject order by score) as rn,
+                   count(*)     over (partition by subject)                as n
+            from exam_scores
+        ),
+        manual as (
+            select subject, round(avg(score), 2) as median_manual
+            from numbered
+            where rn in ((n + 1) / 2, (n + 2) / 2)
+            group by subject
+        ),
+        builtin as (
+            select subject,
+                   round(percentile_cont(0.5) within group (order by score)::numeric, 2) as median_builtin
+            from exam_scores
+            group by subject
+        )
+        select m.subject, m.median_manual, b.median_builtin,
+               m.median_manual = b.median_builtin as agree
+        from manual m
+        join builtin b on b.subject = m.subject
+        order by m.subject
+
+  followUps:
+    - question: What is the difference between percentile_cont and percentile_disc?
+      answer: >-
+        `percentile_cont` treats the data as a continuous distribution and
+        interpolates between the two values surrounding the requested
+        percentile, so it can return a value nobody actually recorded.
+        `percentile_disc` returns an actual observation — the first value whose
+        cumulative distribution reaches the percentile. They agree on
+        odd-sized groups at the median and differ on even ones. Use cont for a
+        statistical summary and disc when the answer must be a real
+        observation, such as a representative row.
+
+    - question: How would you compute a median without ordered-set aggregates?
+      answer: >-
+        Number the rows within each group by ascending value, count the group,
+        and average the rows at positions `(n+1)/2` and `(n+2)/2` using integer
+        division. For an odd n both expressions give the same row, so the
+        average is that row; for an even n they give the two middle rows and
+        the average is their mean. The parity is handled by the arithmetic
+        rather than by a CASE, which is why that particular pair of
+        expressions is the standard formulation.
+
+    - question: Why use a median rather than a mean?
+      answer: >-
+        Because the median is resistant to outliers and the mean is not. One
+        extremely high salary moves the mean substantially and the median
+        barely at all, which is why pay and house-price reporting uses
+        medians. The corollary is that quoting a median alone hides the spread,
+        so the useful summary is usually the median with the quartiles — which
+        costs nothing extra because they share the same sort.
+
+    - question: How would you compute a median over a very large table?
+      answer: >-
+        The exact answer requires sorting the whole group, which is
+        unavoidable. An index on (group, value) removes the sort. If an
+        approximation is acceptable, TABLESAMPLE gives a cheap estimate, and
+        the tdigest extension maintains a streaming sketch that can be merged
+        across partitions — which is how percentiles are computed in practice
+        on time-series data at scale.
+
+  related:
+    - a-aggregates
+    - a-group-by-having
+    - w-ranking
+    - f-data-types

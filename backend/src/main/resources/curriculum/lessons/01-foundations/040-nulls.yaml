@@ -1,0 +1,410 @@
+id: f-nulls
+moduleId: foundations
+position: 40
+title: NULL and three-valued logic
+slug: nulls
+difficulty: Beginner
+estimatedMinutes: 25
+summary: >-
+  NULL is not a value, not zero and not an empty string — it is the absence of
+  information, and SQL's logic has three truth values because of it. This is the
+  topic that produces the most wrong-but-plausible query results in practice.
+tags: [null, three-valued-logic, coalesce, interview-favourite]
+
+prerequisites:
+  - f-filtering
+
+objectives:
+  - State the three truth values and what AND, OR and NOT do with UNKNOWN
+  - Predict which rows a predicate returns when the column is nullable
+  - Use COALESCE, NULLIF and IS DISTINCT FROM correctly
+  - Explain why NOT IN with a NULL in the list returns nothing
+  - Say how each aggregate function treats NULL, and which one is the exception
+
+concept: |
+  ## NULL means "unknown", not "nothing"
+
+  The mental model that makes every NULL rule follow automatically: a NULL is a
+  value the database does not know. Not a blank, not a zero, not an empty
+  string — unknown.
+
+  Ask whether an unknown number equals 10. The honest answer is "I cannot tell",
+  and that is what `NULL = 10` evaluates to: not true, not false, but a third
+  truth value, **UNKNOWN**, which SQL spells as NULL.
+
+  Ask whether two unknown numbers are equal. Still "I cannot tell" — they might
+  both be 7, or one might be 7 and the other 9. So `NULL = NULL` is NULL, and
+  this is why `WHERE col = NULL` never matches.
+
+  ## The truth tables
+
+  `AND` returns the *weakest* result; `OR` returns the *strongest*:
+
+  | a | b | a AND b | a OR b |
+  |---|---|---------|--------|
+  | true | true | true | true |
+  | true | false | false | true |
+  | true | NULL | **NULL** | **true** |
+  | false | false | false | false |
+  | false | NULL | **false** | **NULL** |
+  | NULL | NULL | NULL | NULL |
+
+  The two bold rows that are *not* NULL are worth memorising, because they are
+  the ones people get wrong:
+
+  - `false AND unknown` is **false**. If one side is definitely false, the
+    conjunction is definitely false regardless of the unknown.
+  - `true OR unknown` is **true**. Same logic, mirrored.
+
+  `NOT NULL` is NULL. There is no way to flip unknown into something known.
+
+  ## What this does to WHERE, and what it does not do elsewhere
+
+  `WHERE` keeps rows where the predicate is **true**. Rows evaluating to false
+  and rows evaluating to NULL are both dropped, so a row can be absent from both
+  a predicate and its negation.
+
+  `CHECK` constraints work the other way round: they reject a row only when the
+  condition is **false**, so a NULL passes every CHECK constraint. A
+  `check (salary > 0)` column that is nullable will happily accept NULL.
+
+  `GROUP BY` treats all NULLs as one group. `DISTINCT` treats them as equal.
+  `UNION` deduplicates them together. `ORDER BY` sorts them all to one end.
+  These are the places where SQL does treat NULL as a value, and they are
+  exceptions written into the standard precisely because the alternative was
+  useless.
+
+  ## NOT IN is the famous one
+
+  ```sql
+  select * from employees
+  where dept_id not in (10, 20, null)
+  ```
+
+  returns **no rows at all**. Expand it: `dept_id <> 10 AND dept_id <> 20 AND
+  dept_id <> NULL`. The last term is always NULL, and `something AND NULL` is
+  either false or NULL — never true. Nothing can satisfy it.
+
+  Written with a literal NULL nobody makes this mistake. Written as
+  `not in (select manager_id from employees)` — where `manager_id` is nullable
+  and the CEO's is NULL — everybody does, and the query returns zero rows with
+  no error. `NOT EXISTS` does not have this behaviour and is the habit to form.
+
+  ## The tools
+
+  - `COALESCE(a, b, c)` returns the first non-NULL argument. It short-circuits,
+    so an expensive expression in a later position is not evaluated when an
+    earlier one is non-NULL.
+  - `NULLIF(a, b)` returns NULL when `a = b`, otherwise `a`. The standard use is
+    `NULLIF(denominator, 0)` to turn a division-by-zero error into a NULL.
+  - `a IS DISTINCT FROM b` is NULL-aware `<>`; `IS NOT DISTINCT FROM` is
+    NULL-aware `=`.
+  - `GREATEST` and `LEAST` ignore NULL arguments in PostgreSQL — unlike almost
+    everything else, and unlike the SQL standard, which says they should
+    propagate it.
+
+  ## Aggregates
+
+  **Every aggregate except `count(*)` ignores NULL inputs.** `avg(salary)`
+  divides by the number of non-NULL salaries, not by the row count. That is
+  usually right, and it is occasionally the source of a number nobody can
+  reconcile. `count(*)` counts rows; `count(col)` counts non-NULL values of
+  `col`; the difference between them is how many NULLs there are.
+
+syntax:
+  - form: "expr IS NULL  |  expr IS NOT NULL"
+    notes: The only correct way to test for NULL.
+  - form: "COALESCE(expr1, expr2, ...)"
+    notes: >-
+      First non-NULL argument, or NULL if all are NULL. All arguments must have
+      a common type.
+  - form: "NULLIF(a, b)"
+    notes: NULL when the two are equal, otherwise `a`. Mostly used to guard division.
+  - form: "a IS [NOT] DISTINCT FROM b"
+    notes: Comparison that treats NULL as an ordinary, comparable value.
+  - form: "ORDER BY expr [ASC|DESC] [NULLS FIRST|NULLS LAST]"
+    notes: >-
+      Default is NULLS LAST for ASC and NULLS FIRST for DESC — that is, NULLs
+      sort as though they were larger than everything.
+
+sampleTables: [employees, customers, orders, departments]
+
+examples:
+  - title: The three truth values, printed
+    sql: |
+      select null = null                as null_equals_null,
+             null <> null               as null_not_equals_null,
+             null is null               as null_is_null,
+             null is not distinct from null as null_is_not_distinct,
+             true and null              as true_and_null,
+             false and null             as false_and_null,
+             true or null               as true_or_null,
+             false or null              as false_or_null,
+             not null                   as not_null
+    walkthrough: |
+      Six of the nine columns come back empty — that is a NULL being rendered,
+      not a false. Two are the interesting ones: `false_and_null` is `f` and
+      `true_or_null` is `t`, because in those two cases the known operand
+      settles the question on its own.
+
+      `null_is_null` is `t`, which is the whole reason `IS NULL` exists as
+      separate syntax: it is a predicate about whether a value is known, and it
+      always returns a real boolean.
+
+  - title: Rows that fall through both sides of a filter
+    sql: |
+      select 'dept_id = 10'                as predicate, count(*) as rows
+      from employees where dept_id = 10
+      union all
+      select 'dept_id <> 10',               count(*) from employees where dept_id <> 10
+      union all
+      select 'dept_id is null',             count(*) from employees where dept_id is null
+      union all
+      select 'dept_id is distinct from 10', count(*) from employees where dept_id is distinct from 10
+      union all
+      select 'all rows',                    count(*) from employees
+    walkthrough: |
+      The first three rows add up to the fourth-from-top total only once the
+      NULL count is included. The row labelled `dept_id is distinct from 10`
+      equals `dept_id <> 10` plus `dept_id is null`, which is the arithmetic
+      that makes the operator worth learning.
+
+      This pattern — a `UNION ALL` of labelled counts — is a useful way to make
+      a logical point visible in one result, and it is also how you sanity-check
+      a filter you are unsure about before trusting it in a report.
+
+  - title: COALESCE, NULLIF and safe division
+    sql: |
+      select c.customer_id,
+             coalesce(c.contact_name, '(no contact on file)') as contact,
+             count(o.order_id)                                as orders,
+             count(*) filter (where o.status = 'cancelled')   as cancelled,
+             round(100.0 * count(*) filter (where o.status = 'cancelled')
+                   / nullif(count(o.order_id), 0), 1)         as cancel_pct
+      from customers c
+      left join orders o on o.customer_id = c.customer_id
+      where c.customer_id in (301, 306, 312, 318, 322)
+      group by c.customer_id, c.contact_name
+      order by c.customer_id
+    walkthrough: |
+      `coalesce` supplies a readable placeholder for customer 306, whose
+      `contact_name` really is NULL in the data. Note that it substitutes for
+      display only — it does not change what is stored, and filtering on
+      `coalesce(contact_name, '') = ''` would be non-sargable.
+
+      `nullif(count(...), 0)` is the important one. A customer with no orders
+      would make the denominator zero, and `x / 0` raises an error that aborts
+      the entire query — not just that row. Turning the zero into NULL turns a
+      fatal error into a NULL in one cell, which is both survivable and honest:
+      the cancellation rate of someone with no orders is genuinely undefined.
+
+  - title: How aggregates treat NULL
+    sql: |
+      select count(*)              as all_rows,
+             count(ship_date)      as rows_with_ship_date,
+             count(*) - count(ship_date) as unshipped,
+             min(ship_date)        as earliest_ship,
+             max(ship_date)        as latest_ship,
+             count(distinct status) as distinct_statuses
+      from orders
+    walkthrough: |
+      `count(*)` counts rows. `count(ship_date)` counts rows where `ship_date`
+      is not NULL. Their difference is exactly the number of unshipped orders,
+      and this subtraction is the standard idiom for "how many are missing".
+
+      `min` and `max` ignore the NULLs entirely, so they report the real
+      earliest and latest ship dates rather than returning NULL because one row
+      had no value. If every input were NULL, both would return NULL — not
+      zero, and not an error.
+
+edgeCases:
+  - title: NOT IN with a NULL returns nothing at all
+    body: >-
+      The first count is zero. There is no error, no warning, and the query
+      looks correct. `manager_id` is NULL for the CEO, and that one NULL makes
+      the entire NOT IN predicate unsatisfiable for every row. The second count
+      is the answer the author wanted, written with NOT EXISTS, which compares
+      row by row and is unaffected.
+    sql: |
+      select (select count(*) from employees e
+              where e.emp_id not in (select manager_id from employees))     as with_not_in,
+             (select count(*) from employees e
+              where not exists (select 1 from employees m
+                                where m.manager_id = e.emp_id))             as with_not_exists
+
+  - title: NULL sorts as though it were the largest value
+    body: >-
+      Ascending order puts NULLs last; descending order puts them first. That is
+      PostgreSQL's default and it is a choice, not a law — the standard leaves it
+      implementation-defined, and other databases sort them first in ascending
+      order. Any query whose output order matters and whose sort column is
+      nullable should say NULLS FIRST or NULLS LAST explicitly.
+    sql: |
+      select project_id, project_name, end_date
+      from projects
+      order by end_date desc nulls last, project_id
+
+pitfalls:
+  - mistake: Treating NULL as zero or as an empty string
+    why: >-
+      Many client libraries render all three the same way, and some ORMs map an
+      empty string to NULL on write. So the distinction disappears exactly where
+      it is being learned.
+    fix: >-
+      Check with `IS NULL` and `= ''` separately when it matters. In this
+      application's result grid a NULL is drawn differently from an empty
+      string for exactly this reason.
+
+  - mistake: Using NOT IN against a subquery over a nullable column
+    why: >-
+      One NULL anywhere in the subquery result makes the predicate NULL for
+      every row, so the query returns zero rows. It is silent, and it typically
+      appears months later when the first NULL arrives in production data.
+    fix: >-
+      Use NOT EXISTS, which is NULL-safe and usually produces the same or a
+      better plan. If NOT IN must be kept, add `where col is not null` to the
+      subquery.
+
+  - mistake: Concatenating a nullable column with ||
+    why: >-
+      `'Hello, ' || NULL` is NULL, so one missing middle name blanks the entire
+      assembled string rather than leaving a gap.
+    fix: >-
+      `coalesce(col, '')` around each nullable part, or `concat_ws(' ', a, b,
+      c)`, which skips NULL arguments by design.
+
+  - mistake: Assuming avg() divides by the row count
+    why: >-
+      It divides by the count of non-NULL values. With missing data the average
+      is higher or lower than the same calculation done in a spreadsheet that
+      treated blanks as zero, and the two will never reconcile.
+    fix: >-
+      Decide what the missing values mean. If they should count as zero, write
+      `avg(coalesce(col, 0))` and say so in a comment.
+
+performance: |
+  `IS NULL` is sargable in PostgreSQL: a B-tree index stores NULLs and can be
+  used to find them, which is not true of every database.
+
+  A **partial index** — `create index ... where col is not null` — is the right
+  tool when the overwhelming majority of a column is NULL and queries only ever
+  look for the rest. It is smaller than a full index and cheaper to maintain.
+
+  `COALESCE(col, x) = y` is not sargable, because the indexed value is `col` and
+  the predicate asks about a function of it. `col = y OR col IS NULL` is, and is
+  usually what was meant.
+
+interviewQuestions:
+  - question: What is the difference between NULL, 0 and an empty string?
+    answer: >-
+      NULL is the absence of a known value; 0 and '' are known values that
+      happen to be small. Arithmetic with NULL yields NULL whereas arithmetic
+      with 0 yields a number; `length('')` is 0 whereas `length(NULL)` is NULL;
+      `count(col)` skips NULL but counts '' and 0. In a nullable column,
+      choosing between NULL and a sentinel like 0 or '' is a modelling decision:
+      NULL says "we do not know", a sentinel says "we know, and it is this".
+
+  - question: Why does `SELECT * FROM t WHERE col NOT IN (SELECT x FROM s)` sometimes return nothing?
+    answer: >-
+      If any row of the subquery has `x` NULL, the predicate expands to a chain
+      of `col <> ...` terms one of which is `col <> NULL`, which is NULL. A
+      conjunction containing NULL can be false or NULL but never true, so no row
+      qualifies. The fix is NOT EXISTS with a correlated condition, which
+      compares row by row and is unaffected by NULLs, or filtering the NULLs out
+      of the subquery. This is the most commonly asked NULL question in
+      interviews.
+
+  - question: How do aggregate functions handle NULL?
+    answer: >-
+      All of them ignore NULL inputs except `count(*)`, which counts rows.
+      `count(col)` counts non-NULL values, so `count(*) - count(col)` is the
+      number of NULLs. `sum` over an entirely NULL or empty input returns NULL,
+      not zero, which is why a report showing a blank where a total should be is
+      usually a filter that matched nothing rather than a value of zero. Wrap in
+      `coalesce(sum(x), 0)` when zero is the right display.
+
+  - question: What does a CHECK constraint do with a NULL?
+    answer: >-
+      It accepts the row. A CHECK rejects only when the condition evaluates to
+      false, and a condition involving NULL evaluates to NULL. So `check (age >=
+      18)` on a nullable column permits NULL ages. If the column must be present,
+      the constraint needed is NOT NULL, which is a separate thing.
+
+exercises:
+  - prompt: >-
+      Return every employee with a label for their department: the department
+      name, or the text 'Unassigned' when they have none. Columns full_name and
+      department. Order by department then full_name, with Unassigned appearing
+      wherever the alphabet puts it.
+    difficulty: Easy
+    hint: >-
+      A LEFT JOIN keeps the employees with no department, and COALESCE supplies
+      the label.
+    solutionSql: |
+      select e.first_name || ' ' || e.last_name     as full_name,
+             coalesce(d.dept_name, 'Unassigned')    as department
+      from employees e
+      left join departments d on d.dept_id = e.dept_id
+      order by department, full_name
+
+  - prompt: >-
+      For each order status, show how many orders have it and how many of those
+      have no ship_date. Columns status, orders, unshipped. Order by status.
+    difficulty: Easy
+    hint: >-
+      `count(*) - count(ship_date)` counts the NULLs within each group.
+    solutionSql: |
+      select status,
+             count(*)                      as orders,
+             count(*) - count(ship_date)   as unshipped
+      from orders
+      group by status
+      order by status
+
+  - prompt: >-
+      Find every employee who manages nobody. Write it with NOT EXISTS, and
+      return emp_id and full_name ordered by emp_id.
+    difficulty: Medium
+    hint: >-
+      The correlated subquery looks for any employee whose manager_id is this
+      employee's emp_id. NOT EXISTS is true when it finds none.
+    solutionSql: |
+      select e.emp_id,
+             e.first_name || ' ' || e.last_name as full_name
+      from employees e
+      where not exists (
+            select 1 from employees m
+            where m.manager_id = e.emp_id)
+      order by e.emp_id
+
+checklist:
+  - NULL means unknown, so any comparison with it yields UNKNOWN rather than true or false
+  - "false AND unknown is false; true OR unknown is true — the only two cases that resolve"
+  - WHERE keeps only true; CHECK rejects only false, so NULL passes every CHECK
+  - GROUP BY, DISTINCT, UNION and ORDER BY all treat NULLs as equal to one another
+  - NOT IN over a nullable subquery returns nothing; use NOT EXISTS
+  - Every aggregate ignores NULL except count(*)
+  - "COALESCE for defaults, NULLIF to guard division, IS DISTINCT FROM for NULL-aware comparison"
+  - Concatenation with || propagates NULL; concat_ws does not
+
+related:
+  - f-filtering
+  - a-aggregates
+  - j-exists-in
+  - p03-duplicate-emails
+
+dialect:
+  standard: >-
+    Three-valued logic, IS NULL, COALESCE, NULLIF and IS DISTINCT FROM are all
+    in the SQL standard, as is the rule that aggregates ignore NULL.
+  postgres: >-
+    Sorts NULLs last in ascending order and first in descending, and allows
+    NULLS FIRST / NULLS LAST to override. Indexes NULLs, so IS NULL can use an
+    index. GREATEST and LEAST ignore NULL arguments rather than propagating
+    them, which is a deliberate divergence from the standard.
+  mysql: >-
+    Sorts NULLs first in ascending order — the opposite default — and has no
+    NULLS FIRST/LAST clause, so the workaround is an extra sort key. MySQL has
+    the `<=>` NULL-safe equality operator instead of IS NOT DISTINCT FROM.
+    Oracle famously treats the empty string as NULL for VARCHAR2, which
+    PostgreSQL does not, and this bites hard when migrating.

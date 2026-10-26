@@ -1,0 +1,293 @@
+id: p06-customers-who-never-ordered
+position: 60
+title: Customers who never ordered
+slug: customers-who-never-ordered
+difficulty: Easy
+topic: Joins
+tags: [anti-join, not-exists, not-in, null-trap, classic]
+
+source:
+  name: LeetCode 183 — Customers Who Never Order
+  url: https://leetcode.com/problems/customers-who-never-order/
+
+orderSensitive: false
+
+statement: |
+  Return every customer who has never placed an order, with the date they
+  signed up and how long they have been a customer as at 1 January 2025.
+
+  A customer whose only orders were cancelled **has** ordered and does not
+  qualify.
+
+tables: [customers, orders]
+
+expectedColumns: [customer_id, company_name, country, signup_date, days_since_signup]
+
+edgeCases:
+  - >-
+    `orders.customer_id` is NOT NULL here, so NOT IN happens to be safe — but
+    the habit of using NOT EXISTS is what protects you when it is not.
+  - A cancelled order still counts as an order.
+  - >-
+    The LEFT JOIN form must test a column that cannot be NULL in `orders`, or
+    a genuine NULL is indistinguishable from a non-match.
+  - >-
+    Use a fixed reference date rather than current_date, so the answer is
+    reproducible.
+
+hints:
+  - There are three standard spellings of an anti-join and one of them is a trap.
+  - >-
+    With a LEFT JOIN, which column do you test for NULL, and why does the
+    choice matter?
+  - Subtracting two dates in PostgreSQL gives an integer number of days.
+
+solutionSql: |
+  select c.customer_id,
+         c.company_name,
+         c.country,
+         c.signup_date,
+         date '2025-01-01' - c.signup_date as days_since_signup
+  from customers c
+  where not exists (
+        select 1 from orders o
+        where o.customer_id = c.customer_id)
+  order by c.customer_id
+
+explanation:
+  lineByLine:
+    - clause: "not exists (select 1 from orders o where ...)"
+      note: >-
+        True when the correlated subquery finds no matching row. PostgreSQL
+        plans this as an anti-join, which can stop as soon as one match is
+        found for a given customer.
+    - clause: "select 1"
+      note: >-
+        The select list of an EXISTS subquery is never evaluated, so what it
+        names is irrelevant. `select 1` is the convention and `select *` is
+        equally valid.
+    - clause: "o.customer_id = c.customer_id"
+      note: >-
+        The correlation. It is what makes the subquery a per-row test rather
+        than a single evaluation, and it is the only reference to the outer
+        query.
+    - clause: "date '2025-01-01' - c.signup_date"
+      note: >-
+        Date minus date yields a plain integer number of days in PostgreSQL —
+        no interval and no extract needed. A literal date rather than
+        current_date keeps the result reproducible.
+
+  walkthrough: |
+    For each of the 22 customers, the subquery asks whether `orders` contains
+    any row with that customer_id. Two customers have none.
+
+    Both are small businesses that signed up and never bought anything, which
+    is exactly the segment a "customers who never ordered" report exists to
+    find.
+
+    Note what the result does **not** include: customer 310, whose first order
+    was cancelled. A cancelled order is still an order, and the question says
+    so explicitly — which is the kind of clarification worth asking for rather
+    than assuming.
+
+  alternatives:
+    - title: LEFT JOIN with IS NULL
+      sql: |
+        select c.customer_id,
+               c.company_name,
+               c.country,
+               c.signup_date,
+               date '2025-01-01' - c.signup_date as days_since_signup
+        from customers c
+        left join orders o on o.customer_id = c.customer_id
+        where o.order_id is null
+        order by c.customer_id
+      when: >-
+        Equally correct and planned identically by PostgreSQL. The condition
+        must test `o.order_id`, which is the primary key and cannot be NULL in
+        a real row; testing a nullable column such as `o.ship_date` would
+        match unshipped orders too.
+      equivalent: true
+
+    - title: NOT IN
+      sql: |
+        select c.customer_id,
+               c.company_name,
+               c.country,
+               c.signup_date,
+               date '2025-01-01' - c.signup_date as days_since_signup
+        from customers c
+        where c.customer_id not in (select o.customer_id from orders o)
+        order by c.customer_id
+      when: >-
+        Correct here only because `orders.customer_id` is NOT NULL. If that
+        column were ever nullable, a single NULL would make the predicate
+        unsatisfiable and this query would silently return nothing. It is the
+        right answer today and the wrong habit.
+      equivalent: true
+
+    - title: EXCEPT
+      sql: |
+        select c.customer_id,
+               c.company_name,
+               c.country,
+               c.signup_date,
+               date '2025-01-01' - c.signup_date as days_since_signup
+        from customers c
+        where c.customer_id in (
+              select customer_id from customers
+              except
+              select customer_id from orders)
+        order by c.customer_id
+      when: >-
+        When comparing two whole result sets rather than a table to a related
+        table. Here it is a long way round, and the deduplication EXCEPT
+        performs is wasted work.
+      equivalent: true
+
+  performance: |
+    PostgreSQL recognises `NOT EXISTS` and `LEFT JOIN ... IS NULL` as the same
+    thing and plans both as an **anti-join**, which can abandon the inner scan
+    for a customer as soon as one order is found. That early exit is the
+    structural advantage over counting.
+
+    `NOT IN` is the exception. Because of its NULL semantics the planner
+    generally cannot use an anti-join and falls back to a materialised
+    subplan, so it is both the riskier choice and usually the slower one.
+
+    The index that matters is `idx_orders_customer` on `orders(customer_id)`,
+    which exists in this schema. Without it each customer costs a sequential
+    scan of orders, turning an O(n) query into O(n·m).
+
+    On a large customers table the anti-join is typically a hash anti-join:
+    build a hash of the distinct order customer_ids once, then probe. That is
+    one pass over each table regardless of the ratio between them.
+
+  wrongApproaches:
+    - title: "Counting orders and testing for zero"
+      sql: |
+        select c.customer_id,
+               c.company_name,
+               c.country,
+               c.signup_date,
+               date '2025-01-01' - c.signup_date as days_since_signup
+        from customers c
+        where (select count(*) from orders o where o.customer_id = c.customer_id) = 0
+        order by c.customer_id
+      whyWrong: >-
+        Returns the right rows and counts every order for every customer
+        before comparing to zero. EXISTS stops at the first match; this cannot.
+        For a customer with ten thousand orders the difference is ten thousand
+        rows examined to answer a yes-or-no question.
+
+    - title: "LEFT JOIN testing a nullable column"
+      sql: |
+        select c.customer_id,
+               c.company_name,
+               c.country,
+               c.signup_date,
+               date '2025-01-01' - c.signup_date as days_since_signup
+        from customers c
+        left join orders o on o.customer_id = c.customer_id
+        where o.ship_date is null
+        order by c.customer_id, o.order_id
+      whyWrong: >-
+        `ship_date` is NULL both for a non-match and for a real order that has
+        not shipped. The query therefore returns customers who have ordered,
+        and returns them once per unshipped order. The IS NULL test in an
+        anti-join must name a column that cannot be NULL in the right-hand
+        table.
+
+    - title: "INNER JOIN and hoping"
+      sql: |
+        select c.customer_id,
+               c.company_name,
+               count(o.order_id) as orders
+        from customers c
+        join orders o on o.customer_id = c.customer_id
+        group by c.customer_id, c.company_name
+        having count(o.order_id) = 0
+        order by c.customer_id
+      whyWrong: >-
+        An inner join has already removed every customer with no orders, so
+        there is no group left with a count of zero and the query returns
+        nothing. Counting after an inner join can never find the absent rows —
+        the join is the thing that lost them.
+
+  extraTests:
+    - name: A customer with only a cancelled order (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt has three customers, of which only 303 has never ordered.
+        Customer 301 has one completed and one cancelled order, confirming
+        that a cancelled order still counts and 301 must not appear.
+      sql: |
+        select c.customer_id,
+               c.company_name,
+               c.country,
+               c.signup_date,
+               date '2025-01-01' - c.signup_date as days_since_signup
+        from customers c
+        where not exists (
+              select 1 from orders o
+              where o.customer_id = c.customer_id)
+        order by c.customer_id
+
+    - name: The three spellings agree
+      schema: learning
+      note: >-
+        NOT EXISTS, LEFT JOIN with IS NULL on the primary key, and NOT IN all
+        return the same count on this data. They stop agreeing the moment
+        orders.customer_id becomes nullable, which is why the test is worth
+        running as a statement about today rather than about always.
+      sql: |
+        select (select count(*) from customers c
+                where not exists (select 1 from orders o
+                                  where o.customer_id = c.customer_id))     as with_not_exists,
+               (select count(*) from customers c
+                left join orders o on o.customer_id = c.customer_id
+                where o.order_id is null)                                   as with_left_join,
+               (select count(*) from customers c
+                where c.customer_id not in (select customer_id from orders)) as with_not_in
+
+  followUps:
+    - question: Why is NOT IN dangerous here even though it works?
+      answer: >-
+        It works only because `orders.customer_id` is declared NOT NULL. If
+        that constraint were ever relaxed — or if the subquery were changed to
+        select a nullable column such as `employee_id` — a single NULL would
+        make `x <> NULL` part of the implied conjunction, which is NULL, so no
+        row could satisfy the predicate and the query would return zero rows
+        with no error. NOT EXISTS has no such failure mode, which is why it is
+        the habit to form rather than the exception to remember.
+
+    - question: How would you find customers who have not ordered in the last year?
+      answer: >-
+        Move the date condition inside the NOT EXISTS subquery, so it reads
+        "there is no order from this customer after that date". Putting it in
+        the outer WHERE instead would be meaningless, because the outer query
+        has no order to test. This placement question — inside the subquery or
+        outside it — is the usual follow-up and it changes the answer
+        completely.
+
+    - question: How would you include customers whose only orders were cancelled?
+      answer: >-
+        Add `and o.status <> 'cancelled'` inside the subquery, so a cancelled
+        order no longer counts as a match. Again the condition belongs inside
+        the correlated subquery; in the LEFT JOIN form it belongs in the ON
+        clause, for exactly the same reason.
+
+    - question: Which index supports this query?
+      answer: >-
+        `orders(customer_id)`, which already exists as idx_orders_customer.
+        It lets the anti-join probe per customer rather than scanning orders,
+        and it is the same index that makes the forward direction — "this
+        customer's orders" — fast. A missing index on a foreign-key column is
+        one of the most common performance problems in a PostgreSQL schema,
+        because the database does not create one automatically.
+
+  related:
+    - j-exists-in
+    - j-inner-outer
+    - j-set-operations
+    - f-nulls

@@ -1,0 +1,393 @@
+id: p17-recursive-org-chart
+position: 160
+title: Build the organisation chart
+slug: recursive-org-chart
+difficulty: Hard
+topic: Recursive CTEs
+tags: [recursive-cte, hierarchy, depth, path, org-chart]
+
+orderSensitive: true
+
+statement: |
+  Produce the full reporting hierarchy as an indented org chart.
+
+  For every employee return their depth below the chief executive (1 for the
+  CEO), their name indented by depth, their direct manager's name, the number
+  of people who report to them directly, and the total size of their
+  organisation including themselves.
+
+  Rows must come back in depth-first order — each person immediately followed
+  by their subtree.
+
+tables: [employees]
+
+expectedColumns: [depth, org_chart, manager_name, direct_reports, org_size]
+
+edgeCases:
+  - >-
+    The root has a NULL manager_id and must be the anchor rather than a
+    special case in the recursive term.
+  - >-
+    A leaf has zero direct reports and an org_size of 1, which requires
+    counting a subtree rather than a level.
+  - >-
+    Nothing in the schema prevents a cycle, so a guard is needed even though
+    the data has none.
+  - >-
+    Depth-first order needs a path to sort by; sorting by depth gives
+    breadth-first, which reads as a list of levels rather than a chart.
+
+hints:
+  - The anchor is the row with no manager. The recursive term joins to the previous round.
+  - >-
+    An array of ancestor ids sorts into depth-first order and doubles as a
+    cycle guard.
+  - >-
+    "Everyone beneath this person" is a different traversal from "this
+    person's reports" — think about what the closure of the hierarchy gives
+    you.
+
+solutionSql: |
+  with recursive org as (
+      select e.emp_id,
+             e.manager_id,
+             e.first_name || ' ' || e.last_name as name,
+             1                                  as depth,
+             array[e.emp_id]                    as path
+      from employees e
+      where e.manager_id is null
+      union all
+      select e.emp_id,
+             e.manager_id,
+             e.first_name || ' ' || e.last_name,
+             o.depth + 1,
+             o.path || e.emp_id
+      from employees e
+      join org o on o.emp_id = e.manager_id
+      where o.depth < 20
+        and not e.emp_id = any (o.path)
+  ),
+  subtree as (
+      select a.emp_id as ancestor_id,
+             count(*) as org_size
+      from org a
+      join org d on a.emp_id = any (d.path)
+      group by a.emp_id
+  )
+  select o.depth,
+         repeat('    ', o.depth - 1) || o.name            as org_chart,
+         m.first_name || ' ' || m.last_name               as manager_name,
+         (select count(*) from employees r
+          where r.manager_id = o.emp_id)                  as direct_reports,
+         s.org_size
+  from org o
+  left join employees m on m.emp_id = o.manager_id
+  join subtree s        on s.ancestor_id = o.emp_id
+  order by o.path
+
+explanation:
+  lineByLine:
+    - clause: "where e.manager_id is null"
+      note: >-
+        The anchor. One row — the CEO — because exactly one employee has no
+        manager. If several did, the query would produce a forest, and
+        nothing about the structure would need to change.
+    - clause: "join org o on o.emp_id = e.manager_id"
+      note: >-
+        The recursive term. Each round finds the employees whose manager
+        appeared in the previous round, which is what walks the tree downward
+        one level at a time.
+    - clause: "o.path || e.emp_id"
+      note: >-
+        Accumulates the route from the root. It serves three purposes — the
+        cycle guard, the depth-first ordering, and the subtree membership
+        test — which is why carrying it is worth the column.
+    - clause: "not e.emp_id = any (o.path)"
+      note: >-
+        The cycle guard. No constraint prevents an employee becoming their own
+        ancestor through a bad update, and without this the recursion would
+        not terminate.
+    - clause: "join org d on a.emp_id = any (d.path)"
+      note: >-
+        The subtree count. A person is in someone's organisation exactly when
+        that someone appears in their path, so this self-join of the result
+        gives every ancestor-descendant pair — effectively the closure of the
+        hierarchy, computed on the fly.
+    - clause: "order by o.path"
+      note: >-
+        Sorting by the array of ancestor ids produces depth-first order, so
+        each person is immediately followed by their subtree. Ordering by
+        depth would give breadth-first, which is a list of levels rather than
+        a chart.
+
+  walkthrough: |
+    The anchor returns Asha Raman, depth 1, path `{1}`. Round two finds the
+    six people whose manager_id is 1 — the five VPs and the Chief of Staff —
+    at depth 2 with paths like `{1,2}`. Round three finds their reports, and
+    so on until a round produces nobody.
+
+    The tree is four levels deep. Harpreet Singh at depth 4 has path
+    `{1,2,9,20}`, which reads directly as the management chain.
+
+    `subtree` joins the result to itself on path membership. Asha appears in
+    everyone's path, so her org_size is 40 — the whole company. A leaf such
+    as Harpreet appears only in their own path, so org_size is 1.
+
+    `direct_reports` is a correlated count against the base table rather than
+    against the recursion, because it is a one-level question and does not
+    need the traversal.
+
+    `order by o.path` is what makes the output readable. Compare it with
+    `order by depth`: the same rows, and a completely different document.
+
+  alternatives:
+    - title: Breadth-first, one level at a time
+      sql: |
+        with recursive org as (
+            select emp_id, manager_id,
+                   first_name || ' ' || last_name as name,
+                   1 as depth
+            from employees where manager_id is null
+            union all
+            select e.emp_id, e.manager_id,
+                   e.first_name || ' ' || e.last_name,
+                   o.depth + 1
+            from employees e
+            join org o on o.emp_id = e.manager_id
+            where o.depth < 20
+        )
+        select depth,
+               count(*)                                   as people,
+               string_agg(name, ', ' order by name)       as who
+        from org
+        group by depth
+        order by depth
+      when: >-
+        When the question is about the shape of the organisation rather than
+        about individuals — how many layers, how wide each one is. Much
+        simpler, because it needs no path and no subtree join.
+      equivalent: false
+
+    - title: Upward traversal, one person's management chain
+      sql: |
+        with recursive chain as (
+            select emp_id, manager_id,
+                   first_name || ' ' || last_name as name,
+                   1 as levels_up
+            from employees where emp_id = 20
+            union all
+            select m.emp_id, m.manager_id,
+                   m.first_name || ' ' || m.last_name,
+                   c.levels_up + 1
+            from employees m
+            join chain c on c.manager_id = m.emp_id
+            where c.levels_up < 20
+        )
+        select levels_up, emp_id, name
+        from chain
+        order by levels_up
+      when: >-
+        For "who does this person ultimately report to". The join is
+        reversed — manager's emp_id matched to the previous row's manager_id
+        — and the recursion terminates on the NULL manager_id rather than on
+        running out of children.
+      equivalent: false
+
+  performance: |
+    Each iteration is a join between the working set and `employees`. The
+    index that matters is `idx_employees_manager` on `manager_id`, which this
+    schema has; without it every level is a sequential scan and the traversal
+    is quadratic in the table size.
+
+    The `subtree` join is the expensive part. `a.emp_id = any (d.path)` cannot
+    use an index — it is an array containment test over the recursion's
+    output — so it is a nested loop over the result squared. With 40
+    employees that is 1,600 comparisons; with 40,000 it would be 1.6 billion
+    and the query would not finish.
+
+    The planner also has very poor estimates for recursive CTEs, because it
+    cannot know how many iterations there will be. Row-count estimates above
+    the recursion are often wrong by orders of magnitude, which can produce a
+    bad join order in the outer query — one reason a slow recursive query is
+    sometimes slow *above* the recursion rather than inside it.
+
+    For a hierarchy read constantly and changed rarely, a **closure table**
+    maintained by triggers turns both the traversal and the subtree count into
+    indexed lookups. That is the production answer, and the recursive CTE is
+    what builds it.
+
+  wrongApproaches:
+    - title: Ordering by depth instead of path
+      sql: |
+        with recursive org as (
+            select emp_id, manager_id,
+                   first_name || ' ' || last_name as name,
+                   1 as depth
+            from employees where manager_id is null
+            union all
+            select e.emp_id, e.manager_id,
+                   e.first_name || ' ' || e.last_name,
+                   o.depth + 1
+            from employees e join org o on o.emp_id = e.manager_id
+            where o.depth < 20
+        )
+        select depth, repeat('    ', depth - 1) || name as org_chart
+        from org
+        order by depth, name
+      whyWrong: >-
+        Produces breadth-first order, so every depth-2 manager is listed
+        before any depth-3 report. The indentation is still there and now
+        means nothing — a reader cannot tell who reports to whom, because the
+        rows between a manager and their reports belong to other managers.
+
+    - title: Counting direct reports as the org size
+      sql: |
+        with recursive org as (
+            select emp_id, manager_id,
+                   first_name || ' ' || last_name as name,
+                   1 as depth, array[emp_id] as path
+            from employees where manager_id is null
+            union all
+            select e.emp_id, e.manager_id,
+                   e.first_name || ' ' || e.last_name,
+                   o.depth + 1, o.path || e.emp_id
+            from employees e join org o on o.emp_id = e.manager_id
+            where o.depth < 20
+        )
+        select o.depth, o.name,
+               (select count(*) from employees r where r.manager_id = o.emp_id) as not_org_size
+        from org o
+        order by o.path
+      whyWrong: >-
+        Counts one level only. The CEO shows 6 rather than 40, because her
+        six direct reports each have their own organisations beneath them.
+        "Span of control" and "organisation size" are different measures and
+        conflating them understates every manager above the bottom layer.
+
+    - title: No cycle guard
+      sql: |
+        with recursive org as (
+            select emp_id, manager_id, 1 as depth
+            from employees where manager_id is null
+            union all
+            select e.emp_id, e.manager_id, o.depth + 1
+            from employees e join org o on o.emp_id = e.manager_id
+        )
+        select max(depth) as deepest, count(*) as rows
+        from org
+      whyWrong: >-
+        Terminates on this data because the hierarchy is a clean tree, and
+        would run until it exhausted memory if any employee were ever made
+        their own ancestor — which no constraint prevents. Relying on the data
+        being well-formed is a reasonable bet right up until an UPDATE
+        statement gets it wrong at two in the morning.
+
+  extraTests:
+    - name: Shallow hierarchy with an unmanaged employee (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt has one root (Ada Lovelace) and a two-level tree, with
+        Tony Hoare reporting to the root but having no department. The
+        traversal must reach everyone, and the org_size of the root must be
+        all six employees.
+      sql: |
+        with recursive org as (
+            select e.emp_id,
+                   e.manager_id,
+                   e.first_name || ' ' || e.last_name as name,
+                   1                                  as depth,
+                   array[e.emp_id]                    as path
+            from employees e
+            where e.manager_id is null
+            union all
+            select e.emp_id,
+                   e.manager_id,
+                   e.first_name || ' ' || e.last_name,
+                   o.depth + 1,
+                   o.path || e.emp_id
+            from employees e
+            join org o on o.emp_id = e.manager_id
+            where o.depth < 20
+              and not e.emp_id = any (o.path)
+        ),
+        subtree as (
+            select a.emp_id as ancestor_id, count(*) as org_size
+            from org a
+            join org d on a.emp_id = any (d.path)
+            group by a.emp_id
+        )
+        select o.depth,
+               repeat('    ', o.depth - 1) || o.name as org_chart,
+               m.first_name || ' ' || m.last_name    as manager_name,
+               (select count(*) from employees r where r.manager_id = o.emp_id) as direct_reports,
+               s.org_size
+        from org o
+        left join employees m on m.emp_id = o.manager_id
+        join subtree s        on s.ancestor_id = o.emp_id
+        order by o.path
+
+    - name: Everyone is reachable from the root
+      schema: learning
+      note: >-
+        The traversal must return exactly as many rows as the table has. A
+        shortfall means someone is unreachable — an orphan whose manager was
+        deleted, or a disconnected cycle — and the recursive CTE silently
+        omits them rather than reporting a problem.
+      sql: |
+        with recursive org as (
+            select emp_id, 1 as depth from employees where manager_id is null
+            union all
+            select e.emp_id, o.depth + 1
+            from employees e join org o on o.emp_id = e.manager_id
+            where o.depth < 20
+        )
+        select (select count(*) from org)                         as reachable,
+               (select count(*) from employees)                   as total,
+               (select count(*) from employees) - (select count(*) from org) as unreachable,
+               (select max(depth) from org)                       as deepest_level
+
+  followUps:
+    - question: How does the path array give depth-first order?
+      answer: >-
+        Because arrays compare element by element, so `{1,2}` sorts before
+        `{1,2,9}` and both before `{1,3}`. That is exactly the order in which
+        a depth-first traversal visits the nodes — a parent, then its entire
+        subtree, then the next sibling. Ordering by depth instead gives
+        breadth-first, which lists each level in turn and makes the
+        indentation meaningless.
+
+    - question: How would you detect an existing cycle rather than just surviving one?
+      answer: >-
+        Carry the path and, instead of filtering out a revisit, flag it —
+        emit a boolean `is_cycle` column when the child is already in the
+        path and stop recursing from there. PostgreSQL 14 added a CYCLE clause
+        that maintains exactly that for you. Then select the flagged rows: each
+        one is the point at which a cycle closes, and its path names every
+        member.
+
+    - question: Why is the subtree count expensive, and what would you do instead?
+      answer: >-
+        Because `ancestor = any(path)` is an array containment test over the
+        recursion's output, which no index can serve, so it is a nested loop
+        over the result squared. At forty rows that is nothing; at forty
+        thousand it is unworkable. A closure table — one row per
+        ancestor-descendant pair, maintained by triggers — turns the subtree
+        count into an indexed `count(*) where ancestor_id = ?`. The trade is
+        write amplification on every insert and a subtree rewrite on every
+        move.
+
+    - question: What happens if an employee's manager is deleted?
+      answer: >-
+        They become unreachable from the root and vanish from the result
+        entirely, with no error — which is the quiet failure worth testing
+        for, and why the extra test above compares the traversal's row count
+        with the table's. A foreign key with ON DELETE SET NULL would promote
+        them to a second root instead, which the anchor already handles since
+        it selects every row with a NULL manager_id. ON DELETE RESTRICT, the
+        default here, prevents the situation arising at all.
+
+  related:
+    - i-recursive-cte
+    - j-self-cross
+    - s-relationships
+    - p18-category-tree-depth

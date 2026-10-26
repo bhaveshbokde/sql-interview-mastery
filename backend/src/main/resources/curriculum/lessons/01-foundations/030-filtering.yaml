@@ -1,0 +1,387 @@
+id: f-filtering
+moduleId: foundations
+position: 30
+title: Filtering rows with WHERE
+slug: filtering
+difficulty: Beginner
+estimatedMinutes: 25
+summary: >-
+  Comparison, BETWEEN, IN, LIKE and the boolean operators — plus the two things
+  that catch people out: operator precedence around OR, and what happens the
+  moment a NULL enters the predicate.
+tags: [where, predicates, like, in, between, boolean-logic]
+
+prerequisites:
+  - f-select-basics
+
+objectives:
+  - Write compound predicates and parenthesise them correctly
+  - Choose between IN, BETWEEN and a chain of ORs on readability grounds
+  - Use LIKE and ILIKE, and escape a literal percent sign
+  - Predict what a filter does to rows where the compared column is NULL
+  - Recognise a predicate that cannot use an index because the column is wrapped
+    in a function
+
+concept: |
+  ## WHERE filters input rows
+
+  `WHERE` is evaluated after `FROM` and before everything else, so it works on
+  rows of the source tables. Each row is tested against the predicate and kept
+  only if the result is **true**. Not "not false" — true. That distinction has
+  no consequences until NULL appears, and then it has all of them.
+
+  ## Comparison operators
+
+  `=`, `<>` (or `!=`), `<`, `<=`, `>`, `>=` do what you expect, on any type with
+  an ordering: numbers, text (collation order), dates, timestamps, booleans.
+
+  Three more are worth knowing by name because they are not spelled like
+  operators:
+
+  - `BETWEEN a AND b` is `>= a AND <= b`. **Both ends are inclusive**, which is
+    the trap: `between '2023-01-01' and '2023-12-31'` over a `timestamp` column
+    silently drops everything that happened on 31 December after midnight,
+    because `2023-12-31 09:15` is greater than `2023-12-31 00:00`.
+  - `IN (a, b, c)` is a chain of ORs with less typing.
+  - `IS DISTINCT FROM` is `<>` that treats NULL as a comparable value. It is the
+    operator people actually want when they write `<>` and get surprised.
+
+  ## LIKE and pattern matching
+
+  `LIKE` takes two wildcards and nothing else: `%` matches any sequence of
+  characters including none, and `_` matches exactly one. It is
+  case-**sensitive**; PostgreSQL adds `ILIKE` for the case-insensitive version
+  and `~` for POSIX regular expressions.
+
+  To match a literal `%` or `_`, declare an escape character:
+
+  ```sql
+  where discount_text like '10\%' escape '\'
+  ```
+
+  ## Boolean operators and precedence
+
+  `AND` binds tighter than `OR`. This is the single most expensive precedence
+  rule in SQL because the wrong reading is plausible:
+
+  ```sql
+  where country = 'India' or country = 'Ireland' and segment = 'Enterprise'
+  ```
+
+  reads as "Indian or Irish enterprise customers" and means "every Indian
+  customer, plus Irish enterprise customers". Parenthesise anything that mixes
+  the two, every time, even when you are sure.
+
+  `NOT` binds tightest of the three. `not a = b` is `(not a) = b` in some
+  grammars and `not (a = b)` here; rather than remembering which, write the
+  comparison you mean.
+
+  ## What NULL does to a filter
+
+  Any comparison with NULL yields NULL, which is neither true nor false. A row
+  whose predicate evaluates to NULL is **not returned** — but it is also not
+  returned by the negation of that predicate, which is where the surprise lives:
+
+  ```sql
+  select count(*) from employees where dept_id = 10;      -- 13
+  select count(*) from employees where dept_id <> 10;     -- 25
+  select count(*) from employees;                         -- 40
+  ```
+
+  13 + 25 = 38, not 40. The two employees with a NULL `dept_id` are in neither
+  result. They are not missing because of a bug; they are missing because
+  "unknown = 10" is unknown and "unknown <> 10" is also unknown.
+
+  Use `IS NULL` and `IS NOT NULL` to test for NULL, never `= NULL`. The next
+  lesson is entirely about this.
+
+syntax:
+  - form: "WHERE predicate [AND|OR predicate]..."
+    notes: >-
+      Rows are kept when the predicate is true. NULL and false both drop the row.
+  - form: "expr BETWEEN low AND high"
+    notes: >-
+      Inclusive at both ends. For timestamps prefer `>= low AND < high + 1 day`,
+      a half-open range, which has no boundary ambiguity.
+  - form: "expr IN (v1, v2, ...)  |  expr IN (SELECT ...)"
+    notes: >-
+      With a subquery, NOT IN is dangerous: one NULL in the subquery result makes
+      the whole predicate NULL and the query returns nothing. See the EXISTS
+      lesson.
+  - form: "text LIKE pattern [ESCAPE char]  |  text ILIKE pattern"
+    notes: >-
+      `%` is any run of characters, `_` is exactly one. ILIKE is PostgreSQL-only.
+  - form: "a IS DISTINCT FROM b  |  a IS NOT DISTINCT FROM b"
+    notes: >-
+      NULL-aware `<>` and `=`. Two NULLs are not distinct from each other.
+
+sampleTables: [employees, customers, orders, products]
+
+examples:
+  - title: Compound predicates, parenthesised
+    sql: |
+      select emp_id, first_name, last_name, dept_id, salary
+      from employees
+      where (dept_id = 10 or dept_id = 20)
+        and salary > 150000
+        and is_active
+      order by salary desc
+    walkthrough: |
+      The brackets are load-bearing. Without them, `AND` binds tighter and the
+      query means "everyone in department 10, plus the well-paid active people
+      in department 20" — a different and much larger result.
+
+      `and is_active` with no comparison is idiomatic: the column is already
+      boolean, so `is_active = true` adds nothing. It also behaves correctly if
+      the column were nullable, because NULL would not be true and the row would
+      drop, which is usually what is wanted.
+
+  - title: IN, BETWEEN and the inclusive-boundary trap
+    sql: |
+      select order_id, order_date, status, shipping_country
+      from orders
+      where shipping_country in ('Germany', 'Ireland', 'Spain')
+        and order_date between date '2023-06-01' and date '2023-06-30'
+      order by order_date, order_id
+    walkthrough: |
+      `IN` here is three ORs written once. With a short, fixed list it is the
+      clearest form.
+
+      `BETWEEN` is safe in **this** query because `order_date` is a `date`, so
+      30 June means exactly 30 June. The same predicate against a `timestamp`
+      column would exclude almost all of the last day. The habit that never
+      breaks is the half-open range: `>= date '2023-06-01' and < date
+      '2023-07-01'`.
+
+  - title: LIKE, ILIKE and anchoring
+    sql: |
+      select customer_id, company_name, country
+      from customers
+      where company_name like '%Ltd%'
+         or company_name ilike 'c%'
+      order by customer_id
+    walkthrough: |
+      `like '%Ltd%'` matches `Ltd` anywhere, case-sensitively — `ltd` would not
+      match. `ilike 'c%'` matches anything starting with C or c.
+
+      The leading `%` in the first pattern is the expensive one: a B-tree index
+      on `company_name` can serve `like 'C%'` because the rows it wants are
+      contiguous in the index, but it cannot serve `like '%Ltd%'`, which has no
+      known prefix. That is why "search anywhere in the string" is a full-text
+      or trigram problem rather than a B-tree one.
+
+  - title: The rows a negation forgets
+    sql: |
+      select count(*)                                   as all_employees,
+             count(*) filter (where dept_id = 10)       as in_dept_10,
+             count(*) filter (where dept_id <> 10)      as not_in_dept_10,
+             count(*) filter (where dept_id is null)    as dept_unknown,
+             count(*) filter (where dept_id is distinct from 10) as distinct_from_10
+      from employees
+    walkthrough: |
+      One row that makes the three-valued logic arithmetic visible.
+      `in_dept_10 + not_in_dept_10` does not reach `all_employees`; the gap is
+      exactly `dept_unknown`.
+
+      The last column is the fix. `IS DISTINCT FROM` treats NULL as a value that
+      can differ from 10, so it counts the unknowns as "not 10" — which is
+      almost always what the person writing `<> 10` meant.
+
+      `count(*) filter (where ...)` is standard SQL and covered in the
+      aggregation module; here it is just a way to get five counts in one query.
+
+edgeCases:
+  - title: An empty IN list is a syntax error, but an empty subquery is not
+    body: >-
+      `where x in ()` does not parse. `where x in (select ...)` where the
+      subquery returns no rows is perfectly valid and matches nothing — which is
+      the correct and quiet answer. Code that builds an IN list from an
+      application array has to special-case the empty array; code that uses
+      `= any(?)` with an array parameter does not.
+    sql: |
+      select count(*) as matched
+      from employees
+      where dept_id in (select dept_id from departments where budget > 99000000)
+
+  - title: Filtering on a function of a column
+    body: >-
+      This query is correct and returns the right rows, but no index on
+      `hire_date` can help it, because the index stores `hire_date` and the
+      filter asks about `extract(year from hire_date)`. PostgreSQL can index the
+      expression itself — `create index on employees (extract(year from
+      hire_date))` — or the predicate can be rewritten as a range, which an
+      ordinary index serves.
+    sql: |
+      select emp_id, first_name, hire_date
+      from employees
+      where extract(year from hire_date) = 2020
+      order by hire_date
+
+pitfalls:
+  - mistake: Mixing AND and OR without brackets
+    why: >-
+      AND binds tighter than OR, and the English reading of the sentence binds
+      the other way. The query runs, returns a plausible number of rows, and is
+      wrong.
+    fix: >-
+      Parenthesise every mixed predicate. If the brackets make the condition
+      hard to read, that is information: it usually wants to be an IN list or a
+      join against a small set.
+
+  - mistake: Using BETWEEN on a timestamp column for a whole day or month
+    why: >-
+      BETWEEN is inclusive, so the upper bound is the instant at midnight, and
+      everything later that day is excluded. The query looks right and loses
+      about one day's data per period.
+    fix: >-
+      Use a half-open range — `>= start AND < next_start`. It needs no
+      adjustment for leap years, month lengths or the resolution of the
+      timestamp type.
+
+  - mistake: Writing `where column = NULL`
+    why: >-
+      It is grammatical and it never matches anything, including rows where the
+      column really is NULL. Nothing warns you.
+    fix: >-
+      `IS NULL`. If you need a NULL-tolerant equality between two nullable
+      expressions, use `IS NOT DISTINCT FROM`.
+
+  - mistake: Wrapping the filtered column in a function out of habit
+    why: >-
+      `where lower(email) = 'x'` and `where date(created_at) = '...'` read
+      naturally and make an ordinary index useless, because the index holds the
+      column's value and the predicate asks about a derived one.
+    fix: >-
+      Rewrite as a range where possible, or create an expression index that
+      matches the predicate exactly. Either way, confirm with EXPLAIN rather
+      than assuming.
+
+performance: |
+  A predicate is **sargable** — able to use an index — when it compares the
+  indexed column itself to a constant. `col = 5`, `col > 5`, `col between 1 and
+  9` and `col like 'abc%'` all qualify. `f(col) = 5`, `col || '' = '5'` and
+  `col like '%abc'` do not.
+
+  `IN` with a literal list is rewritten to a series of index lookups and is
+  generally efficient. `NOT IN` against a subquery is the one to be careful
+  with, and the reason is correctness before performance: a single NULL in the
+  subquery makes the whole predicate NULL for every row.
+
+  Index selectivity matters as much as index existence. A filter that matches
+  most of the table is served faster by a sequential scan, and PostgreSQL will
+  correctly choose one. An index that appears unused is often an index the
+  planner rejected on purpose.
+
+interviewQuestions:
+  - question: Why does `WHERE salary <> 100000` not return employees whose salary is NULL?
+    answer: >-
+      Because `NULL <> 100000` evaluates to NULL, not to true, and WHERE keeps
+      only rows for which the predicate is true. NULL means "unknown", so the
+      database cannot assert that an unknown salary differs from 100000. The
+      row is excluded from both the predicate and its negation. To include them,
+      write `salary IS DISTINCT FROM 100000`, or `salary <> 100000 OR salary IS
+      NULL`.
+
+  - question: What is wrong with `BETWEEN` for a date range on a timestamp column?
+    answer: >-
+      BETWEEN is inclusive at both ends, so `between '2024-01-01' and
+      '2024-01-31'` covers up to `2024-01-31 00:00:00` and silently drops the
+      rest of the 31st. The fix is a half-open range, `>= '2024-01-01' AND <
+      '2024-02-01'`, which also avoids having to know whether the month has 28,
+      30 or 31 days and works regardless of the column's precision.
+
+  - question: When can an index not be used for a WHERE clause?
+    answer: >-
+      When the predicate is not sargable — the indexed column is wrapped in a
+      function or expression, the pattern has a leading wildcard, the comparison
+      is against a different and non-implicitly-castable type, or an OR spans
+      columns that are not all covered. Also when the planner estimates that the
+      filter matches a large fraction of the table, in which case a sequential
+      scan is genuinely cheaper and the index is being ignored correctly.
+
+  - question: What is the difference between `LIKE` and `=` for a pattern with no wildcards?
+    answer: >-
+      Semantically nothing: `like 'Engineering'` matches exactly the same rows
+      as `= 'Engineering'`. The planner can also use a B-tree index for both.
+      The differences are that LIKE carries pattern semantics, so a value
+      containing `%` or `_` supplied from user input behaves unexpectedly, and
+      that LIKE will not benefit from certain optimisations on non-text types.
+      Use `=` when you mean equality.
+
+exercises:
+  - prompt: >-
+      Find every order placed in the first quarter of 2024 whose status is not
+      'cancelled', shipped to the United Kingdom or Ireland. Return order_id,
+      order_date, status and shipping_country, ordered by order_date.
+    difficulty: Easy
+    hint: >-
+      Use a half-open date range and an IN list, and remember the brackets are
+      unnecessary here because IN is a single predicate.
+    solutionSql: |
+      select order_id, order_date, status, shipping_country
+      from orders
+      where order_date >= date '2024-01-01'
+        and order_date <  date '2024-04-01'
+        and status <> 'cancelled'
+        and shipping_country in ('United Kingdom', 'Ireland')
+      order by order_date, order_id
+
+  - prompt: >-
+      List products whose name contains the word "Laptop" (case-insensitively)
+      and that are either discontinued or have fewer than 10 units in stock.
+      Return product_id, product_name, units_in_stock and discontinued.
+    difficulty: Medium
+    hint: >-
+      ILIKE with wildcards on both sides, and brackets around the OR.
+    solutionSql: |
+      select product_id, product_name, units_in_stock, discontinued
+      from products
+      where product_name ilike '%laptop%'
+        and (discontinued or units_in_stock < 10)
+      order by product_id
+
+  - prompt: >-
+      Count customers whose contact_name is unknown, and customers whose
+      contact_name differs from 'Ellen Marsh' counting unknowns as different.
+      Return two columns, unknown_contact and not_ellen.
+    difficulty: Medium
+    hint: >-
+      `IS NULL` for the first; `IS DISTINCT FROM` for the second. Both can go
+      inside `count(*) filter (where ...)`.
+    solutionSql: |
+      select count(*) filter (where contact_name is null) as unknown_contact,
+             count(*) filter (where contact_name is distinct from 'Ellen Marsh')
+                                                           as not_ellen
+      from customers
+
+checklist:
+  - WHERE keeps rows where the predicate is true — NULL and false both drop the row
+  - AND binds tighter than OR; parenthesise every mixed predicate
+  - BETWEEN is inclusive at both ends, so prefer half-open ranges for timestamps
+  - LIKE is case-sensitive; ILIKE is the PostgreSQL case-insensitive form
+  - A leading wildcard defeats a B-tree index; a trailing one does not
+  - "= NULL never matches; use IS NULL, or IS DISTINCT FROM for NULL-aware inequality"
+  - Wrapping a column in a function makes the predicate non-sargable
+  - An empty IN list is a syntax error; an empty subquery is valid and matches nothing
+
+related:
+  - f-select-basics
+  - f-nulls
+  - j-exists-in
+  - p-indexes
+
+dialect:
+  standard: >-
+    All the comparison operators, BETWEEN, IN, LIKE with ESCAPE, and IS DISTINCT
+    FROM are standard SQL.
+  postgres: >-
+    Adds ILIKE, the POSIX regex operators `~`, `~*`, `!~`, `!~*`, and the
+    `SIMILAR TO` middle ground. Also adds `= ANY(array)`, which is the form to
+    use when the list comes from an application parameter, since it handles the
+    empty array without special-casing. Text comparison follows the database
+    collation, which on most installations is case-sensitive.
+  mysql: >-
+    LIKE is case-insensitive by default under the usual `_ci` collations, so a
+    query that relies on LIKE being case-sensitive behaves differently. MySQL
+    has no ILIKE and no IS DISTINCT FROM — the equivalent is the `<=>`
+    NULL-safe equality operator, negated.

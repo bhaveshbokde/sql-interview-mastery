@@ -1,0 +1,432 @@
+id: j-set-operations
+moduleId: joins
+position: 30
+title: UNION, INTERSECT and EXCEPT
+slug: set-operations
+difficulty: Intermediate
+estimatedMinutes: 20
+summary: >-
+  Stacking result sets vertically rather than joining them horizontally. UNION
+  versus UNION ALL is the performance question; how set operators treat NULL
+  and duplicates is the correctness one.
+tags: [union, intersect, except, set-operations, deduplication]
+
+prerequisites:
+  - j-inner-outer
+
+objectives:
+  - Choose between UNION and UNION ALL and justify the choice
+  - State the three compatibility rules a set operation imposes on its branches
+  - Use EXCEPT and INTERSECT, and say what each does with duplicates
+  - Explain how set operators treat NULL differently from a WHERE clause
+  - Write a reconciliation query that finds differences in both directions
+
+concept: |
+  ## Stacking instead of joining
+
+  A join combines tables **horizontally** — the result is wider. A set operation
+  combines them **vertically** — the result is taller, with the same columns.
+
+  | Operator | Returns | Duplicates |
+  |----------|---------|------------|
+  | `UNION ALL` | every row of both branches | kept |
+  | `UNION` | every row of both branches | removed |
+  | `INTERSECT` | rows in both branches | removed |
+  | `EXCEPT` | rows in the first branch and not the second | removed |
+
+  Each has an `ALL` variant that keeps duplicates with multiset semantics —
+  `INTERSECT ALL` and `EXCEPT ALL` exist and are rarely needed.
+
+  ## Compatibility rules
+
+  Branches must agree on three things:
+
+  1. **The same number of columns.** Not negotiable.
+  2. **Compatible types, by position.** Column 1 of each branch must be
+     type-compatible with column 1 of the others. PostgreSQL will resolve a
+     common type where it can — integer and numeric become numeric — and
+     refuse where it cannot.
+  3. **Nothing about names.** Column names come from the **first** branch and
+     the others' are ignored entirely. A branch whose columns are in the wrong
+     order produces a perfectly valid query with the data in the wrong columns,
+     and this is the classic set-operation bug.
+
+  `ORDER BY` and `LIMIT` apply to the whole result and go at the end. To sort
+  or limit a single branch, wrap it in parentheses.
+
+  ## UNION versus UNION ALL
+
+  `UNION` deduplicates, which requires a sort or a hash over the entire
+  combined result. `UNION ALL` just concatenates.
+
+  **Default to `UNION ALL`.** Use `UNION` only when duplicates are genuinely
+  possible *and* undesirable. Writing `UNION` out of habit is one of the most
+  common unnecessary costs in reporting SQL, and on branches that cannot
+  overlap it is pure waste.
+
+  ## NULL in set operations
+
+  Set operators compare rows the way `DISTINCT` and `GROUP BY` do, not the way
+  `WHERE` does: **two NULLs are considered equal**. So `UNION` collapses two
+  identical rows containing NULL into one, and `INTERSECT` matches them.
+
+  That is the opposite of `=`, and it is deliberate. A deduplication rule under
+  which NULL never equals NULL would never remove any row containing one.
+
+  ## EXCEPT as an anti-join and as a diff
+
+  `EXCEPT` is the set-based way to ask "what is in A and not in B". For whole
+  rows it is the clearest option available, and it is the natural tool for
+  comparing two systems that should agree:
+
+  ```sql
+  (select ... from source except select ... from target)      -- missing in target
+  union all
+  (select ... from target except select ... from source)      -- extra in target
+  ```
+
+  Both directions, one query, and an empty result means they match. Note that
+  `EXCEPT` deduplicates, so it will not tell you that a row appears twice in
+  one and once in the other — `EXCEPT ALL` will.
+
+syntax:
+  - form: "query1 UNION [ALL] query2"
+    notes: >-
+      ALL keeps duplicates and is cheaper. Column names come from query1;
+      types must be compatible by position.
+  - form: "query1 INTERSECT [ALL] query2"
+    notes: Rows present in both. Deduplicates unless ALL is given.
+  - form: "query1 EXCEPT [ALL] query2"
+    notes: >-
+      Rows in query1 not in query2. Not symmetric. Called MINUS in Oracle.
+  - form: "(query1 ORDER BY x LIMIT n) UNION ALL (query2 ORDER BY y LIMIT m)"
+    notes: >-
+      Parentheses are required to apply ORDER BY or LIMIT to one branch rather
+      than to the whole result.
+  - form: "... ORDER BY 1, 2"
+    notes: >-
+      A trailing ORDER BY applies to the combined result and may refer to output
+      column names or positions.
+
+sampleTables: [employees, customers, orders, contacts, departments]
+
+examples:
+  - title: UNION ALL versus UNION, counted
+    sql: |
+      select 'union all' as operator, count(*) as rows
+      from (select country from customers
+            union all
+            select shipping_country from orders) t
+      union all
+      select 'union', count(*)
+      from (select country from customers
+            union
+            select shipping_country from orders) t
+      union all
+      select 'intersect', count(*)
+      from (select country from customers
+            intersect
+            select shipping_country from orders) t
+      union all
+      select 'except', count(*)
+      from (select country from customers
+            except
+            select shipping_country from orders) t
+      order by operator
+    walkthrough: |
+      `union all` is simply 22 + 151 — every row from both branches. `union`
+      collapses that to the handful of distinct country names, which is a much
+      smaller number and cost a deduplication pass to produce.
+
+      `intersect` gives the countries that appear as both a customer country
+      and a shipping country. `except` gives customer countries that no order
+      was ever shipped to — a genuinely useful question, and notice it is not
+      symmetric: swapping the branches asks something different.
+
+  - title: Building a labelled union of different row types
+    sql: |
+      select 'employee'                              as kind,
+             e.emp_id                                as id,
+             e.first_name || ' ' || e.last_name      as name,
+             e.email                                 as contact
+      from employees e
+      where e.dept_id = 20
+      union all
+      select 'customer',
+             c.customer_id,
+             c.company_name,
+             coalesce(c.contact_name, '(none)')
+      from customers c
+      where c.country = 'Sweden'
+      order by kind, id
+    walkthrough: |
+      A constant in the first column labels each branch, which is how you keep
+      track of where a row came from once the two are stacked. Without it the
+      result is a pile of names with no provenance.
+
+      The branches have different source tables and different column names —
+      `email` and `contact_name` — and that is fine, because only position
+      matters. The output column is called `contact`, from the first branch.
+
+      That naming rule is also the hazard. Swapping two columns in the second
+      branch produces a result where customer names appear under `contact` and
+      nothing complains, because `text` and `text` are compatible.
+
+  - title: Set operations treat NULL as equal
+    sql: |
+      select 'union (dedupes NULLs together)' as note,
+             count(*)                         as rows
+      from (select contact_name from customers where contact_name is null
+            union
+            select contact_name from customers where contact_name is null) t
+      union all
+      select 'union all (keeps both)',
+             count(*)
+      from (select contact_name from customers where contact_name is null
+            union all
+            select contact_name from customers where contact_name is null) t
+      union all
+      select 'intersect (NULL matches NULL)',
+             count(*)
+      from (select contact_name from customers where contact_name is null
+            intersect
+            select contact_name from customers where contact_name is null) t
+      order by note
+    walkthrough: |
+      The same NULL-valued rows put through three operators. `UNION` collapses
+      them to a single row and `INTERSECT` matches them, even though `NULL =
+      NULL` is NULL everywhere else in SQL.
+
+      This is the same exception `GROUP BY` and `DISTINCT` make. The reasoning
+      is practical: deduplication that could never remove a row containing NULL
+      would not be deduplication.
+
+  - title: A two-way reconciliation with EXCEPT
+    sql: |
+      select 'in contacts, not in customers' as direction,
+             email
+      from (select lower(email) as email from contacts
+            except
+            select lower(contact_name) from customers where contact_name is not null) a
+      union all
+      select 'customers with no contacts row',
+             name
+      from (select lower(company_name) as name from customers
+            except
+            select lower(full_name) from contacts) b
+      order by direction, email
+      limit 15
+    walkthrough: |
+      The shape that matters here is the pattern, not these particular columns:
+      `A EXCEPT B` stacked with `B EXCEPT A` gives both directions of a
+      difference in one result, and an empty result means the two sides agree.
+
+      `lower()` on both sides normalises before comparing, which is almost
+      always needed in a reconciliation — the differences you want to find are
+      real ones, not casing.
+
+      Remember that `EXCEPT` deduplicates. If a row appears three times on one
+      side and once on the other, this reports nothing; `EXCEPT ALL` reports the
+      two extras.
+
+edgeCases:
+  - title: Column names come from the first branch only
+    body: >-
+      The second branch's aliases are ignored entirely. Here the output column
+      is `label`, not `other_name`, and nothing warns that the second branch
+      called it something else. The same silence applies when the columns are in
+      the wrong order, which is why a set operation with more than two or three
+      columns deserves a careful read.
+    sql: |
+      select 'first branch' as label, 1 as n
+      union all
+      select 'second branch' as other_name, 2 as other_number
+      order by n
+
+  - title: ORDER BY applies to the whole result unless parenthesised
+    body: >-
+      A trailing ORDER BY sorts the combined output. To take the top rows of
+      each branch independently, each branch needs its own parentheses, its own
+      ORDER BY and its own LIMIT — and then the overall order is still
+      undefined without a final ORDER BY, which is why one appears here as well.
+    sql: |
+      (select 'highest' as which, first_name, salary
+       from employees order by salary desc, emp_id limit 3)
+      union all
+      (select 'lowest', first_name, salary
+       from employees order by salary, emp_id limit 3)
+      order by which, salary desc
+
+pitfalls:
+  - mistake: Using UNION when UNION ALL would do
+    why: >-
+      UNION deduplicates, which means sorting or hashing the whole combined
+      result. On branches that cannot overlap — different years, different
+      statuses, different source tables — the work is entirely wasted and the
+      query is correct, so nothing points at it.
+    fix: >-
+      Default to UNION ALL. Switch to UNION only when you can name the
+      duplicates it is there to remove.
+
+  - mistake: Relying on the second branch's column names
+    why: >-
+      Only the first branch's names survive. Code or tooling that reads the
+      result by name then finds a column that is not there, or worse, finds one
+      that is there and holds the wrong thing.
+    fix: >-
+      Alias the first branch explicitly and deliberately, and keep the branches
+      visually aligned so a positional mismatch is obvious.
+
+  - mistake: Expecting EXCEPT to be symmetric
+    why: >-
+      It reads like "difference", and set difference is directional. `A EXCEPT
+      B` says nothing about rows that are only in B.
+    fix: >-
+      For a full comparison, union both directions, or use a FULL JOIN with
+      IS NULL tests on each side.
+
+  - mistake: Forgetting that EXCEPT and INTERSECT deduplicate
+    why: >-
+      They are set operators, so cardinality is discarded. A reconciliation that
+      should report "three copies here, one there" reports nothing.
+    fix: >-
+      Use EXCEPT ALL or INTERSECT ALL, which use multiset semantics and preserve
+      counts.
+
+performance: |
+  `UNION ALL` is the cheapest: it appends, and PostgreSQL can even return rows
+  from the first branch before the second has started. `UNION`, `INTERSECT` and
+  `EXCEPT` all require materialising and deduplicating, via a sort or a hash,
+  so they are blocking operations with memory proportional to the result.
+
+  A `WHERE` condition outside a set operation can usually be pushed into each
+  branch by the planner, so a filtered view built on a UNION ALL is not
+  automatically slow.
+
+  `EXCEPT` and `NOT EXISTS` express similar things with different plans:
+  `NOT EXISTS` becomes an anti-join that can stop at the first match per row,
+  while `EXCEPT` builds both full result sets and subtracts. For "rows of this
+  table with no match in that one", `NOT EXISTS` is usually faster; for
+  comparing two arbitrary result sets, `EXCEPT` is the clearer and often the
+  only practical tool.
+
+interviewQuestions:
+  - question: What is the difference between UNION and UNION ALL?
+    answer: >-
+      UNION removes duplicate rows from the combined result, which requires a
+      sort or hash over everything; UNION ALL simply concatenates. UNION ALL is
+      therefore cheaper and should be the default, with UNION reserved for cases
+      where duplicates genuinely arise and are unwanted. A subtlety worth
+      mentioning: UNION treats two NULLs as equal when deduplicating, unlike the
+      `=` operator, because otherwise rows containing NULL could never be
+      deduplicated.
+
+  - question: What rules must the branches of a UNION satisfy?
+    answer: >-
+      Same number of columns, and type-compatible columns by position —
+      PostgreSQL resolves a common type where one exists. Column names are not
+      required to match and are taken from the first branch; the rest are
+      discarded. That last rule is the dangerous one, because two branches with
+      swapped columns of the same type produce a valid query that puts data in
+      the wrong columns with no error.
+
+  - question: How would you find rows that differ between two tables?
+    answer: >-
+      `A EXCEPT B` gives rows in A not in B, and `B EXCEPT A` the reverse; union
+      the two for a complete diff, and an empty result means they agree. A FULL
+      OUTER JOIN with IS NULL tests on both sides does the same and additionally
+      shows matched rows with their differing columns side by side. Note that
+      EXCEPT deduplicates, so use EXCEPT ALL if differing row counts matter.
+
+  - question: Why is UNION sometimes slower than you expect even when the branches are small?
+    answer: >-
+      Because deduplication is over the combined result and is a blocking
+      operation — nothing can be returned until both branches have been read
+      fully and the hash or sort is complete. With a LIMIT on the outer query,
+      UNION ALL can stream and stop early, while UNION cannot. On wide rows the
+      deduplication also compares every column, so the cost scales with row
+      width as well as row count.
+
+exercises:
+  - prompt: >-
+      Produce a single list of the countries that appear either as a customer
+      country or as an order shipping country, with no duplicates. One column,
+      country, ordered alphabetically.
+    difficulty: Easy
+    hint: UNION is correct here, because the two sources genuinely overlap.
+    solutionSql: |
+      select country from customers
+      union
+      select shipping_country from orders
+      order by country
+
+  - prompt: >-
+      Return the three highest-paid and the three lowest-paid employees in one
+      result, labelled. Columns band, full_name, salary. Order by band then
+      salary descending.
+    difficulty: Medium
+    hint: >-
+      Each branch needs its own parentheses so its ORDER BY and LIMIT apply to
+      that branch alone.
+    solutionSql: |
+      (select 'highest' as band,
+              first_name || ' ' || last_name as full_name,
+              salary
+       from employees
+       order by salary desc, emp_id
+       limit 3)
+      union all
+      (select 'lowest',
+              first_name || ' ' || last_name,
+              salary
+       from employees
+       order by salary, emp_id
+       limit 3)
+      order by band, salary desc
+
+  - prompt: >-
+      Find the departments that have at least one employee earning over 180000
+      but no employee hired in 2023. Return dept_id, ordered ascending, using
+      INTERSECT and EXCEPT.
+    difficulty: Hard
+    hint: >-
+      One branch for "has a high earner", one for "hired someone in 2023", and
+      EXCEPT between them.
+    solutionSql: |
+      select dept_id from employees where salary > 180000 and dept_id is not null
+      except
+      select dept_id from employees
+      where dept_id is not null
+        and hire_date >= date '2023-01-01'
+        and hire_date <  date '2024-01-01'
+      order by dept_id
+
+checklist:
+  - Joins combine horizontally, set operations combine vertically
+  - "UNION ALL concatenates; UNION deduplicates and costs a sort or hash"
+  - Default to UNION ALL and justify every UNION
+  - Branches need the same column count and compatible types by position
+  - Column names come from the first branch; the others are discarded silently
+  - Set operators treat two NULLs as equal, unlike `=`
+  - "EXCEPT is directional; union both directions for a full diff"
+  - A trailing ORDER BY applies to the whole result — parenthesise to sort a branch
+
+related:
+  - j-inner-outer
+  - j-exists-in
+  - f-nulls
+  - p06-customers-who-never-ordered
+
+dialect:
+  standard: >-
+    UNION, UNION ALL, INTERSECT, EXCEPT and their ALL variants are all standard
+    SQL, as is the rule that column names come from the first branch.
+  postgres: >-
+    Implements all of them including INTERSECT ALL and EXCEPT ALL, and resolves
+    a common type across branches where one exists. Parenthesised branches may
+    carry their own ORDER BY and LIMIT.
+  mysql: >-
+    Has UNION and UNION ALL; INTERSECT and EXCEPT arrived only in MySQL 8.0.31,
+    so older code emulates them with joins and NOT EXISTS. Oracle spells EXCEPT
+    as MINUS, which is the same operator under a different name and a common
+    source of confusion in mixed shops.

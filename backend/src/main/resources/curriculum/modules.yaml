@@ -1,0 +1,100 @@
+# The nine modules of the curriculum.
+#
+# `position` is the order they are meant to be worked through, and it is a
+# DEPENDENCY order rather than a difficulty order. Window functions come before
+# schema design even though window functions are harder, because the interview
+# problems lean on window functions constantly and on normal forms almost
+# never. Transactions and indexes come last not because they matter least but
+# because they are the topics a candidate is asked to *discuss* rather than to
+# write, and discussing them is easier once you can see what a query does.
+
+- id: foundations
+  position: 1
+  title: Foundations
+  slug: foundations
+  icon: database
+  summary: >-
+    What a relational database actually is, what the pieces of a SELECT do, the
+    order they happen in, and why NULL behaves the way it does. Everything
+    later in the course assumes this module.
+
+- id: aggregation
+  position: 2
+  title: Aggregation and grouping
+  slug: aggregation
+  icon: sigma
+  summary: >-
+    Collapsing many rows into one. GROUP BY, HAVING, the aggregate functions
+    and how each of them treats NULL, and conditional aggregation with CASE —
+    which is the single most useful trick in this module.
+
+- id: joins
+  position: 3
+  title: Joins and set operations
+  slug: joins
+  icon: git-merge
+  summary: >-
+    Combining tables. The four join types and what each one does to rows with
+    no match, why a join can return more rows than either input, the set
+    operators, and the EXISTS / IN / NOT IN distinctions that interviews
+    return to again and again.
+
+- id: intermediate
+  position: 4
+  title: Intermediate SQL
+  slug: intermediate
+  icon: layers
+  summary: >-
+    Subqueries in each position they can appear, common table expressions
+    including recursive ones, views, and the function libraries for dates,
+    strings, numbers and JSON that real queries are mostly made of.
+
+- id: windows
+  position: 5
+  title: Window functions
+  slug: window-functions
+  icon: chart-bar
+  summary: >-
+    Computing across a set of rows without collapsing them. Ranking, offsets,
+    frames, running totals and top-N-per-group — the techniques behind most
+    medium and hard SQL interview questions.
+
+- id: schema-design
+  position: 6
+  title: Schema design
+  slug: schema-design
+  icon: table
+  summary: >-
+    Keys, constraints, relationships and normal forms, up to BCNF, plus when
+    to denormalise and what it costs. The module that answers "design a schema
+    for X" at a whiteboard.
+
+- id: transactions
+  position: 7
+  title: Transactions and concurrency
+  slug: transactions
+  icon: shield
+  summary: >-
+    ACID, the isolation levels and exactly which anomaly each one permits,
+    PostgreSQL's MVCC, locks, deadlocks, and how all of this surfaces in a
+    Spring application.
+
+- id: performance
+  position: 8
+  title: Indexes and performance
+  slug: performance
+  icon: gauge
+  summary: >-
+    How an index is used and when it is ignored, how to read an execution
+    plan, how to investigate a slow query, and the two access patterns —
+    OFFSET pagination and N+1 — that cause most real-world database pain.
+
+- id: postgres-backend
+  position: 9
+  title: Advanced PostgreSQL and backend usage
+  slug: postgres-and-backend
+  icon: server
+  summary: >-
+    UPSERT, RETURNING, sequences, JSONB indexing, partitioning, migrations,
+    connection pooling, and the JDBC and JPA questions that come up when the
+    interview moves from SQL to the application that issues it.

@@ -1,0 +1,296 @@
+id: p05-department-top-earners
+position: 50
+title: Highest-paid employee in each department
+slug: department-top-earners
+difficulty: Medium
+topic: Window functions
+tags: [top-n-per-group, distinct-on, lateral, latest-per-group]
+
+orderSensitive: false
+
+statement: |
+  For every department, including those with no employees, return the
+  highest-paid employee and their salary.
+
+  A department with no employees must appear with NULLs rather than being
+  omitted. Where two employees share the highest salary in a department,
+  return the one with the lower `emp_id`.
+
+tables: [employees, departments]
+
+expectedColumns: [dept_name, top_earner, salary]
+
+edgeCases:
+  - Research has no employees and must appear with NULLs.
+  - >-
+    A tie for the highest salary needs a deterministic tiebreak, or the answer
+    changes between runs.
+  - >-
+    Employees with no department must not be attached to any department, and
+    must not form a group of their own.
+  - >-
+    `max(salary)` grouped by department gives the right salary and cannot tell
+    you whose it is — that is the trap this problem exists to expose.
+
+hints:
+  - >-
+    "The highest-paid employee" identifies a row, not a value. An aggregate
+    returns a value.
+  - >-
+    Three constructs identify a top-1 row per group. One is PostgreSQL-only
+    and very short.
+  - The empty department is what forces an outer join somewhere in the answer.
+
+solutionSql: |
+  select d.dept_name,
+         top.full_name as top_earner,
+         top.salary
+  from departments d
+  left join lateral (
+        select e.first_name || ' ' || e.last_name as full_name,
+               e.salary
+        from employees e
+        where e.dept_id = d.dept_id
+        order by e.salary desc, e.emp_id
+        limit 1) top on true
+  order by d.dept_name
+
+explanation:
+  lineByLine:
+    - clause: "left join lateral (...) on true"
+      note: >-
+        LATERAL lets the subquery reference `d.dept_id` from the row it is
+        being joined to. LEFT keeps departments whose subquery returned
+        nothing. `ON true` is required by the grammar — the correlation is
+        already expressed inside the subquery.
+    - clause: "where e.dept_id = d.dept_id"
+      note: >-
+        The correlation itself. This reference to the outer query is exactly
+        what an ordinary FROM subquery may not do and LATERAL permits.
+    - clause: "order by e.salary desc, e.emp_id"
+      note: >-
+        Defines "highest paid" and breaks ties deterministically. Without the
+        emp_id key, a department with two employees on the same top salary
+        could return either.
+    - clause: "limit 1"
+      note: >-
+        Applied **per department**, which is what a window function cannot do.
+        With an index on (dept_id, salary desc) this reads one index entry per
+        department rather than sorting every employee.
+
+  walkthrough: |
+    For each of the six departments, the lateral subquery runs with that
+    department's id bound, sorts its employees by descending salary and takes
+    the first.
+
+    Engineering returns Vikram Shetty on 245000, Sales returns Daniel
+    Fernandes on 251000 — who out-earns his own VP, which the previous problem
+    found. Customer Support returns Rahul Menon on 178000.
+
+    Research returns nothing from the subquery, and because the join is LEFT
+    the department still appears with NULL in both columns. Swap `LEFT JOIN
+    LATERAL ... ON true` for `CROSS JOIN LATERAL` and Research disappears,
+    which is the single difference between the two forms.
+
+    The two employees with no department are never considered, because no
+    department's `d.dept_id` matches their NULL.
+
+  alternatives:
+    - title: DISTINCT ON
+      sql: |
+        select d.dept_name,
+               t.full_name as top_earner,
+               t.salary
+        from departments d
+        left join (
+              select distinct on (e.dept_id)
+                     e.dept_id,
+                     e.first_name || ' ' || e.last_name as full_name,
+                     e.salary
+              from employees e
+              where e.dept_id is not null
+              order by e.dept_id, e.salary desc, e.emp_id) t on t.dept_id = d.dept_id
+        order by d.dept_name
+      when: >-
+        The shortest PostgreSQL spelling of top-1-per-group. It needs the
+        outer LEFT JOIN to keep the empty department, because DISTINCT ON can
+        only return groups that have rows.
+      equivalent: true
+
+    - title: ROW_NUMBER, the portable form
+      sql: |
+        with ranked as (
+            select e.dept_id,
+                   e.first_name || ' ' || e.last_name as full_name,
+                   e.salary,
+                   row_number() over (partition by e.dept_id
+                                      order by e.salary desc, e.emp_id) as rn
+            from employees e
+            where e.dept_id is not null
+        )
+        select d.dept_name,
+               r.full_name as top_earner,
+               r.salary
+        from departments d
+        left join ranked r on r.dept_id = d.dept_id and r.rn = 1
+        order by d.dept_name
+      when: >-
+        When the query must run on a database without DISTINCT ON or LATERAL.
+        Note the `and r.rn = 1` is in the ON clause rather than in WHERE —
+        putting it in WHERE would drop Research and turn the outer join into
+        an inner one.
+      equivalent: true
+
+  performance: |
+    LATERAL with LIMIT 1 is the cheapest of the three when an index on
+    `(dept_id, salary desc)` exists: one index seek and one entry read per
+    department, so the work is proportional to the number of departments
+    rather than to the number of employees.
+
+    `DISTINCT ON` and `ROW_NUMBER` both sort every employee once. With few
+    groups and many rows per group they are competitive; with many groups and
+    few rows each, LATERAL wins decisively.
+
+    The crossover depends on the group count, the rows per group and whether
+    the index exists. The honest answer in an interview is to name the
+    trade-off and say you would measure all three with `EXPLAIN (ANALYZE,
+    BUFFERS)`, which takes two minutes.
+
+  wrongApproaches:
+    - title: "max(salary) grouped by department"
+      sql: |
+        select d.dept_name,
+               max(e.salary) as salary,
+               count(e.emp_id) as employees
+        from departments d
+        left join employees e on e.dept_id = d.dept_id
+        group by d.dept_name
+        order by d.dept_name
+      whyWrong: >-
+        Gives the right salary and cannot name the person. Adding
+        `e.first_name` to the select list is rejected by PostgreSQL, because
+        there is no single first name per group. In MySQL without
+        ONLY_FULL_GROUP_BY the same query is accepted and returns a name from
+        an arbitrary row — which is the worst of both worlds, since the result
+        looks correct.
+
+    - title: Join back on the maximum salary
+      sql: |
+        select d.dept_name,
+               e.first_name || ' ' || e.last_name as top_earner,
+               e.salary
+        from departments d
+        left join employees e
+               on e.dept_id = d.dept_id
+              and e.salary = (select max(e2.salary) from employees e2
+                              where e2.dept_id = d.dept_id)
+        order by d.dept_name, e.emp_id
+      whyWrong: >-
+        Correct in spirit and wrong on ties — a department with two employees
+        on the top salary returns two rows, so the result is no longer one row
+        per department. There is no clean place to add a tiebreak, which is
+        why the top-1 constructs exist.
+
+    - title: The filter in WHERE instead of ON
+      sql: |
+        with ranked as (
+            select e.dept_id,
+                   e.first_name || ' ' || e.last_name as full_name,
+                   e.salary,
+                   row_number() over (partition by e.dept_id
+                                      order by e.salary desc, e.emp_id) as rn
+            from employees e
+            where e.dept_id is not null
+        )
+        select d.dept_name, r.full_name as top_earner, r.salary
+        from departments d
+        left join ranked r on r.dept_id = d.dept_id
+        where r.rn = 1
+        order by d.dept_name
+      whyWrong: >-
+        The LEFT JOIN produces a NULL-extended row for Research, and
+        `where r.rn = 1` evaluates `NULL = 1`, which is NULL and therefore not
+        true. Research is dropped and the outer join has quietly become an
+        inner one.
+
+  extraTests:
+    - name: Empty and single-employee departments (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt has a department with no employees (Operations) and one
+        with a tie at the top (Sales, where Grace Hopper and Edsger Dijkstra
+        both earn 150000). The tiebreak must resolve to the lower emp_id and
+        Operations must appear with NULLs.
+      sql: |
+        select d.dept_name,
+               top.full_name as top_earner,
+               top.salary
+        from departments d
+        left join lateral (
+              select e.first_name || ' ' || e.last_name as full_name,
+                     e.salary
+              from employees e
+              where e.dept_id = d.dept_id
+              order by e.salary desc, e.emp_id
+              limit 1) top on true
+        order by d.dept_name
+
+    - name: What CROSS JOIN LATERAL drops
+      schema: learning
+      note: >-
+        The same query with CROSS instead of LEFT returns five rows instead of
+        six. The missing one is Research, and this is the single-line
+        difference between "every department" and "every department that has
+        someone".
+      sql: |
+        select count(*) as departments_returned
+        from departments d
+        cross join lateral (
+              select e.salary
+              from employees e
+              where e.dept_id = d.dept_id
+              order by e.salary desc, e.emp_id
+              limit 1) top
+
+  followUps:
+    - question: How would you return the top three instead of the top one?
+      answer: >-
+        Change `LIMIT 1` to `LIMIT 3` in the lateral subquery, or filter on
+        `rn <= 3` in the window version. The lateral form scales naturally
+        because the limit is per group; the window form computes a rank for
+        every row regardless of n. Note that with ties at the boundary the two
+        give different answers, and DENSE_RANK is needed if "three distinct
+        salaries" is meant rather than "three employees".
+
+    - question: Why can you not just add the name to a GROUP BY with max()?
+      answer: >-
+        Because an aggregate collapses the group to one value per column and
+        there is no single name in a group of fifteen employees. PostgreSQL
+        rejects it; MySQL without ONLY_FULL_GROUP_BY returns a value from an
+        arbitrary row, which is worse because it is silently wrong. The general
+        principle is that aggregates identify values and window functions or
+        DISTINCT ON identify rows.
+
+    - question: How would you find the most recent order per customer?
+      answer: >-
+        Exactly the same shape with different columns — DISTINCT ON
+        (customer_id) ordered by order_date descending, or ROW_NUMBER = 1, or
+        LATERAL with LIMIT 1. Latest-per-entity and top-1-per-group are the
+        same problem, which is worth recognising because it recurs constantly:
+        current status from a history table, last known price, most recent
+        login.
+
+    - question: Which index would make the LATERAL version fast?
+      answer: >-
+        `(dept_id, salary desc, emp_id)`. The leading column lets the subquery
+        seek straight to the department, the second supplies the ordering so
+        no sort is needed, and the third covers the tiebreak. The subquery then
+        reads exactly one index entry per department and stops, which is what
+        makes the lateral form scale with the group count rather than the table
+        size.
+
+  related:
+    - w-top-n-per-group
+    - j-self-cross
+    - j-inner-outer
+    - p02-nth-highest-salary

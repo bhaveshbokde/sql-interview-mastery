@@ -1,0 +1,382 @@
+id: p18-category-tree-depth
+position: 170
+title: Category tree with rolled-up product counts
+slug: category-tree-depth
+difficulty: Medium
+topic: Recursive CTEs
+tags: [recursive-cte, hierarchy, rollup, breadcrumb, forest]
+
+orderSensitive: true
+
+statement: |
+  Return the category hierarchy as a tree, in depth-first order.
+
+  For each category give its depth, its full breadcrumb path separated by
+  ` > `, the number of products assigned **directly** to it, and the number
+  in its whole subtree including itself.
+
+  There is more than one root, and at least one category has no products.
+
+tables: [categories, products]
+
+expectedColumns: [depth, breadcrumb, direct_products, subtree_products]
+
+edgeCases:
+  - >-
+    There are two roots — Electronics and Home — so the anchor returns more
+    than one row and the result is a forest, not a tree.
+  - >-
+    Parent categories hold no products directly, so direct_products is 0 for
+    them while subtree_products is not.
+  - >-
+    One leaf category has no products at all and must show 0 in both columns
+    rather than being omitted.
+  - >-
+    Depth-first order across several roots needs the path to start with the
+    root, which it does naturally.
+
+hints:
+  - A forest is no harder than a tree — the anchor simply returns several rows.
+  - >-
+    Build the breadcrumb by concatenating onto the parent's as you descend.
+  - >-
+    "Everything in the subtree" is an ancestor-descendant question, which the
+    accumulated path answers.
+
+solutionSql: |
+  with recursive tree as (
+      select c.category_id,
+             c.category_name,
+             c.parent_category_id,
+             1                             as depth,
+             c.category_name::text         as breadcrumb,
+             array[c.category_id]          as path
+      from categories c
+      where c.parent_category_id is null
+      union all
+      select c.category_id,
+             c.category_name,
+             c.parent_category_id,
+             t.depth + 1,
+             t.breadcrumb || ' > ' || c.category_name,
+             t.path || c.category_id
+      from categories c
+      join tree t on t.category_id = c.parent_category_id
+      where t.depth < 20
+        and not c.category_id = any (t.path)
+  ),
+  direct as (
+      select category_id, count(*) as n
+      from products
+      group by category_id
+  )
+  select t.depth,
+         t.breadcrumb,
+         coalesce(d.n, 0)                                      as direct_products,
+         (select coalesce(sum(coalesce(d2.n, 0)), 0)
+          from tree t2
+          left join direct d2 on d2.category_id = t2.category_id
+          where t.category_id = any (t2.path))                 as subtree_products
+  from tree t
+  left join direct d on d.category_id = t.category_id
+  order by t.path
+
+explanation:
+  lineByLine:
+    - clause: "where c.parent_category_id is null"
+      note: >-
+        The anchor. It returns two rows here, so the recursion descends from
+        both roots simultaneously. Nothing in the structure assumes a single
+        root — a forest costs no extra code.
+    - clause: "t.breadcrumb || ' > ' || c.category_name"
+      note: >-
+        Builds the path string as it descends, so each level appends its own
+        name to the parent's breadcrumb. The `::text` cast on the anchor fixes
+        the column's type as text rather than the column's own varchar-like
+        type, so the concatenation in the recursive term type-checks.
+    - clause: "t.path || c.category_id"
+      note: >-
+        The array of ancestor ids. Used for the cycle guard, for depth-first
+        ordering, and for the subtree membership test.
+    - clause: "not c.category_id = any (t.path)"
+      note: >-
+        Prevents a cycle. No constraint stops a category being made its own
+        ancestor by an UPDATE, so a traversal over data you do not fully
+        control needs this.
+    - clause: "where t.category_id = any (t2.path)"
+      note: >-
+        The subtree test. A category is beneath `t` exactly when `t` appears
+        in its path — which includes the category itself, since the path
+        starts with its own id.
+    - clause: "order by t.path"
+      note: >-
+        Depth-first. Arrays compare element by element, so a parent sorts
+        immediately before its descendants and both roots' subtrees stay
+        intact.
+
+  walkthrough: |
+    The anchor returns Electronics and Home, both at depth 1. Round two finds
+    Computers and Audio under Electronics, and Kitchen, Furniture and
+    Lighting under Home. Round three finds Laptops and Accessories under
+    Computers. Round four produces nothing and the recursion stops.
+
+    `direct` counts products per category in one pass. Parent categories
+    appear with 0 because every product is assigned to a leaf.
+
+    `subtree_products` sums the direct counts of every category whose path
+    contains this one. Electronics therefore totals Computers, Laptops,
+    Accessories and Audio, even though it holds nothing itself — which is
+    almost always what a business means by "products in Electronics".
+
+    Lighting has no products and no children, so both columns are 0. It
+    appears in the result because the tree is built from `categories`, not
+    from `products`.
+
+    The breadcrumb reads as a path — `Electronics > Computers > Laptops` —
+    which is the form a navigation menu or a search facet needs.
+
+  alternatives:
+    - title: A closure table built in the same query
+      sql: |
+        with recursive closure as (
+            select category_id as ancestor_id,
+                   category_id as descendant_id,
+                   0           as distance
+            from categories
+            union all
+            select cl.ancestor_id,
+                   c.category_id,
+                   cl.distance + 1
+            from closure cl
+            join categories c on c.parent_category_id = cl.descendant_id
+            where cl.distance < 20
+        )
+        select a.category_name                       as ancestor,
+               count(distinct cl.descendant_id)      as categories_in_subtree,
+               coalesce(sum(p.n), 0)                 as subtree_products,
+               max(cl.distance)                      as subtree_depth
+        from closure cl
+        join categories a on a.category_id = cl.ancestor_id
+        left join (select category_id, count(*) as n from products group by category_id) p
+               on p.category_id = cl.descendant_id
+        group by a.category_id, a.category_name
+        order by subtree_products desc, a.category_name
+      when: >-
+        When several subtree questions are asked at once, or when the closure
+        would be stored permanently. Materialising every ancestor-descendant
+        pair once and aggregating over it is cheaper than a correlated
+        subtree test per row, and it is exactly the structure a closure table
+        holds.
+      equivalent: false
+
+    - title: Direct counts only, no recursion
+      sql: |
+        select c.category_id,
+               c.category_name,
+               p.category_name        as parent_name,
+               count(pr.product_id)   as direct_products
+        from categories c
+        left join categories p  on p.category_id = c.parent_category_id
+        left join products pr   on pr.category_id = c.category_id
+        group by c.category_id, c.category_name, p.category_name
+        order by c.category_id
+      when: >-
+        When only the immediate parent and the direct counts are needed. A
+        self join gives one level and needs no recursion — which is the right
+        answer when the depth is known and small, and the wrong one as soon
+        as "everything underneath" is asked.
+      equivalent: false
+
+  performance: |
+    The recursion is cheap: nine categories and four levels, with an index on
+    `categories(parent_category_id)` not even present because the table is
+    tiny. On a deep tree that index is what keeps each level an index scan
+    rather than a sequential one.
+
+    The `subtree_products` correlated subquery is the expensive part. It
+    re-scans the recursion's output for every row and tests array containment,
+    which no index can serve — so it is quadratic in the number of
+    categories. At nine that is 81 comparisons; at nine thousand it would be
+    the whole query.
+
+    The closure-table alternative computes every ancestor-descendant pair once
+    and aggregates in a single pass, which is linear in the number of pairs.
+    For a hierarchy of any size that is the right structure, and for one read
+    constantly it should be a real table maintained by triggers rather than
+    rebuilt per query.
+
+    `direct` is a single grouped scan of `products` and is reused by both the
+    outer join and the subquery, so the product table is read once.
+
+  wrongApproaches:
+    - title: Counting only direct products and calling it the subtree
+      sql: |
+        with recursive tree as (
+            select category_id, category_name, parent_category_id, 1 as depth,
+                   category_name::text as breadcrumb, array[category_id] as path
+            from categories where parent_category_id is null
+            union all
+            select c.category_id, c.category_name, c.parent_category_id, t.depth + 1,
+                   t.breadcrumb || ' > ' || c.category_name, t.path || c.category_id
+            from categories c join tree t on t.category_id = c.parent_category_id
+            where t.depth < 20
+        )
+        select t.depth, t.breadcrumb, count(p.product_id) as products
+        from tree t
+        left join products p on p.category_id = t.category_id
+        group by t.depth, t.breadcrumb, t.path
+        order by t.path
+      whyWrong: >-
+        Reports 0 products for Electronics, Computers and Home, because every
+        product is assigned to a leaf. A category page built on this shows an
+        empty Electronics section while Laptops beneath it has four products
+        — the single most common complaint about hierarchical catalogues.
+
+    - title: Joining products to the tree and summing without the subtree test
+      sql: |
+        with recursive tree as (
+            select category_id, parent_category_id, 1 as depth, array[category_id] as path
+            from categories where parent_category_id is null
+            union all
+            select c.category_id, c.parent_category_id, t.depth + 1, t.path || c.category_id
+            from categories c join tree t on t.category_id = c.parent_category_id
+            where t.depth < 20
+        )
+        select t.depth,
+               count(*)                       as rows_produced,
+               count(distinct t.category_id)  as categories
+        from tree t
+        join products p on p.category_id = any (t.path)
+        group by t.depth
+        order by t.depth
+      whyWrong: >-
+        Reverses the containment test. `p.category_id = any (t.path)` asks
+        whether the product's category is an **ancestor** of this node, which
+        is backwards — it attributes a product to every descendant of its own
+        category rather than to every ancestor. The row count balloons and
+        the attribution is inverted.
+
+    - title: Fixed-depth self joins
+      sql: |
+        select c1.category_name as level1,
+               c2.category_name as level2,
+               c3.category_name as level3
+        from categories c1
+        left join categories c2 on c2.parent_category_id = c1.category_id
+        left join categories c3 on c3.parent_category_id = c2.category_id
+        where c1.parent_category_id is null
+        order by c1.category_name, c2.category_name, c3.category_name
+      whyWrong: >-
+        Works for exactly three levels and silently truncates a fourth. It
+        also produces a wide result with one column per level rather than one
+        row per category, so the depth is encoded in the shape of the output
+        and cannot be queried. Adding a level means editing the query, which
+        is the definition of a structure that should have been a recursion.
+
+  extraTests:
+    - name: A two-level forest with one root (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt has Everything at the root and Gadgets beneath it, with
+        products on both. The root's subtree count must include its own direct
+        product as well as its child's — a case the main dataset does not
+        exercise, because there no parent holds products directly.
+      sql: |
+        with recursive tree as (
+            select c.category_id,
+                   c.category_name,
+                   c.parent_category_id,
+                   1                     as depth,
+                   c.category_name::text as breadcrumb,
+                   array[c.category_id]  as path
+            from categories c
+            where c.parent_category_id is null
+            union all
+            select c.category_id,
+                   c.category_name,
+                   c.parent_category_id,
+                   t.depth + 1,
+                   t.breadcrumb || ' > ' || c.category_name,
+                   t.path || c.category_id
+            from categories c
+            join tree t on t.category_id = c.parent_category_id
+            where t.depth < 20
+              and not c.category_id = any (t.path)
+        ),
+        direct as (
+            select category_id, count(*) as n from products group by category_id
+        )
+        select t.depth,
+               t.breadcrumb,
+               coalesce(d.n, 0) as direct_products,
+               (select coalesce(sum(coalesce(d2.n, 0)), 0)
+                from tree t2
+                left join direct d2 on d2.category_id = t2.category_id
+                where t.category_id = any (t2.path)) as subtree_products
+        from tree t
+        left join direct d on d.category_id = t.category_id
+        order by t.path
+
+    - name: Every category is reachable from a root
+      schema: learning
+      note: >-
+        The traversal must return as many rows as the table has. A shortfall
+        means a category whose parent does not exist, or a disconnected
+        cycle — both of which the recursion omits silently.
+      sql: |
+        with recursive tree as (
+            select category_id, 1 as depth from categories where parent_category_id is null
+            union all
+            select c.category_id, t.depth + 1
+            from categories c join tree t on t.category_id = c.parent_category_id
+            where t.depth < 20
+        )
+        select (select count(*) from tree)                            as reachable,
+               (select count(*) from categories)                      as total,
+               (select count(*) from categories) - (select count(*) from tree) as unreachable,
+               (select max(depth) from tree)                          as deepest,
+               (select count(*) from categories where parent_category_id is null) as roots
+
+  followUps:
+    - question: Why does a forest need no special handling?
+      answer: >-
+        Because the anchor is a query like any other — if it returns three
+        rows, the recursion simply descends from all three in parallel, and
+        each row's path begins with its own root so the depth-first ordering
+        keeps the subtrees separate. Nothing in a recursive CTE assumes a
+        single starting point, which is worth knowing because the single-root
+        case is the one every tutorial shows.
+
+    - question: How would you store this hierarchy for fast subtree queries?
+      answer: >-
+        A closure table with one row per ancestor-descendant pair including
+        self, maintained by triggers. "All products under Electronics" then
+        becomes a join on `ancestor_id = ?` with an index, instead of a
+        recursive traversal plus an array containment test. The cost is
+        O(depth) rows written per insert and a subtree rewrite on move, which
+        is the right trade when reads vastly outnumber writes — as they do for
+        a product catalogue.
+
+    - question: What does the ::text cast on the anchor do?
+      answer: >-
+        It fixes the breadcrumb column's type at text, so the recursive term's
+        concatenation produces the same type. Without it the anchor's type is
+        inferred from `category_name` and the recursive term's longer string
+        may not match, which PostgreSQL reports as a type mismatch between the
+        two branches of the UNION. Casting the anchor is the standard fix and
+        a common stumbling block when building strings in a recursion.
+
+    - question: How would you find the depth of the deepest leaf under each category?
+      answer: >-
+        Carry the depth as here, then for each category take
+        `max(t2.depth) - t.depth` over the rows whose path contains it — the
+        same subtree test with a different aggregate. With a closure table it
+        is `max(distance)` grouped by ancestor, which is one indexed
+        aggregation rather than a correlated scan, and is the form to prefer
+        once the tree is more than a few hundred nodes.
+
+  related:
+    - i-recursive-cte
+    - s-relationships
+    - j-self-cross
+    - p17-recursive-org-chart

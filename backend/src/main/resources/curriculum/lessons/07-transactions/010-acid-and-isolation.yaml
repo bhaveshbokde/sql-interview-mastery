@@ -1,0 +1,477 @@
+id: t-acid-isolation
+moduleId: transactions
+position: 10
+title: ACID and isolation levels
+slug: acid-and-isolation-levels
+difficulty: Advanced
+estimatedMinutes: 30
+summary: >-
+  What each ACID letter actually guarantees, the four isolation levels, and
+  exactly which anomaly each one permits — including the two PostgreSQL
+  prevents that the standard allows.
+tags: [acid, isolation, transactions, anomalies, serializable]
+
+prerequisites:
+  - s-keys-constraints
+
+objectives:
+  - State what each of the four ACID properties guarantees
+  - Name the four isolation levels and the anomalies each permits
+  - Describe dirty read, non-repeatable read, phantom read and write skew
+  - Explain how PostgreSQL's levels differ from the standard's
+  - Choose an isolation level for a given requirement
+
+concept: |
+  ## ACID
+
+  - **Atomicity** — all of a transaction's changes happen, or none do. A
+    failure halfway leaves no trace. Implemented by the write-ahead log and
+    rollback.
+  - **Consistency** — the transaction moves the database from one valid state
+    to another, where "valid" means satisfying every constraint. This is the
+    least precise letter: the database enforces the constraints you declared,
+    and the *application* is responsible for whatever invariants you did not.
+  - **Isolation** — concurrent transactions do not see each other's
+    intermediate states. How much they do not see is the isolation level, and
+    it is the whole subject of this lesson.
+  - **Durability** — once committed, the change survives a crash. Implemented
+    by flushing the WAL to disk before acknowledging the commit.
+
+  Atomicity and durability are near-absolute. Isolation is a dial, and
+  consistency depends on how you set it.
+
+  ## The anomalies
+
+  | Anomaly | What happens |
+  |---------|--------------|
+  | **Dirty read** | You read a row another transaction has written but not committed. |
+  | **Non-repeatable read** | You read a row twice and get different values, because another transaction committed in between. |
+  | **Phantom read** | You run the same query twice and the second returns extra rows, because another transaction inserted matching ones. |
+  | **Lost update** | Two transactions read a value, both compute a new one, and the second overwrites the first. |
+  | **Write skew** | Two transactions each read a set, each make a change that is individually valid, and together they violate an invariant neither could see breaking. |
+
+  Write skew is the one worth dwelling on because it is the only anomaly that
+  `REPEATABLE READ` does **not** prevent, and it is invisible in testing.
+
+  The classic case: a hospital rule that at least one doctor must be on call.
+  Two doctors are on call. Both independently check "is anyone else on call?",
+  both see yes, both take themselves off. Each transaction was valid. The
+  result violates the invariant.
+
+  ## The four isolation levels
+
+  By the SQL standard:
+
+  | Level | Dirty read | Non-repeatable | Phantom |
+  |-------|-----------|----------------|---------|
+  | READ UNCOMMITTED | possible | possible | possible |
+  | READ COMMITTED | prevented | possible | possible |
+  | REPEATABLE READ | prevented | prevented | possible |
+  | SERIALIZABLE | prevented | prevented | prevented |
+
+  **PostgreSQL differs, in your favour, at two points:**
+
+  - `READ UNCOMMITTED` behaves exactly like `READ COMMITTED`. PostgreSQL's
+    MVCC has no mechanism for reading uncommitted data, so dirty reads are
+    impossible at any level. The level exists only for compatibility.
+  - `REPEATABLE READ` also prevents **phantom reads**, because it takes a
+    snapshot of the whole database at the first statement. It is really
+    snapshot isolation, which is stronger than the standard requires and
+    weaker than true serialisability — it still permits write skew.
+
+  So the honest PostgreSQL table is:
+
+  | Level | Non-repeatable | Phantom | Write skew |
+  |-------|----------------|---------|------------|
+  | READ COMMITTED (default) | possible | possible | possible |
+  | REPEATABLE READ | prevented | prevented | **possible** |
+  | SERIALIZABLE | prevented | prevented | prevented |
+
+  ## How each level behaves
+
+  **READ COMMITTED** is the default. Each **statement** sees a fresh snapshot
+  taken when that statement begins. So two `SELECT`s in one transaction can
+  see different data, and a long multi-statement transaction has no stable
+  view at all.
+
+  **REPEATABLE READ** takes one snapshot at the first statement and keeps it
+  for the whole transaction. Everything is consistent as of that instant. If
+  a row you try to update was changed by a concurrent committed transaction,
+  PostgreSQL aborts yours with a **serialisation failure** (SQLSTATE 40001)
+  rather than silently using stale data.
+
+  **SERIALIZABLE** adds Serializable Snapshot Isolation: PostgreSQL tracks
+  read-write dependencies between concurrent transactions and aborts one if the
+  set of them could not have been produced by running them one at a time. No
+  extra locks are taken — reads do not block writes — which is what makes it
+  practical.
+
+  ## Retry is mandatory
+
+  At `REPEATABLE READ` and `SERIALIZABLE`, transactions **can and will** fail
+  with SQLSTATE 40001 under concurrency. That is not an error condition to log
+  and give up on; it is the mechanism working. Any code using these levels must
+  catch it and **retry the whole transaction** from the beginning.
+
+  Code that uses SERIALIZABLE without a retry loop is less reliable than code
+  that used READ COMMITTED, which is why "just use SERIALIZABLE" is incomplete
+  advice.
+
+syntax:
+  - form: "BEGIN; ... COMMIT;  |  ROLLBACK;"
+    notes: >-
+      A transaction block. PostgreSQL also runs every standalone statement in
+      an implicit transaction.
+  - form: "BEGIN ISOLATION LEVEL REPEATABLE READ;"
+    notes: >-
+      Or `SET TRANSACTION ISOLATION LEVEL ...` as the first statement. It
+      cannot be changed once the transaction has read anything.
+  - form: "BEGIN TRANSACTION READ ONLY;"
+    notes: >-
+      Declares intent and lets PostgreSQL optimise. The playground's learner
+      role has this on by default.
+  - form: "SAVEPOINT name; ... ROLLBACK TO SAVEPOINT name;"
+    notes: >-
+      A nested rollback point. Lets part of a transaction fail without losing
+      the rest.
+  - form: "current_setting('transaction_isolation')"
+    notes: >-
+      The current level, readable from SQL. `SHOW transaction_isolation` is the
+      psql spelling.
+
+sampleTables: [orders, payments, employees, account_status_history]
+
+examples:
+  - title: What this session's transaction settings are
+    sql: |
+      select current_setting('transaction_isolation')               as isolation_level,
+             current_setting('transaction_read_only')               as read_only,
+             current_setting('statement_timeout')                   as statement_timeout,
+             current_setting('idle_in_transaction_session_timeout') as idle_timeout,
+             current_setting('lock_timeout')                        as lock_timeout
+    walkthrough: |
+      Every one of these is a real setting on the connection this query ran
+      over, readable from SQL.
+
+      `read_only` is `on` because the playground's role carries
+      `default_transaction_read_only = on`. That is set on the **role**, not
+      on the application, so it applies to every connection that role ever
+      makes — including one opened by a bug or by a psql session.
+
+      `isolation_level` is `read committed`, PostgreSQL's default. The
+      timeouts are the playground's limits, enforced by the server rather than
+      by a timer in Java.
+
+      This query is also a reminder that configuration is queryable. "What is
+      this connection actually doing?" is answerable rather than inferable.
+
+  - title: A read-only transaction's view is a snapshot
+    sql: |
+      select (select count(*) from orders)                   as orders_now,
+             (select count(*) from orders)                   as orders_again,
+             (select count(*) from payments)                 as payments,
+             (select max(order_date) from orders)            as latest_order,
+             current_setting('transaction_isolation')        as level
+    walkthrough: |
+      The two order counts are necessarily equal here, because both subqueries
+      are part of **one statement** and a statement always sees a single
+      consistent snapshot — at every isolation level including READ COMMITTED.
+
+      That is the guarantee people most often underestimate: READ COMMITTED
+      does not mean "inconsistent within a query". A single statement, however
+      complex, sees one instant. What READ COMMITTED permits is two *separate
+      statements* in the same transaction seeing different instants.
+
+      Demonstrating the difference needs two concurrent sessions and a write,
+      which this read-only playground deliberately cannot do. The
+      docs/TESTING.md notes describe the two-session experiment to run locally.
+
+  - title: Reconstructing history, which is what MVCC does internally
+    sql: |
+      select h.customer_id,
+             h.status,
+             h.effective_from,
+             lead(h.effective_from) over (partition by h.customer_id
+                                          order by h.effective_from) as superseded_at,
+             lead(h.effective_from) over (partition by h.customer_id
+                                          order by h.effective_from) is null as is_current
+      from account_status_history h
+      where h.customer_id in (302, 305, 310)
+      order by h.customer_id, h.effective_from
+    walkthrough: |
+      `account_status_history` is an append-only table: a status change inserts
+      a row rather than updating one, and the current status is the latest row.
+
+      That is the same idea MVCC implements inside the storage engine. An
+      `UPDATE` in PostgreSQL does not overwrite a row; it writes a new version
+      and marks the old one as valid up to a point in time. A transaction's
+      snapshot decides which version it sees.
+
+      So "temporal table" is not a workaround for the database's limitations —
+      it is the database's own technique, made visible at the application
+      level. Reading `superseded_at` here is reading exactly what a snapshot
+      reads internally.
+
+      The practical consequence is that readers never block writers and writers
+      never block readers in PostgreSQL, because they are looking at different
+      versions of the row.
+
+  - title: Where a lost update would occur
+    sql: |
+      select o.order_id,
+             o.status,
+             round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2) as order_total,
+             coalesce(round(sum(distinct p.amount), 2), 0)                  as paid,
+             count(distinct p.payment_id)                                   as payment_count
+      from orders o
+      left join order_items oi on oi.order_id = o.order_id
+      left join payments p     on p.order_id  = o.order_id
+      where o.order_id in (1005, 1006, 1011)
+      group by o.order_id, o.status
+      order by o.order_id
+    walkthrough: |
+      Orders 1005, 1006 and 1011 each have two payments, which is the shape
+      that produces lost updates.
+
+      Imagine a `paid_total` column on `orders`, maintained by reading the
+      current value, adding the new payment and writing it back. Two payments
+      arriving concurrently both read the same starting value and the second
+      write overwrites the first. One payment vanishes, the arithmetic is
+      self-consistent, and nothing logs an error.
+
+      Three ways to prevent it, in increasing order of cost: do the arithmetic
+      in the database — `update orders set paid_total = paid_total + ?` — which
+      takes a row lock for the duration; use `SELECT ... FOR UPDATE` to lock
+      the row before reading; or run at `REPEATABLE READ`, where the second
+      transaction gets a serialisation failure and retries.
+
+      The fourth option, used here, is not to store the total at all and
+      compute it from `payments` — which is what the normalisation lesson
+      recommends, and has no concurrency problem because there is nothing to
+      overwrite.
+
+edgeCases:
+  - title: A statement always sees one snapshot, whatever the level
+    body: >-
+      Both aggregates read the same table within one statement and are
+      guaranteed consistent with each other, even at READ COMMITTED. The
+      isolation level governs what happens *between* statements in a
+      transaction, not within one. A query that joins a table to itself, or
+      aggregates it twice, cannot see two different versions of it.
+    sql: |
+      select (select count(*) from payments)                         as rows_a,
+             (select count(*) from payments where amount >= 0)       as rows_b,
+             (select count(*) from payments where amount <  0)       as rows_c,
+             (select count(*) from payments where amount >= 0)
+           + (select count(*) from payments where amount <  0)       as b_plus_c
+
+  - title: PostgreSQL has no real READ UNCOMMITTED
+    body: >-
+      Requesting READ UNCOMMITTED is accepted and silently gives you READ
+      COMMITTED. MVCC stores row versions with the transaction that created
+      them, and an uncommitted version is simply not visible to any other
+      snapshot — there is no mechanism to read one. Dirty reads are therefore
+      impossible in PostgreSQL at any level, which is a genuine difference
+      from several other databases.
+    sql: |
+      select current_setting('transaction_isolation')  as actual_level,
+             current_setting('default_transaction_isolation') as session_default,
+             current_setting('server_version')          as version
+
+pitfalls:
+  - mistake: Using SERIALIZABLE without a retry loop
+    why: >-
+      Serialisation failures are not exceptional; they are the mechanism by
+      which the level provides its guarantee. Code that treats 40001 as a bug
+      fails under exactly the concurrency it was chosen to handle.
+    fix: >-
+      Wrap the transaction in a retry loop that catches SQLSTATE 40001 and
+      40P01, with a small randomised backoff and a bounded attempt count.
+
+  - mistake: Assuming READ COMMITTED gives a stable view within a transaction
+    why: >-
+      Each statement takes its own snapshot. Two SELECTs in one transaction can
+      legitimately return different data, and a read-then-write sequence can
+      act on a value that is already stale.
+    fix: >-
+      REPEATABLE READ for a consistent multi-statement view, or do the whole
+      thing in one statement, which always sees one snapshot.
+
+  - mistake: Read-modify-write in application code
+    why: >-
+      Reading a counter, computing a new value in Java and writing it back is
+      a lost update waiting for concurrency. It passes every single-threaded
+      test.
+    fix: >-
+      `update t set n = n + 1` does the arithmetic under the row lock. Where
+      that is not possible, `SELECT ... FOR UPDATE`, or an optimistic version
+      column with a retry.
+
+  - mistake: Choosing REPEATABLE READ and believing it prevents everything
+    why: >-
+      It prevents dirty reads, non-repeatable reads and — in PostgreSQL —
+      phantoms. It does not prevent write skew, which is the anomaly that
+      silently breaks multi-row invariants.
+    fix: >-
+      SERIALIZABLE when an invariant spans rows that different transactions
+      read and write. Otherwise enforce the invariant with a constraint, which
+      has no isolation level.
+
+performance: |
+  Higher isolation in PostgreSQL does **not** mean more locking. MVCC means
+  readers never block writers and writers never block readers at any level.
+  The cost of `SERIALIZABLE` is predicate-dependency tracking and, above all,
+  **aborted transactions that must be retried**.
+
+  So the cost model is: under low contention, SERIALIZABLE is nearly free.
+  Under high contention on overlapping data, the retry rate climbs and
+  throughput falls — and if the retries are not implemented, correctness falls
+  instead.
+
+  `REPEATABLE READ` holds one snapshot for the whole transaction, which
+  prevents `VACUUM` from reclaiming row versions that snapshot might still
+  need. A long-running `REPEATABLE READ` transaction therefore causes table
+  bloat, and `idle_in_transaction_session_timeout` exists to kill the worst
+  offenders — a transaction left open by an application that forgot to commit.
+
+  The largest practical lever is transaction **duration**. A short transaction
+  contends with fewer others, holds fewer locks, blocks less vacuuming and is
+  cheaper to retry. Doing slow work — an HTTP call, a file write — inside an
+  open transaction is the single most common cause of concurrency problems.
+
+interviewQuestions:
+  - question: What do the four ACID properties guarantee?
+    answer: >-
+      Atomicity: all of a transaction's changes apply or none do, implemented
+      via the write-ahead log. Consistency: the transaction moves the database
+      between states that satisfy its declared constraints — the database
+      enforces what you declared and the application owns the rest. Isolation:
+      concurrent transactions do not observe each other's intermediate states,
+      to a degree set by the isolation level. Durability: a committed change
+      survives a crash, because the WAL is flushed before the commit is
+      acknowledged. Atomicity and durability are near-absolute; isolation is
+      the dial, and consistency depends on where you set it.
+
+  - question: Name the isolation levels and the anomalies each permits.
+    answer: >-
+      READ UNCOMMITTED permits dirty reads, non-repeatable reads and phantoms;
+      READ COMMITTED prevents dirty reads; REPEATABLE READ additionally
+      prevents non-repeatable reads; SERIALIZABLE prevents phantoms as well.
+      PostgreSQL differs in two useful ways: READ UNCOMMITTED is implemented as
+      READ COMMITTED because MVCC makes dirty reads impossible, and REPEATABLE
+      READ also prevents phantoms because it takes a whole-database snapshot.
+      PostgreSQL's REPEATABLE READ is snapshot isolation, which still permits
+      write skew — the gap that SERIALIZABLE closes.
+
+  - question: What is write skew and which level prevents it?
+    answer: >-
+      Two transactions each read overlapping data, each make a change that is
+      valid given what they read, and the combination violates an invariant
+      neither could observe breaking. The canonical example is two on-call
+      doctors each checking that someone else is on call and each signing off.
+      Snapshot isolation — PostgreSQL's REPEATABLE READ — permits it, because
+      neither transaction writes a row the other wrote. Only SERIALIZABLE
+      prevents it, by tracking read-write dependencies and aborting one of the
+      transactions.
+
+  - question: Why must SERIALIZABLE transactions be retried?
+    answer: >-
+      Because PostgreSQL implements it optimistically with Serializable
+      Snapshot Isolation: it allows transactions to proceed without extra locks
+      and aborts one with SQLSTATE 40001 when it detects a dependency cycle
+      that could not have arisen from any serial order. The abort is the
+      mechanism, not a failure, so the application must catch it and re-run the
+      entire transaction with fresh reads. Without a retry loop, choosing
+      SERIALIZABLE makes the system less reliable rather than more.
+
+exercises:
+  - prompt: >-
+      Report this session's isolation level, whether it is read only, and the
+      server version. Columns isolation_level, read_only, server_version.
+    difficulty: Easy
+    hint: current_setting() reads any configuration parameter.
+    solutionSql: |
+      select current_setting('transaction_isolation') as isolation_level,
+             current_setting('transaction_read_only') as read_only,
+             current_setting('server_version')        as server_version
+
+  - prompt: >-
+      Find orders whose payments do not add up to the order total, which is
+      the kind of drift a lost update would cause in a stored paid_total
+      column. Columns order_id, order_total, paid, difference. Order by the
+      absolute difference descending, limited to 10.
+    difficulty: Hard
+    hint: >-
+      Aggregate order_items and payments in separate CTEs so the two joins do
+      not multiply each other, then compare.
+    solutionSql: |
+      with totals as (
+          select order_id,
+                 round(sum(quantity * unit_price * (1 - discount)), 2) as order_total
+          from order_items
+          group by order_id
+      ),
+      paid as (
+          select order_id, round(sum(amount), 2) as paid
+          from payments
+          group by order_id
+      )
+      select t.order_id,
+             t.order_total,
+             coalesce(p.paid, 0)                     as paid,
+             t.order_total - coalesce(p.paid, 0)     as difference
+      from totals t
+      left join paid p on p.order_id = t.order_id
+      order by abs(t.order_total - coalesce(p.paid, 0)) desc, t.order_id
+      limit 10
+
+  - prompt: >-
+      For each customer with more than one status change, show the number of
+      changes and the duration in days between the first and last. Columns
+      customer_id, changes, span_days. Order by span_days descending.
+    difficulty: Medium
+    hint: >-
+      Subtracting two timestamps gives an interval; extract the days from it,
+      or cast both to date.
+    solutionSql: |
+      select customer_id,
+             count(*)                                                as changes,
+             (max(effective_from)::date - min(effective_from)::date) as span_days
+      from account_status_history
+      group by customer_id
+      having count(*) > 1
+      order by span_days desc, customer_id
+
+checklist:
+  - "Atomicity and durability are near-absolute; isolation is a dial"
+  - "Dirty read, non-repeatable read, phantom, lost update, write skew"
+  - PostgreSQL's READ UNCOMMITTED is READ COMMITTED — dirty reads are impossible
+  - PostgreSQL's REPEATABLE READ also prevents phantoms but permits write skew
+  - A single statement always sees one snapshot, at every isolation level
+  - "READ COMMITTED takes a fresh snapshot per statement, not per transaction"
+  - "SERIALIZABLE aborts with SQLSTATE 40001; a retry loop is mandatory"
+  - Short transactions are the biggest concurrency lever
+
+related:
+  - t-mvcc-locks
+  - s-keys-constraints
+  - pg-backend-integration
+  - p-query-patterns
+
+dialect:
+  standard: >-
+    The four isolation levels and the three anomalies that define them are
+    standard SQL. The standard defines levels by which anomalies they must
+    prevent, not by implementation, which is why two databases at the same
+    level can behave differently.
+  postgres: >-
+    MVCC-based. READ UNCOMMITTED behaves as READ COMMITTED; REPEATABLE READ is
+    snapshot isolation and prevents phantoms; SERIALIZABLE uses Serializable
+    Snapshot Isolation with no extra locking and optimistic aborts. Readers
+    never block writers at any level.
+  mysql: >-
+    InnoDB's default is REPEATABLE READ rather than READ COMMITTED, and it
+    prevents phantoms with next-key gap locks — a pessimistic locking approach
+    rather than PostgreSQL's optimistic one, with correspondingly different
+    deadlock behaviour. MySQL genuinely implements READ UNCOMMITTED, so dirty
+    reads are possible there.

@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+        Spring Boot 3.5.16 on Java 21.
+
+        Version choices are deliberate rather than "whatever is newest":
+
+          * Boot 3.5.16 is the version the three sibling services in this
+            portfolio already run, so the whole portfolio shares one dependency
+            baseline. It supports Java 21 and manages PostgreSQL 42.7.11,
+            Flyway 11.7.2, Jackson 2.21.4 and Testcontainers 1.21.4 — every one
+            of which this project uses at the managed version rather than
+            overriding it.
+          * springdoc-openapi 2.8.13 is the 2.8 line, which targets Boot 3.4/3.5.
+            The 3.x line targets Boot 4 and would not work here.
+          * JSqlParser 5.3 is pinned explicitly because Boot does not manage it.
+
+        The only dependencies declared with an explicit version are the two Boot
+        does not know about. Everything else inherits the BOM.
+    -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.16</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.bhavesh</groupId>
+    <artifactId>sql-interview-mastery</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>sql-interview-mastery</name>
+    <description>Interactive SQL learning and interview-preparation application</description>
+
+    <properties>
+        <java.version>21</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <springdoc.version>2.8.13</springdoc.version>
+        <jsqlparser.version>5.3</jsqlparser.version>
+
+        <jacoco.version>0.8.13</jacoco.version>
+        <checkstyle.plugin.version>3.6.0</checkstyle.plugin.version>
+        <checkstyle.version>10.21.1</checkstyle.version>
+    </properties>
+
+    <dependencies>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!--
+            spring-boot-starter-jdbc, not -data-jpa. This application's whole
+            subject is SQL: every query it issues is written by hand so that the
+            code reads the way the lessons teach. An ORM would hide exactly the
+            thing being taught. JdbcTemplate also gives direct control over the
+            two separate DataSources the security model depends on.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <!-- Flyway 10+ moved per-database support into separate artifacts. -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+
+        <!--
+            Compile scope rather than the usual runtime scope. The playground
+            reads PSQLException's server error message to recover the character
+            POSITION and the HINT that PostgreSQL attaches to a syntax error —
+            neither of which is exposed by java.sql.SQLException. Putting the
+            caret on the offending character is most of what makes the editor
+            useful for someone learning, so the coupling is paid for. It is
+            confined to SqlErrorMapper.
+        -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+        </dependency>
+
+        <!--
+            JSqlParser turns a statement into an AST. The playground validator
+            walks that AST instead of pattern-matching the text, which is what
+            makes "reject anything that is not a single read-only SELECT"
+            something that can actually be reasoned about. It is one layer of
+            several — see docs/SECURITY.md — never the only one.
+        -->
+        <dependency>
+            <groupId>com.github.jsqlparser</groupId>
+            <artifactId>jsqlparser</artifactId>
+            <version>${jsqlparser.version}</version>
+        </dependency>
+
+        <!--
+            The curriculum is authored in YAML rather than JSON. A lesson is
+            mostly prose - explanations, walkthroughs, model answers - and YAML
+            block scalars let that prose be written and reviewed as prose,
+            instead of as one line with every newline escaped. The content is
+            still structured data with a fixed schema; only the surface syntax
+            differs, and the diff of a reworded paragraph stays readable.
+        -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.dataformat</groupId>
+            <artifactId>jackson-dataformat-yaml</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>${springdoc.version}</version>
+        </dependency>
+
+        <!-- Test-scoped dependencies below this point. -->
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+            Testcontainers is wired up and the tests that use it are tagged
+            "testcontainers". They are EXCLUDED by default because a Docker
+            daemon is not reachable on every development machine; CI runs them
+            with -Dgroups=testcontainers. The same integration tests also run
+            against a plain local PostgreSQL, so excluding them does not leave
+            the database untested — see docs/TESTING.md.
+        -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <plugins>
+
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <compilerArgs>
+                        <arg>-Xlint:all</arg>
+                        <arg>-parameters</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>@{jacoco.argLine}</argLine>
+                    <excludedGroups>testcontainers</excludedGroups>
+                </configuration>
+            </plugin>
+
+            <!--
+                Coverage is measured and reported, never asserted at a fixed
+                percentage. A check rule only encourages tests that raise a
+                number rather than tests that find defects.
+            -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco.version}</version>
+                <configuration>
+                    <propertyName>jacoco.argLine</propertyName>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals><goal>prepare-agent</goal></goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals><goal>report</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-checkstyle-plugin</artifactId>
+                <version>${checkstyle.plugin.version}</version>
+                <dependencies>
+                    <dependency>
+                        <groupId>com.puppycrawl.tools</groupId>
+                        <artifactId>checkstyle</artifactId>
+                        <version>${checkstyle.version}</version>
+                    </dependency>
+                </dependencies>
+                <configuration>
+                    <configLocation>${project.basedir}/../config/checkstyle.xml</configLocation>
+                    <includeTestSourceDirectory>true</includeTestSourceDirectory>
+                    <failOnViolation>true</failOnViolation>
+                    <violationSeverity>warning</violationSeverity>
+                    <consoleOutput>true</consoleOutput>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>checkstyle-validate</id>
+                        <phase>validate</phase>
+                        <goals><goal>check</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+        </plugins>
+    </build>
+
+</project>

@@ -1,0 +1,302 @@
+id: p08-running-total-revenue
+position: 80
+title: Running total of daily revenue
+slug: running-total-revenue
+difficulty: Medium
+topic: Window functions
+tags: [running-total, frames, rows-vs-range, moving-average]
+
+orderSensitive: true
+
+statement: |
+  For the North region in January 2024, return each day's revenue alongside
+  the running total from the start of the month, a seven-day trailing moving
+  average, and the day's share of the month's total as a percentage.
+
+  Rows must come back in date order — this is a time series and the order is
+  part of the answer.
+
+tables: [daily_sales]
+
+expectedColumns: [sale_date, revenue, running_total, moving_avg_7, pct_of_month]
+
+edgeCases:
+  - >-
+    The first six days have fewer than seven days behind them. Decide whether
+    the moving average should be computed over what exists or suppressed.
+  - >-
+    The month total in the denominator must be the total of the filtered
+    rows, which is what a window over the query result gives you.
+  - >-
+    The default frame is RANGE, not ROWS — with duplicate dates that would
+    change the running total. The primary key makes them unique here.
+  - >-
+    Adding ORDER BY to a window aggregate silently turns a partition total
+    into a running total, which is the trap this problem is built around.
+
+hints:
+  - Two of the four columns need an ordered window and one needs an unordered one.
+  - >-
+    What is the default frame when a window has an ORDER BY but no frame
+    clause?
+  - "`count(*)` over the same frame tells you how many rows the average covered."
+
+solutionSql: |
+  select sale_date,
+         revenue,
+         round(sum(revenue) over (order by sale_date
+                 rows between unbounded preceding and current row), 2) as running_total,
+         round(avg(revenue) over (order by sale_date
+                 rows between 6 preceding and current row), 2)         as moving_avg_7,
+         round(100.0 * revenue / sum(revenue) over (), 2)              as pct_of_month
+  from daily_sales
+  where region = 'North'
+    and sale_date >= date '2024-01-01'
+    and sale_date <  date '2024-02-01'
+  order by sale_date
+
+explanation:
+  lineByLine:
+    - clause: "sum(revenue) over (order by sale_date rows between unbounded preceding and current row)"
+      note: >-
+        The running total, with the frame written out. Omitting the frame
+        would give the same answer here because the dates are unique, but it
+        would be relying on the RANGE default rather than stating the
+        intention.
+    - clause: "avg(revenue) over (order by sale_date rows between 6 preceding and current row)"
+      note: >-
+        Seven rows — six behind plus the current one. On the first six days
+        the frame is short and the average is computed over what exists rather
+        than returning NULL.
+    - clause: "sum(revenue) over ()"
+      note: >-
+        No ORDER BY, so the frame is the entire partition and the value is the
+        month total, constant down the column. This is the same function with
+        a different window producing a completely different meaning.
+    - clause: "100.0 * revenue / ..."
+      note: >-
+        The literal is 100.0 rather than 100 so the division is numeric. With
+        an integer literal and integer operands this would truncate.
+    - clause: "where ... and sale_date < date '2024-02-01'"
+      note: >-
+        A half-open range on the raw column, so an index on sale_date can
+        serve it. It also fixes what the window sees — the month total is the
+        total of the filtered rows, which is what the question asks for.
+
+  walkthrough: |
+    Thirty-one rows, one per day. The running total starts at the first day's
+    revenue and climbs to the month total on the last row, which is a useful
+    self-check: `running_total` on the final row must equal `sum(revenue)
+    over ()` on every row.
+
+    `moving_avg_7` on 1 January averages one value, on 2 January two, and
+    from 7 January onwards seven. That ramp-up is visible in the numbers and
+    is the usual reason a seven-day average chart looks odd at the left edge.
+
+    `pct_of_month` sums to 100 across the result, which is the other
+    self-check worth building in.
+
+    Note that all three window functions read the same rows and only the
+    window specification differs. Two share `order by sale_date` and are
+    computed in one sort; the third has a different specification and needs
+    its own pass.
+
+  alternatives:
+    - title: Self-join for the running total
+      sql: |
+        select a.sale_date,
+               a.revenue,
+               round(sum(b.revenue), 2) as running_total
+        from daily_sales a
+        join daily_sales b
+          on b.region = a.region
+         and b.sale_date <= a.sale_date
+         and b.sale_date >= date '2024-01-01'
+        where a.region = 'North'
+          and a.sale_date >= date '2024-01-01'
+          and a.sale_date <  date '2024-02-01'
+        group by a.sale_date, a.revenue
+        order by a.sale_date
+      when: >-
+        Only on a database without window functions. It is quadratic — each
+        day joins to every earlier day — so thirty-one days produce nearly
+        five hundred joined rows, and a year would produce sixty-seven
+        thousand. Shown to make the cost of the pre-window-function era
+        concrete.
+      equivalent: false
+
+    - title: Calendar-based moving average with RANGE
+      sql: |
+        select sale_date,
+               revenue,
+               round(avg(revenue) over (order by sale_date
+                       range between interval '6 days' preceding and current row), 2) as moving_avg_7_calendar,
+               count(*) over (order by sale_date
+                       range between interval '6 days' preceding and current row)     as days_in_window
+        from daily_sales
+        where region = 'North'
+          and sale_date >= date '2024-01-01'
+          and sale_date <  date '2024-02-01'
+        order by sale_date
+      when: >-
+        When the series can have missing days. `ROWS 6 PRECEDING` means the
+        last seven **rows**, which reaches further back in time when days are
+        absent; `RANGE INTERVAL '6 days'` means the last seven **days**
+        whatever rows exist. They agree here because every day is present.
+      equivalent: false
+
+  performance: |
+    A running total with `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` is
+    maintained incrementally in a single pass — the sum is carried forward as
+    the scan proceeds, so it costs essentially nothing beyond the sort.
+
+    The moving average has a lower bound that moves, which PostgreSQL also
+    handles incrementally for `sum`, `count` and `avg`, because a value can be
+    subtracted as it leaves the frame. `max` and `min` cannot be un-added, so
+    a moving maximum over a wide frame is substantially more expensive.
+
+    The dominant cost is the sort on `sale_date`. The primary key on
+    `(sale_date, region)` does not serve it directly because `region` is the
+    second column and the filter fixes it rather than the sort using it; an
+    index on `(region, sale_date)` would supply the order and remove the sort
+    entirely.
+
+    The two windows with identical specifications share one sort; the
+    `over ()` window needs its own pass, which is visible in EXPLAIN as a
+    second WindowAgg node.
+
+  wrongApproaches:
+    - title: Relying on the default frame
+      sql: |
+        select sale_date,
+               revenue,
+               round(sum(revenue) over (order by sale_date), 2)  as running_total,
+               round(sum(revenue) over (partition by region), 2) as month_total
+        from daily_sales
+        where region = 'North'
+          and sale_date >= date '2024-01-01'
+          and sale_date <  date '2024-02-01'
+        order by sale_date
+      whyWrong: >-
+        Correct here and fragile. The default frame with an ORDER BY is RANGE
+        UNBOUNDED PRECEDING TO CURRENT ROW, which includes every row tied on
+        the ordering value. Dates are unique in this table so it behaves like
+        ROWS — but the same query over a timestamp column with duplicates, or
+        over both regions without the filter, would jump in steps instead of
+        incrementing. Writing ROWS costs four characters.
+
+    - title: Forgetting the ORDER BY and getting a total instead
+      sql: |
+        select sale_date,
+               revenue,
+               round(sum(revenue) over (), 2) as not_a_running_total
+        from daily_sales
+        where region = 'North'
+          and sale_date >= date '2024-01-01'
+          and sale_date <  date '2024-02-01'
+        order by sale_date
+      whyWrong: >-
+        With no ORDER BY the frame is the whole partition, so every row shows
+        the month total rather than a running one. The column looks plausible
+        — it is a number that grows with the data — and the error is only
+        visible if you check that consecutive rows differ.
+
+    - title: Integer division in the percentage
+      sql: |
+        select sale_date,
+               revenue,
+               round(100 * revenue / sum(revenue) over (), 2) as pct_of_month
+        from daily_sales
+        where region = 'North'
+          and sale_date >= date '2024-01-01'
+          and sale_date <  date '2024-02-01'
+        order by sale_date
+      whyWrong: >-
+        Here `revenue` is numeric so this happens to work, which is the
+        problem — the habit of writing `100` rather than `100.0` fails
+        silently the moment both operands are integers, and every percentage
+        becomes 0. The literal costs two characters and removes the dependency
+        on the column's type.
+
+  extraTests:
+    - name: Sparse series where ROWS and RANGE disagree (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt's daily_sales has North on 1 Jan, 2 Jan and 1 Feb — a
+        month-long gap. `ROWS 6 PRECEDING` averages the previous six rows
+        regardless of the gap; `RANGE INTERVAL '6 days'` correctly sees only
+        the row itself on 1 February. The two columns differ, which is the
+        clearest demonstration of why the choice matters.
+      sql: |
+        select sale_date,
+               revenue,
+               round(avg(revenue) over (order by sale_date
+                       rows between 6 preceding and current row), 2)  as avg_by_rows,
+               round(avg(revenue) over (order by sale_date
+                       range between interval '6 days' preceding and current row), 2) as avg_by_calendar,
+               count(*) over (order by sale_date
+                       rows between 6 preceding and current row)      as rows_in_frame
+        from daily_sales
+        where region = 'North'
+        order by sale_date
+
+    - name: The running total reconciles with the grand total
+      schema: learning
+      note: >-
+        The last row's running total must equal the sum of every row. This is
+        the check worth automating on any cumulative column, because a frame
+        mistake usually shows up as the two disagreeing.
+      sql: |
+        select round(max(running_total), 2) as final_running_total,
+               round(sum(revenue), 2)       as plain_sum,
+               round(max(running_total) - sum(revenue), 2) as difference
+        from (select revenue,
+                     sum(revenue) over (order by sale_date
+                         rows between unbounded preceding and current row) as running_total
+              from daily_sales
+              where region = 'North'
+                and sale_date >= date '2024-01-01'
+                and sale_date <  date '2024-02-01') t
+
+  followUps:
+    - question: What is the difference between ROWS and RANGE in a frame?
+      answer: >-
+        ROWS counts physical rows relative to the current one; RANGE works on
+        the values of the ordering column, so all rows sharing the current
+        row's ordering value are peers and enter the frame together. They are
+        identical when the ordering values are unique and differ on ties — a
+        running total under RANGE jumps across a tied group while ROWS
+        increments one row at a time. RANGE additionally accepts value offsets
+        such as INTERVAL '6 days', which gives a true calendar window that is
+        correct across gaps.
+
+    - question: How would you suppress the moving average until the window is full?
+      answer: >-
+        Wrap it in a CASE on `count(*)` over the same frame — `case when
+        count(*) over w = 7 then avg(revenue) over w end`. The count tells you
+        how many rows the frame actually contained, so the ramp-up at the
+        start of the series becomes NULL rather than a misleadingly smooth
+        number. Whether to do it depends on whether the figure is published.
+
+    - question: How would you produce this for every region at once?
+      answer: >-
+        Add `partition by region` to each ordered window, and to the `over ()`
+        window if the percentage should be of the region's total rather than
+        of everything. That last decision is the interesting one: `over ()`
+        and `over (partition by region)` give different denominators and both
+        are defensible, so the question should be asked rather than assumed.
+
+    - question: What if a day could appear twice for the same region?
+      answer: >-
+        The primary key on (sale_date, region) prevents it here. If it could,
+        the RANGE default would include both rows at the same date in each
+        other's frames, so the running total would step rather than increment
+        — and ROWS would include them one at a time but in an undefined order.
+        The honest fix is to aggregate to one row per day first, which makes
+        the frame question disappear.
+
+  related:
+    - w-frames
+    - w-basics
+    - i-datetime-string
+    - p09-month-over-month-growth

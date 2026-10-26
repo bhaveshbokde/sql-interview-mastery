@@ -1,0 +1,418 @@
+id: a-group-by-having
+moduleId: aggregation
+position: 20
+title: GROUP BY and HAVING
+slug: group-by-and-having
+difficulty: Beginner
+estimatedMinutes: 25
+summary: >-
+  Grouping replaces rows with groups, which is why the rules about what may
+  appear in the select list exist. Plus GROUPING SETS, ROLLUP and CUBE, which
+  turn several grouped queries into one.
+tags: [group-by, having, rollup, grouping-sets]
+
+prerequisites:
+  - a-aggregates
+  - f-logical-order
+
+objectives:
+  - Say exactly which columns may appear in the select list after GROUP BY
+  - Group by an expression and by several columns
+  - Choose WHERE or HAVING correctly and explain the choice
+  - Produce subtotals with ROLLUP and distinguish a subtotal row from a data row
+  - Recognise when a group is missing because it has no rows to be made from
+
+concept: |
+  ## GROUP BY replaces rows with groups
+
+  After `GROUP BY dept_id`, the intermediate result no longer has employee
+  rows — it has one row per department. So a reference to `first_name` is
+  meaningless: there are fifteen of them in department 10 and the query has not
+  said which to show.
+
+  That is the whole rule, and it is why the error message says what it says:
+
+  > column "e.first_name" must appear in the GROUP BY clause or be used in an
+  > aggregate function
+
+  Every select-list item after a `GROUP BY` must be either a grouping key, an
+  aggregate, or a constant. The exception PostgreSQL allows — grouping by a
+  primary key frees the rest of that table's columns — exists because the
+  database can prove there is only one possible value.
+
+  ## Grouping by several things, and by expressions
+
+  ```sql
+  group by d.dept_name, e.job_title        -- one row per (department, title)
+  group by date_trunc('month', order_date) -- one row per month
+  group by case when salary > 150000 then 'senior' else 'other' end
+  ```
+
+  Grouping by an expression is normal and useful. The expression must be
+  repeated in the select list — or referred to by its alias, which PostgreSQL
+  permits in `GROUP BY` as an extension — because the select list is evaluated
+  after grouping.
+
+  ## Groups that do not exist
+
+  `GROUP BY` can only produce a group from rows that exist. A department with
+  no employees produces no group — not a group with count 0, but no row at all.
+
+  This is the most common "missing data" complaint about grouped reports, and
+  the fix is not in the `GROUP BY`. It is a `LEFT JOIN` from the table that
+  defines the complete set of categories:
+
+  ```sql
+  from departments d
+  left join employees e on e.dept_id = d.dept_id
+  group by d.dept_id
+  ```
+
+  Now Research appears with `count(e.emp_id) = 0`. Note `count(e.emp_id)`, not
+  `count(*)`: the LEFT JOIN produces one NULL-extended row for Research, so
+  `count(*)` would report 1.
+
+  The same applies to missing time periods — a month with no sales produces no
+  row — and the fix there is a `generate_series` left-joined to the data.
+
+  ## HAVING
+
+  `HAVING` filters groups after they are formed, so it may reference
+  aggregates. `WHERE` filters rows before, so it may not.
+
+  A `HAVING` clause with no aggregate in it is a `WHERE` clause that ran too
+  late. It produces the right answer and makes the grouping step do work it
+  did not need to do.
+
+  ## GROUPING SETS, ROLLUP and CUBE
+
+  Several levels of aggregation in one pass:
+
+  - `GROUP BY GROUPING SETS ((a, b), (a), ())` — three result sets stacked:
+    grouped by both, grouped by `a`, and the grand total.
+  - `GROUP BY ROLLUP (a, b)` — the hierarchy: `(a, b)`, `(a)`, `()`. For
+    subtotals down a dimension, such as country then city then total.
+  - `GROUP BY CUBE (a, b)` — every combination: `(a, b)`, `(a)`, `(b)`, `()`.
+
+  Subtotal rows carry NULL in the columns that were rolled up, which is
+  ambiguous when the data itself contains NULLs. `GROUPING(col)` returns 1 for
+  a rolled-up NULL and 0 for a real one, and that is the only reliable way to
+  tell them apart.
+
+syntax:
+  - form: "GROUP BY expr [, expr]..."
+    notes: >-
+      One output row per distinct combination. All NULLs in a grouping column
+      form a single group.
+  - form: "HAVING aggregate_condition"
+    notes: Filters groups. A HAVING with no aggregate belongs in WHERE.
+  - form: "GROUP BY ROLLUP (a, b)"
+    notes: "Adds subtotal rows for (a) and a grand total for ()."
+  - form: "GROUP BY CUBE (a, b)"
+    notes: Every subset of the grouping columns. Produces 2^n grouping levels.
+  - form: "GROUPING(col)"
+    notes: >-
+      1 when `col` was rolled up in this row, 0 when the NULL came from the
+      data. Essential for labelling subtotal rows.
+
+sampleTables: [employees, departments, orders, order_items, customers, daily_sales]
+
+examples:
+  - title: One row per group, and only grouped columns in the select list
+    sql: |
+      select d.dept_name,
+             count(*)                      as headcount,
+             min(e.salary)                 as lowest,
+             max(e.salary)                 as highest,
+             round(avg(e.salary), 0)       as average,
+             max(e.hire_date)              as most_recent_hire
+      from employees e
+      join departments d on d.dept_id = e.dept_id
+      group by d.dept_name
+      order by headcount desc, d.dept_name
+    walkthrough: |
+      `d.dept_name` is a grouping key, so it may appear. Everything else is an
+      aggregate. Adding `e.first_name` to the select list would fail, and
+      correctly: the query has not said which of the fifteen names in
+      Engineering it wants.
+
+      `max(e.hire_date)` is fine, because an aggregate collapses the group to
+      one value. But note what it does *not* give you: the **name** of the most
+      recently hired employee. Mixing `max(hire_date)` with `first_name` is the
+      classic wrong answer to that question, and the correct ones are
+      `DISTINCT ON` or a window function.
+
+  - title: Groups that are missing, and how to get them back
+    sql: |
+      select d.dept_id,
+             d.dept_name,
+             count(*)           as rows_from_join,
+             count(e.emp_id)    as employees,
+             coalesce(sum(e.salary), 0) as payroll
+      from departments d
+      left join employees e on e.dept_id = d.dept_id
+      group by d.dept_id, d.dept_name
+      order by d.dept_id
+    walkthrough: |
+      Research (department 60) appears with `employees = 0`, which an inner join
+      would have hidden entirely.
+
+      The two count columns differ for exactly that row: the LEFT JOIN produced
+      one NULL-extended row for Research, so `count(*)` is 1 while
+      `count(e.emp_id)` is 0. Counting a column from the **right-hand** table is
+      the rule for outer-joined aggregates, and `count(*)` is the bug.
+
+      `coalesce(sum(...), 0)` handles the other half of the same problem: the
+      payroll of a department with no employees is NULL without it.
+
+  - title: WHERE and HAVING in one query
+    sql: |
+      select c.country,
+             count(distinct c.customer_id)                   as customers,
+             count(o.order_id)                               as orders,
+             round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2) as revenue
+      from customers c
+      join orders o      on o.customer_id = c.customer_id
+      join order_items oi on oi.order_id = o.order_id
+      where o.status <> 'cancelled'
+      group by c.country
+      having count(o.order_id) >= 10
+      order by revenue desc
+    walkthrough: |
+      `WHERE o.status <> 'cancelled'` removes rows before grouping, so cancelled
+      orders contribute nothing to any total. Putting it in `HAVING` would be
+      impossible — there is no single status per country.
+
+      `HAVING count(o.order_id) >= 10` removes whole countries. Putting it in
+      `WHERE` would be impossible too, for the mirror-image reason.
+
+      `count(distinct c.customer_id)` is necessary rather than stylistic: the
+      join to `order_items` multiplies each customer row by the number of lines
+      they ever ordered, so a plain `count(c.customer_id)` would be a count of
+      order lines wearing a customer label. Fan-out like this is the main hazard
+      of aggregating across a join chain.
+
+  - title: Subtotals with ROLLUP, labelled with GROUPING
+    sql: |
+      select case when grouping(region) = 1 then 'ALL REGIONS' else region end as region,
+             case when grouping(month_start) = 1 then null else month_start end as month_start,
+             round(sum(revenue), 2)  as revenue,
+             count(*)                as days,
+             grouping(region) + grouping(month_start) as rollup_level
+      from (select region, date_trunc('month', sale_date) as month_start, revenue
+            from daily_sales) s
+      group by rollup (region, month_start)
+      order by grouping(region), region, month_start
+    walkthrough: |
+      `ROLLUP (region, month_start)` produces three levels: each
+      region-and-month, each region's total, and the grand total. `rollup_level`
+      counts how many columns were rolled up in that row, so 0 is detail, 1 is a
+      region subtotal and 2 is the grand total.
+
+      The `CASE ... grouping(...)` wrappers exist because a subtotal row carries
+      NULL in the rolled-up column, and NULL also appears in real data. Without
+      `GROUPING` there is no way for a consumer to tell "all regions" from "a
+      row whose region was unknown".
+
+      `order by grouping(region), region` sorts the detail rows before the grand
+      total rather than letting the NULL sort wherever it falls.
+
+edgeCases:
+  - title: All NULLs form a single group
+    body: >-
+      GROUP BY treats NULLs as equal to each other, so the two employees with no
+      department land in one group rather than one group each or none at all.
+      This is a deliberate exception to three-valued logic, written into the
+      standard because the alternative would make GROUP BY useless on nullable
+      columns.
+    sql: |
+      select dept_id, count(*) as employees
+      from employees
+      group by dept_id
+      order by dept_id nulls last
+
+  - title: GROUP BY with no aggregate is DISTINCT, spelled longer
+    body: >-
+      Perfectly legal and usually a sign that DISTINCT was meant. PostgreSQL
+      generally produces the same plan for both. The one reason to prefer this
+      form is that it can be extended with HAVING, which DISTINCT cannot.
+    sql: |
+      select country, segment
+      from customers
+      group by country, segment
+      order by country, segment
+
+pitfalls:
+  - mistake: Using count(*) with a LEFT JOIN
+    why: >-
+      The outer join manufactures one NULL-extended row for every unmatched
+      left row, and `count(*)` counts it. Every empty category reports 1 instead
+      of 0, which looks like data rather than like an error.
+    fix: >-
+      Count a non-nullable column from the right-hand table — `count(e.emp_id)`.
+      The same applies to sums, which need COALESCE.
+
+  - mistake: Aggregating across a chain of joins without checking fan-out
+    why: >-
+      Joining orders to order_items multiplies each order row by its line count,
+      so `sum(o.total)` double-counts and `count(c.customer_id)` counts lines.
+      The numbers are plausible and too large.
+    fix: >-
+      Aggregate each level separately in CTEs and join the results, or use
+      COUNT(DISTINCT) deliberately. Always sanity-check a grouped total against
+      a simpler query over one table.
+
+  - mistake: Expecting a group for a category with no rows
+    why: >-
+      GROUP BY builds groups from rows. No rows, no group — including months
+      with no sales and products never ordered.
+    fix: >-
+      LEFT JOIN from the table (or generate_series) that defines the complete
+      set of categories, and group by its columns.
+
+  - mistake: Putting a non-aggregate condition in HAVING
+    why: >-
+      It is accepted, so there is no feedback. The condition runs after
+      grouping, having let every row it would have removed through first.
+    fix: >-
+      If the condition contains no aggregate function, it belongs in WHERE.
+
+performance: |
+  PostgreSQL implements `GROUP BY` as either a **HashAggregate** — one pass,
+  memory proportional to the number of distinct groups — or a **GroupAggregate**
+  over sorted input, which needs a sort unless an index supplies the order. The
+  planner chooses based on the estimated number of groups and `work_mem`.
+
+  Reducing rows before grouping is the single biggest lever: a `WHERE` that
+  halves the input roughly halves the aggregation cost. That is the practical
+  reason the WHERE-versus-HAVING advice is not just pedantry.
+
+  `GROUPING SETS`, `ROLLUP` and `CUBE` are computed in one pass over the input
+  where possible, which is why they beat `UNION ALL` of several grouped queries:
+  the table is read once instead of n times.
+
+  An index on the grouping columns can let PostgreSQL skip the sort for a
+  GroupAggregate, and in version 14 and later an incremental sort can use a
+  partially matching index.
+
+interviewQuestions:
+  - question: Why must every non-aggregated select-list column appear in GROUP BY?
+    answer: >-
+      Because grouping replaces the input rows with one row per group, and a
+      non-aggregated column has no single value within a group — the query has
+      not said which of the many values to show. The exception is when the
+      grouping columns functionally determine the column, which SQL:1999 allows
+      and PostgreSQL implements for primary keys. MySQL historically returned an
+      arbitrary value instead, which is why ONLY_FULL_GROUP_BY exists.
+
+  - question: A report is missing categories with zero rows. Why, and how do you fix it?
+    answer: >-
+      GROUP BY can only form a group from rows that exist, so a category with no
+      matching rows produces no group rather than a zero. The fix is to start
+      from the table that enumerates the categories and LEFT JOIN the facts to
+      it, grouping by the category table's columns. Then count a column from the
+      fact side — `count(f.id)`, not `count(*)` — because the outer join creates
+      one NULL-extended row per empty category. For missing time periods,
+      generate_series supplies the complete calendar.
+
+  - question: When would you use ROLLUP instead of UNION ALL?
+    answer: >-
+      When you want detail rows plus subtotals plus a grand total from one scan
+      of the data. UNION ALL of three grouped queries reads the input three
+      times and the three branches can drift apart during maintenance. ROLLUP
+      expresses the hierarchy once. The cost is that subtotal rows carry NULL in
+      the rolled-up columns and must be distinguished from genuine NULLs with
+      GROUPING().
+
+  - question: What does GROUP BY do with NULL?
+    answer: >-
+      It puts all NULLs in one group, treating them as equal to each other. This
+      contradicts the usual rule that NULL is not equal to anything, and it is a
+      deliberate exception shared by DISTINCT, UNION and ORDER BY — grouping on
+      a nullable column would otherwise be unusable.
+
+exercises:
+  - prompt: >-
+      For each job title in department 10, return the number of employees, the
+      average salary rounded to the nearest rupee, and the salary range
+      (max minus min). Only include titles held by more than one person.
+      Columns job_title, holders, avg_salary, salary_range.
+    difficulty: Easy
+    hint: >-
+      The department filter is per-row, so WHERE. The "more than one" filter is
+      per-group, so HAVING.
+    solutionSql: |
+      select job_title,
+             count(*)                 as holders,
+             round(avg(salary), 0)    as avg_salary,
+             max(salary) - min(salary) as salary_range
+      from employees
+      where dept_id = 10
+      group by job_title
+      having count(*) > 1
+      order by holders desc, job_title
+
+  - prompt: >-
+      Return every product category id together with the number of products in
+      it, including categories that contain no products. Columns category_id,
+      category_name, products. Order by category_id.
+    difficulty: Medium
+    hint: >-
+      LEFT JOIN from categories, and count a column from products rather than
+      count(*).
+    solutionSql: |
+      select c.category_id,
+             c.category_name,
+             count(p.product_id) as products
+      from categories c
+      left join products p on p.category_id = c.category_id
+      group by c.category_id, c.category_name
+      order by c.category_id
+
+  - prompt: >-
+      Produce monthly revenue for 2024 from daily_sales with a grand-total row.
+      Columns month_start (NULL on the total row), revenue. Order detail rows
+      first, then the total.
+    difficulty: Medium
+    hint: >-
+      `group by rollup (month_start)` over a subquery that computes month_start,
+      and order by `grouping(month_start)` first.
+    solutionSql: |
+      select month_start,
+             round(sum(revenue), 2) as revenue
+      from (select date_trunc('month', sale_date) as month_start, revenue
+            from daily_sales
+            where sale_date >= date '2024-01-01'
+              and sale_date <  date '2025-01-01') s
+      group by rollup (month_start)
+      order by grouping(month_start), month_start
+
+checklist:
+  - GROUP BY replaces rows with groups, so only keys, aggregates and constants may be selected
+  - PostgreSQL frees the other columns when you group by a primary key
+  - A category with no rows produces no group — LEFT JOIN from the category table
+  - "With a LEFT JOIN, count a column from the right-hand side, never count(*)"
+  - WHERE filters rows before grouping, HAVING filters groups after
+  - A HAVING clause with no aggregate belongs in WHERE
+  - All NULLs form a single group
+  - "ROLLUP and CUBE give subtotals in one pass; GROUPING() tells a subtotal NULL from a data NULL"
+
+related:
+  - a-aggregates
+  - a-conditional-aggregation
+  - f-logical-order
+  - j-inner-outer
+
+dialect:
+  standard: >-
+    GROUP BY, HAVING, GROUPING SETS, ROLLUP, CUBE and the GROUPING() function
+    are all standard SQL, as is the functional-dependency relaxation.
+  postgres: >-
+    Implements all of the above, allows a select-list alias in GROUP BY, and
+    supports grouping by a primary key to free the dependent columns. Chooses
+    between HashAggregate and GroupAggregate automatically.
+  mysql: >-
+    Supports WITH ROLLUP in a different syntax and has no GROUPING SETS or CUBE.
+    Without ONLY_FULL_GROUP_BY it permits non-aggregated, non-grouped columns
+    and returns an arbitrary value, which produces queries that cannot be ported
+    without rethinking what they meant.

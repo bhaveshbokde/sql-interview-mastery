@@ -1,0 +1,489 @@
+id: p-explain
+moduleId: performance
+position: 20
+title: Reading an execution plan
+slug: reading-execution-plans
+difficulty: Advanced
+estimatedMinutes: 30
+summary: >-
+  EXPLAIN shows the plan, EXPLAIN ANALYZE shows what happened. Learn to read
+  the node types, spot the one number that matters most — estimated versus
+  actual rows — and stop guessing at performance.
+tags: [explain, query-plan, planner, cost, statistics]
+
+prerequisites:
+  - p-indexes
+
+objectives:
+  - Read a plan tree and say which node runs first
+  - Interpret cost, rows, width, actual time and loops
+  - Use the estimate-versus-actual row ratio to diagnose a bad plan
+  - Recognise the scan and join node types and what each implies
+  - Name the EXPLAIN options worth using and why BUFFERS matters
+
+concept: |
+  ## EXPLAIN and EXPLAIN ANALYZE
+
+  `EXPLAIN query` shows the plan the planner **would** choose, with estimates.
+  Nothing is executed.
+
+  `EXPLAIN ANALYZE query` **executes** the query and reports what actually
+  happened alongside the estimates. It runs the query, including its side
+  effects — wrap a data-modifying statement in a transaction and roll back.
+
+  > The playground cannot run `EXPLAIN`: it accepts only `SELECT`, and
+  > `EXPLAIN` is a different statement type. Everything in this lesson is
+  > meant for a `psql` session against your own database, and the plans shown
+  > below were produced that way.
+
+  ## Reading the tree
+
+  Plans are trees printed with indentation. **Read inside out and bottom
+  up**: the most-indented nodes execute first and feed their parents.
+
+  ```
+  Sort  (cost=74.54..74.67 rows=50 width=68)
+    Sort Key: e.salary DESC
+    ->  Hash Join  (cost=1.14..72.90 rows=50 width=68)
+          Hash Cond: (e.dept_id = d.dept_id)
+          ->  Seq Scan on employees e  (cost=0.00..1.40 rows=40 width=40)
+          ->  Hash  (cost=1.06..1.06 rows=6 width=36)
+                ->  Seq Scan on departments d  (cost=0.00..1.06 rows=6 width=36)
+  ```
+
+  Scan `departments`, build a hash from it, scan `employees`, probe the hash,
+  sort the result.
+
+  ## The numbers
+
+  `cost=0.00..1.40` — **startup cost** and **total cost**, in arbitrary units
+  where 1.0 is notionally one sequential page read. Startup cost is the work
+  before the first row can be returned, which is why a `Sort` has a high
+  startup cost and a `Seq Scan` has none. Only the ratios between costs
+  matter; the absolute numbers mean nothing in seconds.
+
+  `rows=40` — the **estimated** row count.
+
+  `width=40` — estimated average row width in bytes.
+
+  With `ANALYZE` you also get:
+
+  `actual time=0.011..0.019` — real startup and total time in milliseconds,
+  **per loop**.
+
+  `rows=40` (in the actual section) — the real count, **per loop**.
+
+  `loops=6` — how many times this node ran. **Multiply** actual time and rows
+  by loops for the total. A node showing 0.1 ms and 2000 loops cost 200 ms,
+  and this is the most commonly misread part of a plan.
+
+  ## The number that matters most
+
+  **Estimated rows versus actual rows.** If the planner thought a node would
+  produce 5 rows and it produced 50,000, every decision above that node was
+  made on false information — and that, far more often than a missing index,
+  is why a plan is bad.
+
+  A ratio within an order of magnitude is normal. Three orders of magnitude is
+  the thing to investigate, and the causes are:
+
+  - stale statistics → `ANALYZE`
+  - a skewed distribution the histogram misses → raise the statistics target
+  - correlated columns the planner assumes are independent →
+    `CREATE STATISTICS` for multivariate statistics
+  - an expression or function the planner cannot estimate → an expression
+    index gives it statistics
+
+  ## Node types worth recognising
+
+  **Scans**
+
+  - `Seq Scan` — read the whole table. Correct for small tables and
+    unselective filters.
+  - `Index Scan` — walk the index, fetch each matching row from the heap.
+  - `Index Only Scan` — answered from the index alone. Check
+    `Heap Fetches:` — a high number means the visibility map is stale.
+  - `Bitmap Heap Scan` with `Bitmap Index Scan` — collect locations, sort
+    them, read heap pages in physical order. The middle-selectivity choice.
+
+  **Joins**
+
+  - `Nested Loop` — for each outer row, probe the inner. Fast when the outer
+    is small and the inner is indexed; catastrophic when the outer is large
+    and the estimate said it would be small.
+  - `Hash Join` — build a hash on the smaller side, probe with the larger.
+    The usual choice for large unindexed equi-joins.
+  - `Merge Join` — walk two sorted inputs together. Good when both are
+    already sorted.
+
+  **Other**
+
+  - `Sort` — look for `Sort Method:`. `quicksort  Memory: 25kB` is fine;
+    `external merge  Disk: 4800kB` means it spilled and `work_mem` is too
+    small for this query.
+  - `HashAggregate` / `GroupAggregate` — grouping, with and without a sort.
+  - `Materialize` — the result is stored for repeated reading.
+  - `Memoize` — results of repeated inner lookups are cached. PostgreSQL 14+.
+
+  ## Options worth using
+
+  ```sql
+  EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) query;
+  ```
+
+  `BUFFERS` is the most undervalued. It reports pages hit in cache versus read
+  from disk, per node, which converts "this is slow" into "this node read
+  40,000 pages from disk". Time varies with cache state; buffer counts do not,
+  which makes them the more reliable comparison between two runs.
+
+  `VERBOSE` adds output column lists. `SETTINGS` shows non-default planner
+  settings, which is how you discover the previous engineer's `enable_seqscan
+  = off`.
+
+syntax:
+  - form: "EXPLAIN query"
+    notes: The plan with estimates. Nothing is executed.
+  - form: "EXPLAIN ANALYZE query"
+    notes: >-
+      Executes the query and reports actual timings and row counts. Wrap
+      data-modifying statements in a transaction and roll back.
+  - form: "EXPLAIN (ANALYZE, BUFFERS) query"
+    notes: >-
+      Adds shared buffer hits and reads per node. The most useful option and
+      the least used.
+  - form: "EXPLAIN (ANALYZE, FORMAT JSON) query"
+    notes: Machine-readable, for tooling and for diffing two plans.
+  - form: "ANALYZE tablename"
+    notes: >-
+      A different statement entirely — it refreshes the planner's statistics.
+      The first thing to try when estimates are wrong.
+  - form: "CREATE STATISTICS name (dependencies) ON a, b FROM t"
+    notes: >-
+      Multivariate statistics for correlated columns the planner would
+      otherwise assume independent.
+
+sampleTables: [employees, departments, orders, order_items, products]
+
+examples:
+  - title: The query whose plan is shown above
+    sql: |
+      select e.emp_id,
+             e.first_name || ' ' || e.last_name as employee,
+             d.dept_name,
+             e.salary
+      from employees e
+      join departments d on d.dept_id = e.dept_id
+      where e.salary > 150000
+      order by e.salary desc
+    walkthrough: |
+      Run `EXPLAIN ANALYZE` on this in psql and you will see a `Hash Join`
+      above two `Seq Scan`s, with a `Sort` on top.
+
+      Both scans are sequential, and that is correct: `departments` has six
+      rows and `employees` has forty, so reading them whole is cheaper than
+      any index could be. An index on `employees(salary)` would sit unused,
+      and creating one to "fix" the sequential scan would be a mistake.
+
+      The `Hash Join` builds its hash from `departments` because it is the
+      smaller side. The planner chooses which side to hash, and seeing it
+      choose the larger one is a signal that the estimates are wrong.
+
+      This is the baseline worth internalising: on small tables, sequential
+      scans and hash joins are the right plan, and a plan full of index scans
+      is not automatically better.
+
+  - title: A query whose estimates are easy to get wrong
+    sql: |
+      select o.shipping_country,
+             count(*)                                                       as lines,
+             count(distinct o.order_id)                                     as orders,
+             round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2) as revenue
+      from orders o
+      join order_items oi on oi.order_id = o.order_id
+      where o.status = 'completed'
+        and o.order_date >= date '2024-01-01'
+      group by o.shipping_country
+      order by revenue desc
+    walkthrough: |
+      Two filters on `orders`, then a join that fans out to `order_items`,
+      then an aggregate. Three places the estimate can go wrong.
+
+      The planner assumes `status` and `order_date` are **independent** and
+      multiplies their selectivities. If completed orders are concentrated in
+      the past — which they are, since recent orders have not completed yet —
+      the two are correlated and the combined estimate is too low. `CREATE
+      STATISTICS (dependencies) ON status, order_date FROM orders` fixes
+      exactly that.
+
+      A too-low estimate here is dangerous rather than merely inaccurate: it
+      can make the planner choose a nested loop for the join to
+      `order_items`, which is excellent for 10 rows and disastrous for
+      100,000.
+
+      Compare the estimated and actual rows at the join node. That one
+      comparison diagnoses more slow queries than any other single check.
+
+  - title: What the planner knows about a column
+    sql: |
+      select count(*)                                      as rows,
+             count(distinct status)                        as distinct_statuses,
+             count(distinct shipping_country)              as distinct_countries,
+             count(distinct customer_id)                   as distinct_customers,
+             round(count(*)::numeric / count(distinct status), 1)  as avg_rows_per_status
+      from orders
+    walkthrough: |
+      These are the quantities the planner estimates from its statistics:
+      total rows, distinct values per column, and therefore the expected
+      number of rows matching an equality filter.
+
+      With 151 orders and 4 distinct statuses, the planner's default
+      assumption for `where status = ?` is roughly 38 rows. If the
+      distribution is actually skewed — 140 completed and 11 across the rest —
+      that estimate is badly wrong for both the common and the rare value.
+
+      PostgreSQL handles this with a **most-common-values list** in
+      `pg_stats`, which records the frequency of the top n values separately
+      from the histogram. The default n is 100, raised with `ALTER TABLE ...
+      ALTER COLUMN ... SET STATISTICS`. Knowing that the MCV list exists is
+      most of understanding why some estimates are good and some are not.
+
+  - title: A query shape that invites a bad nested loop
+    sql: |
+      select p.product_id,
+             p.product_name,
+             (select count(*) from order_items oi where oi.product_id = p.product_id) as lines,
+             (select round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2)
+              from order_items oi where oi.product_id = p.product_id)                 as revenue
+      from products p
+      order by revenue desc nulls last, p.product_id
+      limit 10
+    walkthrough: |
+      Two correlated scalar subqueries, each executed per product. In the plan
+      these appear as `SubPlan` nodes with `loops=25`, and the per-loop timing
+      must be multiplied by the loop count to see the real cost.
+
+      That multiplication is the most commonly misread part of a plan. A
+      SubPlan showing `actual time=0.015..0.016 rows=15 loops=25` cost about
+      0.4 ms in total, not 0.016 ms.
+
+      The rewrite is a single aggregate joined once — the derived-table form
+      from the subqueries lesson. On 25 products the difference is noise; on
+      250,000 it is the whole query, and the plan shape is identical in both
+      cases, which is why reading the plan rather than the timing is what
+      generalises.
+
+edgeCases:
+  - title: A plan with no index available at all
+    body: >-
+      contacts has only a primary-key index, so grouping by email must
+      sequentially scan and hash-aggregate. That is the right plan for twelve
+      rows and would still be the right plan for a few thousand. The point at
+      which an index on email starts to win depends on how selective the
+      lookups are, not on the table's size alone — a grouped scan reads
+      everything regardless.
+    sql: |
+      select email, count(*) as rows
+      from contacts
+      group by email
+      having count(*) > 1
+      order by rows desc, email
+
+  - title: Sort versus index order
+    body: >-
+      The first query sorts by the primary key, which an index can supply
+      directly, so the plan may contain no Sort node at all. The second sorts
+      by a non-indexed expression and must sort. Comparing the two plans in
+      psql is the clearest demonstration that an ORDER BY is not automatically
+      a sort — it is a sort only when nothing already provides the order.
+    sql: |
+      select 'by primary key' as sorted_by, count(*) as rows
+      from (select order_id from orders order by order_id) a
+      union all
+      select 'by expression', count(*)
+      from (select order_id from orders order by order_id::text) b
+      order by sorted_by
+
+pitfalls:
+  - mistake: Reading actual time without multiplying by loops
+    why: >-
+      Per-loop figures look small. A node at 0.1 ms with 5,000 loops is half a
+      second, and it is printed as 0.1.
+    fix: >-
+      Always multiply. Visual plan tools do it for you, which is a good reason
+      to use one for anything non-trivial.
+
+  - mistake: Chasing the most expensive node instead of the worst estimate
+    why: >-
+      The expensive node is usually a symptom. The cause is further down,
+      where an estimate of 5 rows produced 50,000 and the planner picked a
+      nested loop on that basis.
+    fix: >-
+      Scan the plan for the largest estimated-to-actual ratio first, and fix
+      that. The expensive node above it often disappears.
+
+  - mistake: Trusting EXPLAIN without ANALYZE for a performance problem
+    why: >-
+      Plain EXPLAIN shows only estimates. If the estimates are the problem —
+      which they usually are — it shows you the wrong numbers with complete
+      confidence.
+    fix: >-
+      EXPLAIN (ANALYZE, BUFFERS) for anything you are diagnosing. Use plain
+      EXPLAIN only when executing would be unacceptable.
+
+  - mistake: Comparing timings between runs without considering cache
+    why: >-
+      The second run of a query is faster because the pages are in the buffer
+      cache. A "20% improvement" from a rewrite is frequently just the cache.
+    fix: >-
+      Compare `BUFFERS` counts, which do not depend on cache state, and run
+      each variant several times.
+
+performance: |
+  The planner's job is to estimate the cost of each candidate plan and pick the
+  cheapest. It does that from statistics gathered by `ANALYZE`: row counts,
+  distinct-value counts, a most-common-values list, a histogram, and a
+  correlation figure describing how well the column's order matches physical
+  order.
+
+  The cost model's main parameters are `seq_page_cost` (1.0),
+  `random_page_cost` (4.0), `cpu_tuple_cost` (0.01) and `work_mem` (4 MB).
+  The 4:1 page-cost ratio dates from spinning disks; on SSDs, lowering
+  `random_page_cost` to around 1.1 makes index scans correctly more attractive
+  and is one of the highest-value configuration changes available.
+
+  `work_mem` is **per sort or hash node, per parallel worker** — not per
+  query and not per connection. A query with three sorts and two workers can
+  use six times `work_mem`. Raising it globally is therefore risky; raising it
+  for one session before one heavy query is the safer pattern.
+
+  Multivariate statistics via `CREATE STATISTICS` are the fix for correlated
+  columns, where the planner's independence assumption multiplies two
+  selectivities that should not be multiplied. It is under-used and it fixes a
+  whole class of nested-loop disasters.
+
+interviewQuestions:
+  - question: What is the difference between EXPLAIN and EXPLAIN ANALYZE?
+    answer: >-
+      EXPLAIN shows the plan the planner would choose along with its estimates,
+      without running the query. EXPLAIN ANALYZE actually executes it and
+      reports real timings, real row counts and loop counts beside the
+      estimates. The comparison between estimated and actual rows is the single
+      most useful diagnostic in the output. Because it executes, EXPLAIN
+      ANALYZE on an INSERT, UPDATE or DELETE performs the modification, so such
+      statements should be wrapped in a transaction and rolled back.
+
+  - question: What does "rows=5 ... actual rows=50000" tell you?
+    answer: >-
+      That the planner's estimate was wrong by four orders of magnitude, so
+      every decision made above that node — join algorithm, join order,
+      whether to sort or hash — was based on false information. That is a far
+      more common cause of a bad plan than a missing index. The usual remedies
+      are running ANALYZE if statistics are stale, raising the statistics
+      target for a skewed column, creating multivariate statistics when two
+      filtered columns are correlated, or adding an expression index so the
+      planner has statistics for an expression it cannot otherwise estimate.
+
+  - question: When is a nested loop join the right choice, and when is it a disaster?
+    answer: >-
+      It is right when the outer input is small and the inner side has an index
+      on the join key, because each outer row costs one index lookup — often
+      the cheapest possible plan, and it can return rows immediately with no
+      startup cost. It is a disaster when the outer input turns out to be much
+      larger than estimated, because the cost is outer rows times inner lookup
+      and grows linearly with a number that was wrong. A nested loop whose
+      outer estimate was 10 and whose actual was 100,000 is the classic shape
+      of a query that used to be fast.
+
+  - question: Why is BUFFERS more useful than timing?
+    answer: >-
+      Because buffer counts are deterministic and timings are not. The time a
+      query takes depends on what happens to be in the shared buffer cache and
+      the OS page cache, so the second run is always faster and a comparison
+      between two variants measures cache state as much as query quality.
+      Shared buffer hits and reads per node are the same regardless, so they
+      let you say that one plan touches 40,000 pages and another touches 400 —
+      which is the fact that generalises to production.
+
+exercises:
+  - prompt: >-
+      Report the statistics the planner would base its estimates on for the
+      orders table — row count and distinct values of status, shipping_country
+      and customer_id. Columns rows, statuses, countries, customers.
+    difficulty: Easy
+    hint: count(*) and three count(distinct ...).
+    solutionSql: |
+      select count(*)                          as rows,
+             count(distinct status)            as statuses,
+             count(distinct shipping_country)  as countries,
+             count(distinct customer_id)       as customers
+      from orders
+
+  - prompt: >-
+      Show the status distribution of orders, so you can judge whether the
+      planner's uniform-distribution assumption would be accurate. Columns
+      status, orders, pct, and the count that a uniform assumption would
+      predict. Order by orders descending.
+    difficulty: Medium
+    hint: >-
+      The uniform prediction is total rows divided by the number of distinct
+      statuses, available via window functions over the grouped result.
+    solutionSql: |
+      select status,
+             count(*)                                                      as orders,
+             round(100.0 * count(*) / sum(count(*)) over (), 1)            as pct,
+             round(sum(count(*)) over () / count(*) over (), 1)            as uniform_prediction
+      from orders
+      group by status
+      order by orders desc, status
+
+  - prompt: >-
+      Demonstrate correlated selectivity: count orders that are completed,
+      count those placed in 2024, and count those that are both — then compare
+      the actual overlap with what independence would predict. Columns
+      completed, in_2024, actual_overlap, independent_prediction.
+    difficulty: Hard
+    hint: >-
+      The independence prediction is completed × in_2024 / total. Use FILTER
+      counts and a single total. Avoid naming a column `both` — it is a
+      reserved word.
+    solutionSql: |
+      select count(*) filter (where status = 'completed')                  as completed,
+             count(*) filter (where order_date >= date '2024-01-01')       as in_2024,
+             count(*) filter (where status = 'completed'
+                                and order_date >= date '2024-01-01')       as actual_overlap,
+             round((count(*) filter (where status = 'completed'))::numeric
+                   * (count(*) filter (where order_date >= date '2024-01-01'))
+                   / count(*), 1)                                          as independent_prediction
+      from orders
+
+checklist:
+  - "Read a plan inside out and bottom up; the most indented node runs first"
+  - "cost is startup..total in arbitrary units; only ratios mean anything"
+  - "Multiply actual time and rows by loops — this is the most misread number"
+  - The estimated-to-actual row ratio is the single best diagnostic
+  - "Seq Scan is correct for small tables and unselective filters"
+  - "A nested loop is excellent with a small outer side and catastrophic when the estimate was wrong"
+  - "Sort Method: external merge means work_mem was too small"
+  - BUFFERS is deterministic where timing is not
+
+related:
+  - p-indexes
+  - p-query-patterns
+  - f-logical-order
+  - t-mvcc-locks
+
+dialect:
+  standard: >-
+    Execution plans are entirely outside the SQL standard. Every database has
+    its own command, format and vocabulary.
+  postgres: >-
+    EXPLAIN with ANALYZE, BUFFERS, VERBOSE, SETTINGS, WAL and FORMAT options.
+    Text, JSON, XML and YAML output. Statistics in pg_stats, refreshed by
+    ANALYZE and by autovacuum, with multivariate statistics available through
+    CREATE STATISTICS.
+  mysql: >-
+    EXPLAIN produces a flat table rather than a tree, with a `type` column
+    whose values (ALL, index, range, ref, eq_ref, const) encode the access
+    method. EXPLAIN ANALYZE arrived in 8.0.18 and does produce a tree. The
+    older EXPLAIN FORMAT=JSON gives cost estimates. The vocabulary does not
+    transfer, so plan-reading skill is per-database.

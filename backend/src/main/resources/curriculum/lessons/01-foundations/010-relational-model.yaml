@@ -1,0 +1,420 @@
+id: f-relational-model
+moduleId: foundations
+position: 10
+title: What SQL is, and how a relational database stores data
+slug: relational-model
+difficulty: Beginner
+estimatedMinutes: 20
+summary: >-
+  Tables, rows, columns, schemas and the relationships between them — and the
+  one idea underneath all of it: SQL describes the result you want, not the
+  steps to produce it.
+tags: [relational-model, schema, keys, basics]
+
+prerequisites: []
+
+objectives:
+  - Say what makes a database "relational" without using the word "table"
+  - Name the four things a table definition fixes about every row in it
+  - Explain the difference between a schema, a database and a table
+  - Read a foreign key and say out loud which direction the dependency runs
+  - Describe what a database server does with a query between receiving it and
+    returning rows
+
+concept: |
+  ## SQL describes the answer, not the method
+
+  Almost every language you have written before is **imperative**: you say what
+  to do, in order, and the machine does it. SQL is **declarative**. You describe
+  the set of rows you want, and the database works out how to get them.
+
+  That single difference explains a surprising amount of what follows. It is why
+  two queries that look nothing alike can take exactly the same time to run —
+  the planner rewrote both into the same plan. It is why adding an index can
+  make a query a thousand times faster without changing a character of it. And
+  it is why the most common beginner frustration — "I wrote the steps in the
+  right order and it still doesn't work" — happens: there are no steps.
+
+  ## What "relational" means
+
+  A **relation** is a set of rows that all have the same shape. That is it.
+  The word does not refer to relationships between tables, which is a near
+  universal misunderstanding and worth getting out of the way early. A table
+  *is* a relation; a foreign key is something else.
+
+  Being a set has consequences that people rediscover the hard way:
+
+  - **There is no row order.** A table has no first row. If you want an order,
+    you ask for one with `ORDER BY`. Any order you see without it is an accident
+    of how the rows happen to be stored, and it will change.
+  - **There is no column order either**, in principle — though SQL does give
+    columns a position, and `SELECT *` depends on it, which is one of several
+    reasons not to use `SELECT *` in anything that has to keep working.
+  - **Duplicate rows are possible in SQL** even though a mathematical relation
+    has none. SQL tables are really multisets. This is a deliberate departure
+    from the theory and it is the reason `UNION` and `UNION ALL` are different
+    operators.
+
+  ## Tables, columns, rows
+
+  A table definition fixes four things about every row in it:
+
+  1. **The columns**, by name and position.
+  2. **The type of each column** — `integer`, `text`, `date`, `numeric(10,2)`.
+     The database enforces this; you cannot put the word "yesterday" into a
+     `date` column.
+  3. **Whether each column may be NULL** — that is, whether the value is allowed
+     to be absent.
+  4. **The constraints** — a primary key, uniqueness, a check, a default.
+
+  Everything in that list is enforced by the database, not by the application.
+  That is the point of putting it there: the application is one of several
+  things that writes to the database, and the constraint holds for all of them,
+  including the person with a psql prompt at two in the morning.
+
+  ## Schemas and databases
+
+  These two words get used loosely and they are not the same thing.
+
+  - A **database** is a self-contained collection of data with its own
+    connections. A query cannot join across two databases in PostgreSQL.
+  - A **schema** is a namespace *inside* a database. Tables live in schemas.
+    `learning.employees` means "the `employees` table in the `learning` schema".
+  - The **search path** decides what an unqualified name like `employees` means.
+    In this playground it is set to `learning`, which is why you can write
+    `employees` and get `learning.employees`.
+
+  This application uses two schemas in one database, and the separation is doing
+  real work: everything you can query is in `learning`, and the lesson content
+  and problem solutions are in `app`, which the playground role has no
+  permission to read.
+
+  ## Relationships and keys
+
+  A **primary key** identifies a row uniquely. `employees.emp_id` is one.
+
+  A **foreign key** is a column whose values must appear as a primary key
+  somewhere else. `employees.dept_id` references `departments.dept_id`, which
+  means two things at once:
+
+  - the database will reject an employee in a department that does not exist;
+  - the dependency runs from employee to department. You can delete an employee
+    freely; you cannot delete a department that still has employees.
+
+  Reading the direction off a foreign key is a small skill with a large payoff,
+  because it tells you which side of a join can have no match — and that is
+  exactly where `LEFT JOIN` and `NULL` come in later.
+
+  ## What happens when you press Run
+
+  1. The statement is sent to the PostgreSQL server over a connection.
+  2. The **parser** turns the text into a tree, rejecting anything ungrammatical.
+  3. The **planner** considers several ways to produce the result — scan the
+     table, use an index, which join algorithm, which order — and estimates the
+     cost of each using statistics about the data.
+  4. The **executor** runs the winning plan.
+  5. Rows come back over the connection.
+
+  Step 3 is why SQL performance is a topic at all, and why `EXPLAIN` exists: it
+  shows you the plan that was chosen.
+
+syntax:
+  - form: "schema.table"
+    notes: >-
+      A qualified name. Unqualified names are resolved against the search path,
+      which here is `learning`, so `employees` and `learning.employees` mean the
+      same thing.
+  - form: "SELECT column_list FROM table"
+    notes: >-
+      The minimum useful query. The column list may be `*`, which means every
+      column in table order — convenient when exploring, a liability in code,
+      because the result silently changes shape when a column is added.
+  - form: "CREATE TABLE t (col type [NOT NULL] [DEFAULT expr], PRIMARY KEY (col))"
+    notes: >-
+      The shape of a table definition. You will not run DDL in this playground —
+      it is read-only — but you will be asked to write it at a whiteboard, and
+      the schema-design module covers it properly.
+
+sampleTables: [departments, employees, products, categories]
+
+examples:
+  - title: Look at a whole, small table
+    sql: |
+      select *
+      from departments
+      order by dept_id
+    walkthrough: |
+      `SELECT *` means every column; `FROM departments` names the table;
+      `ORDER BY dept_id` imposes an order, because without it the database is
+      free to return the rows however it likes.
+
+      Note what the result tells you about the table definition. `location` and
+      `budget` are shown for every row here, but that is this data, not a rule —
+      you cannot tell from a result whether a column is nullable. The schema
+      panel on the left can, and so can the next example.
+
+  - title: Ask the database about its own structure
+    sql: |
+      select column_name,
+             data_type,
+             is_nullable,
+             column_default
+      from information_schema.columns
+      where table_schema = 'learning'
+        and table_name   = 'employees'
+      order by ordinal_position
+    walkthrough: |
+      PostgreSQL describes itself through `information_schema`, which is part of
+      the SQL standard, and through its own `pg_catalog`. This query reads the
+      definition of `employees`: the column names, their types, whether each
+      one accepts NULL, and any default.
+
+      Two things to notice in the output. `dept_id` and `manager_id` are
+      nullable — which is how the CEO can have no manager and a new hire can
+      have no department yet. And `is_active` has a default of `true`, so an
+      INSERT that does not mention it still gets a value.
+
+      This is also the first query here that reads a table you did not know
+      existed, which is the general lesson: the catalogue is queryable with
+      ordinary SQL, because it is ordinary tables.
+
+  - title: Follow a foreign key
+    sql: |
+      select e.emp_id,
+             e.first_name || ' ' || e.last_name as employee,
+             e.dept_id,
+             d.dept_name
+      from employees e
+      join departments d on d.dept_id = e.dept_id
+      order by e.emp_id
+      limit 8
+    walkthrough: |
+      `employees.dept_id` holds the key of a row in `departments`. Joining on
+      that equality replaces the number with the name.
+
+      `e` and `d` are **table aliases**. They are not decoration: once two tables
+      are in play, `dept_id` is ambiguous, and qualifying every column with its
+      table is the habit that makes a five-table query readable.
+
+      The `||` operator concatenates text. It is the standard SQL spelling;
+      MySQL uses `CONCAT()` and treats `||` as logical OR, which is a classic
+      way to get a confusing result when moving a query between the two.
+
+  - title: See a hierarchy inside one table
+    sql: |
+      select c.category_id,
+             c.category_name,
+             c.parent_category_id,
+             p.category_name as parent_name
+      from categories c
+      left join categories p on p.category_id = c.parent_category_id
+      order by c.category_id
+    walkthrough: |
+      A foreign key can point at the table it lives in. `categories.parent_category_id`
+      references `categories.category_id`, which is how a hierarchy of any depth
+      is stored in a flat table.
+
+      The join is a **self join**: the same table appearing twice under two
+      aliases, which is the only way to refer to two different rows of it in one
+      query. `LEFT JOIN` rather than `JOIN`, because a top-level category has no
+      parent — and with a plain `JOIN` the two root categories would vanish from
+      the result without any indication that they had.
+
+edgeCases:
+  - title: A table with no rows is still a table
+    body: >-
+      `order_items` in the alternate dataset is empty. A query against it is not
+      an error and does not return NULL — it returns no rows, which is a
+      different thing and behaves differently in almost every context that
+      follows. Aggregates over it are the interesting case, covered in the
+      aggregation module.
+    sql: |
+      select count(*) as row_count
+      from order_items
+
+  - title: Row order without ORDER BY is not a promise
+    body: >-
+      This query asks for five employees with no ordering. PostgreSQL will
+      return some five rows. Which five, and in what sequence, is not defined,
+      and can change when the table is updated, when it is vacuumed, when the
+      planner picks an index scan over a sequential scan, or when the server is
+      upgraded. Code that depends on it works until it does not.
+    sql: |
+      select emp_id, first_name
+      from employees
+      limit 5
+
+pitfalls:
+  - mistake: Assuming rows come back in insertion order
+    why: >-
+      They often do, for a while, in a small table that has never been updated.
+      The illusion is strong because it survives every test on a developer
+      machine and breaks in production once the table is large enough for the
+      planner to choose a different access path.
+    fix: >-
+      Put an `ORDER BY` on anything whose order you rely on. If you find
+      yourself unable to name a column that defines the order, that is worth
+      knowing too — it usually means the requirement is vague rather than that
+      SQL is deficient.
+
+  - mistake: Thinking "relational" refers to relationships between tables
+    why: >-
+      The word strongly suggests it, and nearly every introduction leaves it
+      ambiguous. It actually names the mathematical relation — a set of rows of
+      the same shape.
+    fix: >-
+      Call the connections "foreign keys" and the thing a table is a "relation".
+      The distinction matters when you read documentation or a paper and the
+      author is precise.
+
+  - mistake: Using `SELECT *` in application code
+    why: >-
+      It is the right thing to type when exploring. In code it means the result
+      changes shape whenever someone adds a column, which breaks positional
+      access, silently widens network transfer, and can defeat an index-only
+      scan that would otherwise have avoided touching the table at all.
+    fix: >-
+      Name the columns you want. The cost is a few seconds of typing and the
+      benefit is that the query keeps meaning what it meant.
+
+performance: |
+  Nothing in this lesson is about performance yet, but two facts are worth
+  planting now because the performance module builds on them.
+
+  First, **the shape of a query does not determine how it runs.** The planner
+  rewrites. A subquery and a join that express the same thing frequently produce
+  byte-identical plans, so "rewrite the subquery as a join for speed" is advice
+  that was true decades ago and is usually false now. Measure with `EXPLAIN`
+  before believing any rule of that kind, including this one.
+
+  Second, **the amount of data moved matters more than almost anything else at
+  small scale.** `SELECT *` on a wide table with a `jsonb` column can be an
+  order of magnitude more bytes than selecting the three columns you wanted,
+  and no index will save you from that.
+
+interviewQuestions:
+  - question: What does it mean to say SQL is declarative?
+    answer: >-
+      You describe the result set you want rather than the procedure to compute
+      it. The database's planner chooses the procedure — which index to use,
+      which join algorithm, what order to join in — based on statistics about
+      the data. The practical consequences are that two differently-written
+      queries can execute identically, that performance can change without the
+      query changing, and that tuning usually means giving the planner better
+      options or better information rather than rewriting the logic.
+
+  - question: What is the difference between a database and a schema in PostgreSQL?
+    answer: >-
+      A database is a self-contained collection with its own set of connections;
+      you cannot join across two of them in a single query without an extension
+      such as postgres_fdw. A schema is a namespace within a database, and a
+      single query can freely join tables in different schemas. The search_path
+      setting determines which schemas an unqualified table name is looked up
+      in. MySQL confuses this by using "database" and "schema" as synonyms,
+      which is worth saying out loud if the interviewer's background is MySQL.
+
+  - question: A table has no primary key. What goes wrong?
+    answer: >-
+      Nothing immediately — PostgreSQL will accept it. The problems are that
+      there is no way to identify a particular row to update or delete, so an
+      application ends up deleting several rows when it meant one; duplicates
+      can accumulate with nothing to prevent them; replication tools that
+      identify rows by key either refuse to work or fall back to comparing whole
+      rows; and most ORMs cannot map the table at all. A surrogate key is cheap
+      insurance even when a natural key exists.
+
+  - question: Why does SQL allow duplicate rows when the relational model does not?
+    answer: >-
+      Because eliminating them is expensive — it requires a sort or a hash over
+      the whole result — and because for many queries the duplicates are the
+      answer, as when counting. SQL therefore works on multisets and makes
+      deduplication something you ask for explicitly, with `DISTINCT` or by
+      choosing `UNION` over `UNION ALL`. The flip side is that `UNION` is doing
+      hidden work that `UNION ALL` is not, which is a real performance
+      difference on large inputs.
+
+exercises:
+  - prompt: >-
+      List every category together with its parent's name, ordered so that
+      top-level categories come first. Name the columns category_name and
+      parent_name.
+    difficulty: Easy
+    hint: >-
+      A category with no parent has NULL in parent_category_id. Decide what you
+      want that to sort as — PostgreSQL puts NULLs last by default in ascending
+      order, and `NULLS FIRST` overrides it.
+    solutionSql: |
+      select c.category_name,
+             p.category_name as parent_name
+      from categories c
+      left join categories p on p.category_id = c.parent_category_id
+      order by c.parent_category_id nulls first, c.category_name
+
+  - prompt: >-
+      Find every column in the learning schema that is a foreign key, together
+      with the table it points at. Return source_table, source_column and
+      target_table.
+    difficulty: Medium
+    hint: >-
+      information_schema.table_constraints tells you which constraints are of
+      type FOREIGN KEY; key_column_usage gives the column on this side and
+      constraint_column_usage gives the column on the other side. Join all three
+      on constraint_name.
+    solutionSql: |
+      select kcu.table_name  as source_table,
+             kcu.column_name as source_column,
+             ccu.table_name  as target_table
+      from information_schema.table_constraints tc
+      join information_schema.key_column_usage kcu
+        on kcu.constraint_name = tc.constraint_name
+       and kcu.table_schema    = tc.table_schema
+      join information_schema.constraint_column_usage ccu
+        on ccu.constraint_name = tc.constraint_name
+       and ccu.table_schema    = tc.table_schema
+      where tc.table_schema    = 'learning'
+        and tc.constraint_type = 'FOREIGN KEY'
+      order by source_table, source_column
+
+  - prompt: >-
+      How many rows are in each of employees, departments and orders? Return one
+      row with three columns named employees, departments and orders.
+    difficulty: Easy
+    hint: >-
+      A scalar subquery — a SELECT returning exactly one row and one column —
+      can appear anywhere a value can, including in the select list.
+    solutionSql: |
+      select (select count(*) from employees)   as employees,
+             (select count(*) from departments) as departments,
+             (select count(*) from orders)      as orders
+
+checklist:
+  - SQL is declarative — you describe the result, the planner chooses the method
+  - A table is a set of rows with a fixed shape; "relational" refers to that, not to foreign keys
+  - There is no row order without ORDER BY, and any order you observe is an accident
+  - A table definition fixes columns, types, nullability and constraints, and the database enforces all four
+  - A schema is a namespace inside a database; search_path resolves unqualified names
+  - A foreign key constrains values and tells you which side of a join can have no match
+  - information_schema is queryable with ordinary SQL, because it is ordinary tables
+  - SELECT * is for exploring, not for code
+
+related:
+  - f-data-types
+  - f-select-basics
+  - s-keys-constraints
+  - j-inner-outer
+
+dialect:
+  standard: >-
+    Tables, schemas, primary and foreign keys, and the information_schema views
+    are all in the SQL standard. So is the `||` concatenation operator.
+  postgres: >-
+    PostgreSQL adds its own pg_catalog alongside information_schema, with more
+    detail — index definitions, planner statistics, table sizes — than the
+    standard views expose. A database is a hard boundary: cross-database joins
+    need postgres_fdw or dblink.
+  mysql: >-
+    MySQL treats "database" and "schema" as the same thing, so a MySQL "schema"
+    is a PostgreSQL "database" and there is no equivalent of PostgreSQL's
+    namespacing within one. MySQL also reads `||` as logical OR by default
+    rather than concatenation, so a query using `||` to join strings returns
+    0 or 1 instead of text.

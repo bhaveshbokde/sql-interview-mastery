@@ -1,0 +1,333 @@
+id: p15-pivot-sales-by-quarter
+position: 140
+title: Pivot revenue by quarter
+slug: pivot-sales-by-quarter
+difficulty: Medium
+topic: Aggregation
+tags: [pivot, conditional-aggregation, filter, reporting]
+
+orderSensitive: false
+
+statement: |
+  Produce a report with one row per shipping country and one column per
+  quarter of 2023, showing completed-order revenue in each, plus the year
+  total and the number of distinct customers.
+
+  Countries with revenue in only some quarters must show zero in the others,
+  not NULL.
+
+tables: [orders, order_items, customers]
+
+expectedColumns: [shipping_country, q1, q2, q3, q4, year_total, customers]
+
+edgeCases:
+  - >-
+    A country with no revenue in a quarter must show 0, which means guarding
+    the sum with COALESCE.
+  - The four quarter columns must add up to the year total in every row.
+  - >-
+    Joining orders to order_items fans out, so counting customers needs
+    DISTINCT.
+  - >-
+    The column list is fixed when the query is written — a genuinely dynamic
+    pivot is not possible in one statement.
+
+hints:
+  - Conditional aggregation is the portable pivot. There is no PIVOT keyword.
+  - >-
+    `sum(...) filter (where ...)` returns NULL when nothing matches, and the
+    question asks for zero.
+  - Check that the quarter columns sum to the total — it catches a missed bucket.
+
+solutionSql: |
+  select o.shipping_country,
+         coalesce(round(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                  filter (where extract(quarter from o.order_date) = 1), 2), 0) as q1,
+         coalesce(round(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                  filter (where extract(quarter from o.order_date) = 2), 2), 0) as q2,
+         coalesce(round(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                  filter (where extract(quarter from o.order_date) = 3), 2), 0) as q3,
+         coalesce(round(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                  filter (where extract(quarter from o.order_date) = 4), 2), 0) as q4,
+         round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2)          as year_total,
+         count(distinct o.customer_id)                                           as customers
+  from orders o
+  join order_items oi on oi.order_id = o.order_id
+  where o.status = 'completed'
+    and o.order_date >= date '2023-01-01'
+    and o.order_date <  date '2024-01-01'
+  group by o.shipping_country
+  order by year_total desc, o.shipping_country
+
+explanation:
+  lineByLine:
+    - clause: "sum(...) filter (where extract(quarter from o.order_date) = 1)"
+      note: >-
+        One aggregate per output column, each restricted to its quarter.
+        FILTER restricts what this aggregate consumes without affecting the
+        group or the other aggregates, which is precisely what a pivot needs.
+    - clause: "coalesce(..., 0)"
+      note: >-
+        A sum over no rows is NULL, not zero. A country with no Q3 revenue
+        would otherwise show a blank cell, which reads as missing data rather
+        than as no sales.
+    - clause: "round(..., 2) inside the coalesce"
+      note: >-
+        Rounding before the COALESCE keeps the types consistent — numeric in
+        both branches — and avoids rounding a zero.
+    - clause: "count(distinct o.customer_id)"
+      note: >-
+        The join to order_items repeats each order once per line, so a plain
+        count would count lines. DISTINCT is doing real work here, not
+        decoration.
+    - clause: "where ... order_date < date '2024-01-01'"
+      note: >-
+        A half-open range on the raw column, so an index can serve it. The
+        quarter extraction happens only inside the FILTER clauses, where it
+        cannot prevent index use on the outer filter.
+
+  walkthrough: |
+    The join produces one row per completed 2023 order line. Grouping by
+    country collapses them, and the four filtered sums split each group's
+    revenue into quarters.
+
+    The United Kingdom and the Netherlands lead on volume. Several countries
+    have revenue in only two or three quarters, and those cells come back as
+    0 rather than blank because of the COALESCE.
+
+    The self-check is built into the result: `q1 + q2 + q3 + q4` equals
+    `year_total` on every row. If it did not, some order would have fallen
+    outside all four buckets, which can only happen if the date filter and
+    the quarter conditions disagree — a real risk when someone later widens
+    the date range and forgets the fifth column.
+
+    All four quarter columns plus the total plus the distinct count are
+    computed in **one pass**. The alternative — four grouped queries joined
+    together — reads the data four times for the same answer.
+
+  alternatives:
+    - title: CASE instead of FILTER, the portable form
+      sql: |
+        select o.shipping_country,
+               coalesce(round(sum(case when extract(quarter from o.order_date) = 1
+                        then oi.quantity * oi.unit_price * (1 - oi.discount) else 0 end), 2), 0) as q1,
+               coalesce(round(sum(case when extract(quarter from o.order_date) = 2
+                        then oi.quantity * oi.unit_price * (1 - oi.discount) else 0 end), 2), 0) as q2,
+               coalesce(round(sum(case when extract(quarter from o.order_date) = 3
+                        then oi.quantity * oi.unit_price * (1 - oi.discount) else 0 end), 2), 0) as q3,
+               coalesce(round(sum(case when extract(quarter from o.order_date) = 4
+                        then oi.quantity * oi.unit_price * (1 - oi.discount) else 0 end), 2), 0) as q4,
+               round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2) as year_total
+        from orders o
+        join order_items oi on oi.order_id = o.order_id
+        where o.status = 'completed'
+          and o.order_date >= date '2023-01-01'
+          and o.order_date <  date '2024-01-01'
+        group by o.shipping_country
+        order by year_total desc, o.shipping_country
+      when: >-
+        On MySQL or SQL Server, which have no FILTER clause. Note that `else
+        0` is correct with `sum` and would be a bug with `count` — the
+        asymmetry that makes FILTER preferable where it exists.
+      equivalent: true
+
+    - title: Long format, for a client that pivots itself
+      sql: |
+        select o.shipping_country,
+               extract(quarter from o.order_date)::int                        as quarter,
+               round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2) as revenue,
+               count(distinct o.customer_id)                                  as customers
+        from orders o
+        join order_items oi on oi.order_id = o.order_id
+        where o.status = 'completed'
+          and o.order_date >= date '2023-01-01'
+          and o.order_date <  date '2024-01-01'
+        group by o.shipping_country, extract(quarter from o.order_date)
+        order by o.shipping_country, quarter
+      when: >-
+        Almost always, in practice. A long result handles any number of
+        periods without changing the SQL, and the presentation layer or the
+        BI tool pivots it. The wide form is for when the consumer genuinely
+        needs fixed columns — a CSV with a known header, say.
+      equivalent: false
+
+  performance: |
+    Six aggregates over one group are computed in a **single pass**. The
+    equivalent as four separate grouped queries joined on country reads the
+    joined data four times; as four correlated subqueries, once per country
+    per quarter.
+
+    FILTER and the CASE form compile to essentially the same plan, so the
+    choice between them is readability rather than speed.
+
+    `count(distinct customer_id)` is the most expensive item here, because
+    each group must deduplicate and that cannot be done incrementally. With
+    several such columns a two-stage aggregation — distinct pairs first, then
+    counted — is sometimes markedly faster.
+
+    The date filter on the raw column means an index on `orders(order_date)`
+    can restrict the scan before the join. The quarter extraction inside the
+    FILTER clauses is evaluated per row and cannot use an index, but it never
+    needed to.
+
+  wrongApproaches:
+    - title: "count(case when ... then 1 else 0 end)"
+      sql: |
+        select o.shipping_country,
+               count(case when extract(quarter from o.order_date) = 1 then 1 else 0 end) as q1_orders,
+               count(case when extract(quarter from o.order_date) = 1 then 1 end)        as q1_orders_correct,
+               count(*)                                                                  as all_lines
+        from orders o
+        join order_items oi on oi.order_id = o.order_id
+        where o.status = 'completed'
+          and o.order_date >= date '2023-01-01'
+          and o.order_date <  date '2024-01-01'
+        group by o.shipping_country
+        order by o.shipping_country
+      whyWrong: >-
+        The first column equals the total line count, because `count` ignores
+        only NULL and `else 0` supplies a non-NULL value for every row. The
+        second column is the correct form, relying on the implicit ELSE NULL.
+        The two are shown together because the difference is invisible unless
+        you compare them.
+
+    - title: Four separate queries joined together
+      sql: |
+        select q1.shipping_country,
+               round(q1.revenue, 2) as q1,
+               round(coalesce(q2.revenue, 0), 2) as q2
+        from (select shipping_country,
+                     sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue
+              from orders o join order_items oi on oi.order_id = o.order_id
+              where o.status = 'completed'
+                and o.order_date >= date '2023-01-01' and o.order_date < date '2023-04-01'
+              group by shipping_country) q1
+        left join (select shipping_country,
+                          sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue
+                   from orders o join order_items oi on oi.order_id = o.order_id
+                   where o.status = 'completed'
+                     and o.order_date >= date '2023-04-01' and o.order_date < date '2023-07-01'
+                   group by shipping_country) q2 on q2.shipping_country = q1.shipping_country
+        order by q1.shipping_country
+      whyWrong: >-
+        Reads the data once per quarter, and worse, a country with no Q1
+        revenue is missing entirely because Q1 is the driving side of the
+        joins. Getting every country requires a FULL JOIN chain or a separate
+        list of countries to drive from — four joins and an outer-join
+        subtlety per quarter, all to avoid one FILTER clause.
+
+    - title: Forgetting COALESCE on the empty quarters
+      sql: |
+        select o.shipping_country,
+               round(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                     filter (where extract(quarter from o.order_date) = 4), 2) as q4
+        from orders o
+        join order_items oi on oi.order_id = o.order_id
+        where o.status = 'completed'
+          and o.order_date >= date '2023-01-01'
+          and o.order_date <  date '2024-01-01'
+        group by o.shipping_country
+        order by o.shipping_country
+      whyWrong: >-
+        Countries with no Q4 revenue show NULL rather than 0. In a report that
+        reads as "no data" rather than "no sales", and any arithmetic the
+        consumer does on the column — a total, an average — silently drops
+        those rows.
+
+  extraTests:
+    - name: Empty order_items (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt has no order_items at all, so the join produces nothing
+        and the query returns no rows. That is correct — there are no
+        countries with completed revenue — and it confirms the pivot does not
+        manufacture zero rows for countries that have no qualifying orders at
+        all. Zero-filling empty **cells** and inventing empty **rows** are
+        different problems.
+      sql: |
+        select o.shipping_country,
+               coalesce(round(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                        filter (where extract(quarter from o.order_date) = 1), 2), 0) as q1,
+               coalesce(round(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                        filter (where extract(quarter from o.order_date) = 2), 2), 0) as q2,
+               round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2)         as year_total,
+               count(distinct o.customer_id)                                          as customers
+        from orders o
+        join order_items oi on oi.order_id = o.order_id
+        where o.status = 'completed'
+        group by o.shipping_country
+        order by year_total desc, o.shipping_country
+
+    - name: The quarter columns reconcile with the total
+      schema: learning
+      note: >-
+        Every row's four quarters must sum to its year total. A non-zero
+        difference means an order fell outside all four buckets, which is the
+        failure a widened date range introduces and which no error message
+        reports.
+      sql: |
+        select shipping_country,
+               round(q1 + q2 + q3 + q4 - year_total, 2) as difference
+        from (
+            select o.shipping_country,
+                   coalesce(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                            filter (where extract(quarter from o.order_date) = 1), 0) as q1,
+                   coalesce(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                            filter (where extract(quarter from o.order_date) = 2), 0) as q2,
+                   coalesce(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                            filter (where extract(quarter from o.order_date) = 3), 0) as q3,
+                   coalesce(sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                            filter (where extract(quarter from o.order_date) = 4), 0) as q4,
+                   sum(oi.quantity * oi.unit_price * (1 - oi.discount))                as year_total
+            from orders o
+            join order_items oi on oi.order_id = o.order_id
+            where o.status = 'completed'
+              and o.order_date >= date '2023-01-01'
+              and o.order_date <  date '2024-01-01'
+            group by o.shipping_country) t
+        order by shipping_country
+
+  followUps:
+    - question: How would you make the pivot dynamic?
+      answer: >-
+        You cannot, in a single statement — a SQL result's column list is
+        fixed before execution, so it cannot depend on the data. The options
+        are to generate the SQL from a prior query that discovers the
+        distinct values, to return the long format and pivot in the
+        application or BI tool, or to aggregate into JSON with
+        `jsonb_object_agg` so one column holds a variable set of keys.
+        PostgreSQL's `crosstab` from the tablefunc extension still requires a
+        static column list.
+
+    - question: Why use FILTER rather than CASE?
+      answer: >-
+        It states the intent directly and has no variant that silently means
+        something else. The CASE form has a real trap — `count(case when c
+        then 1 else 0 end)` counts every row, because count ignores only NULL
+        — while `sum(case when c then x else 0 end)` is correct. FILTER
+        removes that asymmetry. It is standard SQL from SQL:2003, implemented
+        by PostgreSQL and SQLite but not MySQL or SQL Server, so the CASE
+        form is still worth knowing.
+
+    - question: Why is count(distinct customer_id) necessary here?
+      answer: >-
+        Because the join to order_items produces one row per order line, so
+        each order appears several times and each customer once per line they
+        ever bought. A plain count would return the line count under a
+        customer label. This fan-out is the most common source of inflated
+        figures in reporting SQL, and the general defence is to check the
+        joined row count against the count of the driving entity.
+
+    - question: How would you add a grand-total row?
+      answer: >-
+        `group by rollup (shipping_country)` adds a row with NULL in the
+        country column holding the overall totals, computed in the same pass.
+        Distinguishing that NULL from a genuinely unknown country needs
+        `grouping(shipping_country)`, which returns 1 for the rollup row — and
+        that distinction is the reason the function exists.
+
+  related:
+    - a-conditional-aggregation
+    - a-group-by-having
+    - i-datetime-string
+    - p09-month-over-month-growth

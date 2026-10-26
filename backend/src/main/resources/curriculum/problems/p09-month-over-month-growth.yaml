@@ -1,0 +1,344 @@
+id: p09-month-over-month-growth
+position: 90
+title: Month-over-month revenue growth
+slug: month-over-month-growth
+difficulty: Medium
+topic: Window functions
+tags: [lag, growth, date-trunc, division-by-zero, reporting]
+
+orderSensitive: true
+
+statement: |
+  For each region, return monthly revenue from `daily_sales` with the previous
+  month's revenue, the absolute change and the percentage change rounded to
+  one decimal place.
+
+  The first month of each region has no predecessor and its change columns
+  must be NULL rather than zero.
+
+tables: [daily_sales]
+
+expectedColumns: [region, month_start, revenue, previous_month, change, pct_change]
+
+edgeCases:
+  - >-
+    The first month of each region has nothing to compare against — NULL is
+    the honest answer, not zero.
+  - >-
+    A previous month of zero would make the percentage a division by zero,
+    which aborts the whole statement rather than one row.
+  - >-
+    A month with no sales produces no row, so LAG returns the previous
+    **row** rather than the previous calendar month. Whether that matters
+    depends on whether gaps are possible.
+  - The comparison must be within a region, not across all of them.
+
+hints:
+  - Aggregate to months first, then compare — two steps, not one.
+  - "`LAG` takes the previous row in the window, which is why the window needs a partition."
+  - A percentage whose denominator can be zero needs guarding.
+
+solutionSql: |
+  with monthly as (
+      select region,
+             date_trunc('month', sale_date)::date as month_start,
+             sum(revenue)                         as revenue
+      from daily_sales
+      group by region, date_trunc('month', sale_date)
+  )
+  select region,
+         month_start,
+         round(revenue, 2)                                                as revenue,
+         round(lag(revenue) over w, 2)                                    as previous_month,
+         round(revenue - lag(revenue) over w, 2)                          as change,
+         round(100.0 * (revenue - lag(revenue) over w)
+               / nullif(lag(revenue) over w, 0), 1)                       as pct_change
+  from monthly
+  window w as (partition by region order by month_start)
+  order by region, month_start
+
+explanation:
+  lineByLine:
+    - clause: "date_trunc('month', sale_date)::date"
+      note: >-
+        Buckets each day into its month and keeps the type, so the result
+        sorts chronologically. `extract(month from ...)` would return a number
+        with no year and would merge the same month across years.
+    - clause: "group by region, date_trunc('month', sale_date)"
+      note: >-
+        Aggregating to the comparison grain first is what makes the rest
+        simple. Trying to compute month-over-month growth in one pass over
+        daily rows is possible and much harder to read.
+    - clause: "window w as (partition by region order by month_start)"
+      note: >-
+        One window definition used four times. The partition keeps regions
+        independent — without it, the first month of the South would be
+        compared with the last month of the North.
+    - clause: "lag(revenue) over w"
+      note: >-
+        The previous row in the window. For the first month of each region
+        there is no previous row and it returns NULL, which propagates
+        correctly through the change and percentage columns.
+    - clause: "nullif(lag(revenue) over w, 0)"
+      note: >-
+        Turns a zero denominator into NULL. Without it, a month with no
+        revenue would raise a division-by-zero error that cancels the entire
+        statement, not just that row.
+
+  walkthrough: |
+    `monthly` collapses 180 daily rows into one row per region per month —
+    three months for each of North and South.
+
+    For the North, January's revenue has no predecessor so `previous_month`,
+    `change` and `pct_change` are all NULL. February compares against January,
+    March against February.
+
+    The South is computed independently because of the partition. Its January
+    row is also NULL in the comparison columns, which is correct: the previous
+    row in the whole result set is the North's March, and comparing those two
+    would be meaningless.
+
+    Note that March is partial — the data runs to 29 March — so its revenue is
+    lower than a full month's and the percentage change is misleading. That is
+    a property of the data rather than the query, and it is the kind of thing
+    worth flagging in a report rather than letting a reader conclude revenue
+    collapsed.
+
+  alternatives:
+    - title: Self-join on the previous month
+      sql: |
+        with monthly as (
+            select region,
+                   date_trunc('month', sale_date)::date as month_start,
+                   sum(revenue)                         as revenue
+            from daily_sales
+            group by region, date_trunc('month', sale_date)
+        )
+        select m.region,
+               m.month_start,
+               round(m.revenue, 2)                     as revenue,
+               round(p.revenue, 2)                     as previous_month,
+               round(m.revenue - p.revenue, 2)         as change,
+               round(100.0 * (m.revenue - p.revenue)
+                     / nullif(p.revenue, 0), 1)        as pct_change
+        from monthly m
+        left join monthly p
+               on p.region      = m.region
+              and p.month_start = m.month_start - interval '1 month'
+        order by m.region, m.month_start
+      when: >-
+        When "previous month" must mean the previous **calendar** month rather
+        than the previous row. If a region had no sales in February, LAG would
+        compare March with January while this join would correctly find no
+        predecessor. On this gapless data the two agree.
+      equivalent: true
+
+    - title: Generated calendar so gaps appear as zero
+      sql: |
+        with months as (
+            select generate_series(date '2024-01-01', date '2024-03-01',
+                                   interval '1 month')::date as month_start
+        ),
+        regions as (
+            select distinct region from daily_sales
+        ),
+        monthly as (
+            select r.region,
+                   m.month_start,
+                   coalesce(sum(s.revenue), 0) as revenue
+            from regions r
+            cross join months m
+            left join daily_sales s
+                   on s.region     = r.region
+                  and s.sale_date >= m.month_start
+                  and s.sale_date <  m.month_start + interval '1 month'
+            group by r.region, m.month_start
+        )
+        select region,
+               month_start,
+               round(revenue, 2)                              as revenue,
+               round(lag(revenue) over w, 2)                  as previous_month,
+               round(revenue - lag(revenue) over w, 2)        as change,
+               round(100.0 * (revenue - lag(revenue) over w)
+                     / nullif(lag(revenue) over w, 0), 1)     as pct_change
+        from monthly
+        window w as (partition by region order by month_start)
+        order by region, month_start
+      when: >-
+        When a month with no sales must appear as zero rather than being
+        absent. This is the correct shape for a chart, and it is also what
+        makes the NULLIF guard load-bearing — a zero month now really can be
+        the denominator.
+      equivalent: false
+
+  performance: |
+    The aggregation is the expensive half: one pass over `daily_sales`
+    grouped by region and truncated month. With 180 rows that is nothing; on a
+    large fact table it is the whole cost, and an index on `(region,
+    sale_date)` lets the grouping be done over an index scan rather than a
+    hash aggregate.
+
+    The window pass is over the aggregated rows — six of them here — so it is
+    free regardless. That asymmetry is the general lesson: aggregate to the
+    comparison grain first, and the window functions cost nothing.
+
+    `date_trunc` in the GROUP BY cannot use an index for grouping, but it does
+    not prevent an index from serving the `WHERE` clause, because the filter
+    is on the raw column. Truncating in GROUP BY and filtering on the raw
+    column is the combination that keeps both halves efficient.
+
+    The self-join alternative reads the aggregated set twice and joins; the
+    planner materialises the CTE once because it is referenced twice, so the
+    base table is still read only once.
+
+  wrongApproaches:
+    - title: No partition, so regions bleed into each other
+      sql: |
+        with monthly as (
+            select region,
+                   date_trunc('month', sale_date)::date as month_start,
+                   sum(revenue)                         as revenue
+            from daily_sales
+            group by region, date_trunc('month', sale_date)
+        )
+        select region,
+               month_start,
+               round(revenue, 2)                               as revenue,
+               round(lag(revenue) over (order by region, month_start), 2) as previous_month
+        from monthly
+        order by region, month_start
+      whyWrong: >-
+        Ordering by region inside the window makes the rows contiguous but
+        does not separate them. The South's first month is compared with the
+        North's last, producing a change figure that compares two different
+        regions and looks entirely plausible.
+
+    - title: Unguarded division
+      sql: |
+        with monthly as (
+            select region,
+                   date_trunc('month', sale_date)::date as month_start,
+                   sum(revenue)                         as revenue
+            from daily_sales
+            group by region, date_trunc('month', sale_date)
+        )
+        select region,
+               month_start,
+               round(100.0 * (revenue - lag(revenue) over w)
+                     / lag(revenue) over w, 1) as pct_change
+        from monthly
+        window w as (partition by region order by month_start)
+        order by region, month_start
+      whyWrong: >-
+        Works on this data because no month has zero revenue. A zero month
+        raises `division by zero`, which aborts the entire statement rather
+        than producing NULL in one cell — so a report that ran fine for a year
+        fails completely the first quiet month. NULLIF costs nothing.
+
+    - title: Grouping by extract(month) and losing the year
+      sql: |
+        select region,
+               extract(month from sale_date) as month_number,
+               round(sum(revenue), 2)        as revenue
+        from daily_sales
+        group by region, extract(month from sale_date)
+        order by region, month_number
+      whyWrong: >-
+        Returns a month number with no year, so January 2024 and January 2025
+        would be summed together, and the result cannot be ordered
+        chronologically across a year boundary. It is right only when the data
+        is known to span a single year, which is a property that changes
+        without warning.
+
+  extraTests:
+    - name: A region with a month-long gap (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt's North region has sales on 1 and 2 January and then 1
+        February, and the South has only 1 January. LAG compares February with
+        January correctly here, and the South's single month has NULL
+        comparisons — confirming that a one-row partition behaves.
+      sql: |
+        with monthly as (
+            select region,
+                   date_trunc('month', sale_date)::date as month_start,
+                   sum(revenue)                         as revenue
+            from daily_sales
+            group by region, date_trunc('month', sale_date)
+        )
+        select region,
+               month_start,
+               round(revenue, 2)                                          as revenue,
+               round(lag(revenue) over w, 2)                              as previous_month,
+               round(revenue - lag(revenue) over w, 2)                    as change,
+               round(100.0 * (revenue - lag(revenue) over w)
+                     / nullif(lag(revenue) over w, 0), 1)                 as pct_change
+        from monthly
+        window w as (partition by region order by month_start)
+        order by region, month_start
+
+    - name: LAG versus a calendar join when months are missing
+      schema: learning_alt
+      note: >-
+        With the gap present, LAG's "previous row" and a join's "previous
+        calendar month" can disagree. Running both side by side is the only
+        way to see which semantics a query actually has.
+      sql: |
+        with monthly as (
+            select region,
+                   date_trunc('month', sale_date)::date as month_start,
+                   sum(revenue)                         as revenue
+            from daily_sales
+            group by region, date_trunc('month', sale_date)
+        )
+        select m.region,
+               m.month_start,
+               round(lag(m.revenue) over (partition by m.region order by m.month_start), 2) as by_lag,
+               round(p.revenue, 2)                                                          as by_calendar_join
+        from monthly m
+        left join monthly p
+               on p.region      = m.region
+              and p.month_start = m.month_start - interval '1 month'
+        order by m.region, m.month_start
+
+  followUps:
+    - question: Why is LAG not always the same as "the previous month"?
+      answer: >-
+        LAG returns the previous **row** in the window, not the previous
+        calendar period. If a month has no sales it produces no row, so LAG
+        silently compares March with January and labels the result as
+        month-over-month growth. Either join on the calculated previous month,
+        which correctly finds nothing, or generate the complete calendar and
+        left-join the data so every month exists as a row. Which is right
+        depends on whether a missing month means zero or means unknown.
+
+    - question: How would you add a year-over-year comparison as well?
+      answer: >-
+        `lag(revenue, 12) over w` gives the row twelve positions back, which
+        is the same-month-last-year figure **if** every month is present.
+        With gaps it is not, so the generated-calendar form becomes necessary
+        rather than merely tidier. This is the point at which most reporting
+        pipelines start materialising a complete calendar dimension.
+
+    - question: What does a NULL in pct_change mean, and should it be zero?
+      answer: >-
+        It means the comparison is undefined — either there is no previous
+        month, or the previous month was zero. Neither is "no growth", so
+        displaying zero would assert something false. The honest presentation
+        is a dash or an em-rule in the report, and the decision to substitute
+        zero should be made deliberately by whoever reads it rather than
+        silently by the query.
+
+    - question: How would you flag an incomplete current month?
+      answer: >-
+        Compare `max(sale_date)` within each month against the month's last
+        day and return a boolean column. A partial month's revenue is not
+        comparable with a full one, and a report that does not say so invites
+        the reader to conclude that revenue has collapsed every month on the
+        day it is run.
+
+  related:
+    - w-frames
+    - i-datetime-string
+    - a-group-by-having
+    - p08-running-total-revenue

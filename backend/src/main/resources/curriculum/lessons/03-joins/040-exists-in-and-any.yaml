@@ -1,0 +1,457 @@
+id: j-exists-in
+moduleId: joins
+position: 40
+title: EXISTS, IN, ANY and ALL
+slug: exists-in-and-any
+difficulty: Intermediate
+estimatedMinutes: 25
+summary: >-
+  Four ways to ask "does a matching row exist", three of which are usually
+  equivalent and one of which — NOT IN — silently returns nothing when a NULL
+  appears. The most reliably asked SQL interview topic after window functions.
+tags: [exists, in, not-in, any, all, semi-join, interview-favourite]
+
+prerequisites:
+  - f-nulls
+  - j-inner-outer
+
+objectives:
+  - Choose between EXISTS, IN and a join for a membership test
+  - Explain exactly why NOT IN returns no rows when the subquery yields a NULL
+  - Use ANY and ALL with a comparison operator
+  - Describe what a semi-join and an anti-join are
+  - Say why a join is not a drop-in replacement for EXISTS
+
+concept: |
+  ## Four ways to ask one question
+
+  "Which customers have placed an order?" can be written:
+
+  ```sql
+  where exists (select 1 from orders o where o.customer_id = c.customer_id)
+  where c.customer_id in (select customer_id from orders)
+  where c.customer_id = any (select customer_id from orders)
+  -- or as a join, with a caveat
+  join orders o on o.customer_id = c.customer_id    -- duplicates!
+  ```
+
+  The first three are **semi-joins**: they test for existence and return each
+  left row at most once. PostgreSQL plans all three identically, so the choice
+  is about readability and NULL-safety.
+
+  The join is different. It returns one row per match, so a customer with
+  twelve orders appears twelve times. Adding `DISTINCT` papers over it; using
+  `EXISTS` avoids creating the problem.
+
+  ## EXISTS
+
+  `EXISTS (subquery)` is true when the subquery returns at least one row. What
+  the subquery *selects* is irrelevant — `select 1`, `select *` and `select
+  1/0` all behave identically, because the executor stops at the first row and
+  never evaluates the select list. `select 1` is the convention.
+
+  `EXISTS` is usually **correlated**: the subquery references a column of the
+  outer query. That correlation is what makes it a per-row test.
+
+  Crucially, `EXISTS` is immune to NULL problems. It asks "is there a row?",
+  which is a yes-or-no question with no third answer.
+
+  ## The NOT IN problem
+
+  ```sql
+  where c.id not in (select manager_id from employees)
+  ```
+
+  If any `manager_id` is NULL, this returns **zero rows**. Expand it:
+
+  ```
+  c.id <> m1 AND c.id <> m2 AND ... AND c.id <> NULL
+  ```
+
+  The last term is NULL. A conjunction containing NULL evaluates to false or
+  NULL, never true. Nothing can satisfy it.
+
+  There is no error and no warning. The query is often written against a
+  column that happens to have no NULLs today, works for a year, and returns an
+  empty result the day the first NULL arrives.
+
+  **Use `NOT EXISTS`.** It compares row by row, so a NULL on either side simply
+  fails to match that row rather than poisoning the whole predicate. The
+  positive `IN` is safe, because a NULL there merely fails to match.
+
+  ## ANY and ALL
+
+  `= ANY (subquery)` is exactly `IN`. `<> ALL (subquery)` is exactly `NOT IN`,
+  with the same NULL hazard. What makes them worth knowing is that they work
+  with any comparison operator:
+
+  ```sql
+  where salary > all  (select salary from employees where dept_id = 50)
+  where salary > any  (select salary from employees where dept_id = 50)
+  ```
+
+  "Higher than everyone in Support" and "higher than at least one person in
+  Support".
+
+  Their empty-set behaviour is the part that trips people up and is actually
+  logical: `> ALL (empty set)` is **true** — vacuously, every element of the
+  empty set is smaller — and `> ANY (empty set)` is **false**, because there is
+  no element to be greater than.
+
+  PostgreSQL also accepts `= ANY (array)`, which is the form to use when the
+  list comes from an application parameter: it handles an empty array without
+  the special-casing that an empty `IN ()` list requires.
+
+  ## Semi-joins and anti-joins
+
+  A **semi-join** returns rows of the left input that have at least one match,
+  each once. An **anti-join** returns rows that have none. Neither is spelled
+  with a keyword in SQL — they are what the planner produces from `EXISTS`,
+  `IN` and `NOT EXISTS`.
+
+  `EXPLAIN` names them directly: `Hash Semi Join`, `Hash Anti Join`. Seeing
+  those in a plan is confirmation that the planner understood the intent.
+
+syntax:
+  - form: "EXISTS (SELECT 1 FROM t WHERE t.fk = outer.pk)"
+    notes: >-
+      True when at least one row matches. The select list is never evaluated.
+      NULL-safe.
+  - form: "NOT EXISTS (SELECT 1 FROM ...)"
+    notes: The anti-join. The correct spelling of "has no match".
+  - form: "expr IN (SELECT ...)"
+    notes: Safe. A NULL in the subquery simply fails to match.
+  - form: "expr NOT IN (SELECT ...)"
+    notes: >-
+      Returns no rows if the subquery produces any NULL. Avoid, or add
+      `WHERE col IS NOT NULL` to the subquery.
+  - form: "expr op ANY (subquery) | expr op ALL (subquery)"
+    notes: >-
+      Works with any comparison operator. Over an empty subquery, ALL is true
+      and ANY is false.
+
+sampleTables: [customers, orders, employees, products, order_items, departments]
+
+examples:
+  - title: EXISTS, IN and a join — the same question, three answers
+    sql: |
+      select 'exists' as method, count(*) as customers
+      from customers c
+      where exists (select 1 from orders o where o.customer_id = c.customer_id)
+      union all
+      select 'in', count(*)
+      from customers c
+      where c.customer_id in (select customer_id from orders)
+      union all
+      select 'join (wrong — counts orders)', count(*)
+      from customers c
+      join orders o on o.customer_id = c.customer_id
+      union all
+      select 'join with distinct', count(distinct c.customer_id)
+      from customers c
+      join orders o on o.customer_id = c.customer_id
+      order by method
+    walkthrough: |
+      `exists` and `in` give the same number, as they always will for a
+      membership test. The plain join gives 151 — the number of orders, not the
+      number of customers — because each customer appears once per order.
+
+      `count(distinct)` repairs it, and that is the point: the join needed
+      repairing and the semi-join did not. When the question is "does a match
+      exist", a construct that returns one row per match is the wrong shape and
+      every subsequent aggregate has to compensate.
+
+  - title: NOT IN returning nothing, and NOT EXISTS returning the answer
+    sql: |
+      select 'not in (manager_id is nullable)' as method,
+             count(*)                          as employees_who_manage_nobody
+      from employees e
+      where e.emp_id not in (select manager_id from employees)
+      union all
+      select 'not in, NULLs filtered out',
+             count(*)
+      from employees e
+      where e.emp_id not in (select manager_id from employees where manager_id is not null)
+      union all
+      select 'not exists',
+             count(*)
+      from employees e
+      where not exists (select 1 from employees m where m.manager_id = e.emp_id)
+      order by method
+    walkthrough: |
+      The first row is `0`. Not "we checked and nobody manages nobody" — the
+      predicate was unsatisfiable, because the CEO's `manager_id` is NULL and
+      one NULL in the list is enough.
+
+      The second row shows that filtering the NULLs out of the subquery fixes
+      it. It works, and it requires the author to have remembered that the
+      column is nullable, which is exactly the thing people forget.
+
+      The third row is the same answer with nothing to remember. `NOT EXISTS`
+      compares row by row; a NULL `manager_id` simply does not equal
+      `e.emp_id`, so that row does not count as a match and the predicate
+      behaves.
+
+  - title: ANY and ALL with a real comparison
+    sql: |
+      select e.emp_id,
+             e.first_name || ' ' || e.last_name as employee,
+             e.dept_id,
+             e.salary
+      from employees e
+      where e.salary > all (select s.salary from employees s where s.dept_id = 50)
+        and e.dept_id <> 50
+      order by e.salary
+      limit 8
+    walkthrough: |
+      "Everyone who out-earns every single person in Customer Support." `> ALL`
+      is the direct translation, and it is clearer than `> (select max(salary)
+      ...)` even though the planner may well turn one into the other.
+
+      The `dept_id <> 50` exclusion is necessary because the highest-paid person
+      in Support does not out-earn themselves — `>` is strict — but the second
+      highest would otherwise qualify against nobody. Thinking about whether the
+      subject belongs in the comparison set is part of getting these right.
+
+      If department 50 had no employees, `> ALL` over the empty set would be
+      true and every employee would qualify. That is logically correct and
+      almost never what was wanted, which is why the empty-set behaviour is
+      worth knowing before it surprises you.
+
+  - title: Correlated EXISTS with more than one condition
+    sql: |
+      select p.product_id,
+             p.product_name,
+             p.unit_price
+      from products p
+      where exists (
+            select 1
+            from order_items oi
+            join orders o on o.order_id = oi.order_id
+            where oi.product_id = p.product_id
+              and o.status = 'completed'
+              and o.order_date >= date '2024-01-01')
+        and not exists (
+            select 1
+            from order_items oi2
+            join orders o2 on o2.order_id = oi2.order_id
+            where oi2.product_id = p.product_id
+              and o2.status = 'cancelled')
+      order by p.product_id
+    walkthrough: |
+      Products ordered on a completed order in 2024 and never on a cancelled
+      one. Two correlated subqueries, one positive and one negative, both
+      correlated on `p.product_id`.
+
+      Expressing this with joins would need a join for the first condition, a
+      LEFT JOIN plus an IS NULL test for the second, a DISTINCT to undo the
+      fan-out from the first, and careful thought about whether the two
+      interact. The EXISTS version says what it means.
+
+      The planner turns the first into a semi-join and the second into an
+      anti-join, both of which can stop at the first matching row — so the
+      readable version is also the one that does less work.
+
+edgeCases:
+  - title: EXISTS does not care what the subquery selects
+    body: >-
+      All three columns are the same. The subquery's select list is never
+      evaluated, because the executor only needs to know whether a row exists.
+      `select 1` is the convention; `select *` is equally valid and marginally
+      more confusing. Even an expression that would raise an error is harmless,
+      which is a vivid way to confirm the select list really is ignored.
+    sql: |
+      select (select count(*) from customers c
+              where exists (select 1 from orders o where o.customer_id = c.customer_id))  as with_1,
+             (select count(*) from customers c
+              where exists (select * from orders o where o.customer_id = c.customer_id))  as with_star,
+             (select count(*) from customers c
+              where exists (select null from orders o where o.customer_id = c.customer_id)) as with_null
+
+  - title: ALL over an empty set is true
+    body: >-
+      No department has id 999, so the subquery is empty, and `> ALL (empty)`
+      is vacuously true for every row — all 40 employees qualify. `> ANY
+      (empty)` is false for every row and returns none. Both are logically
+      correct and both are usually a bug, because the author assumed the
+      subquery would return something.
+    sql: |
+      select (select count(*) from employees
+              where salary > all (select salary from employees where dept_id = 999)) as gt_all_empty,
+             (select count(*) from employees
+              where salary > any (select salary from employees where dept_id = 999)) as gt_any_empty,
+             (select count(*) from employees)                                        as total
+
+pitfalls:
+  - mistake: Using NOT IN with a subquery over a nullable column
+    why: >-
+      A single NULL makes the predicate unsatisfiable and the query returns
+      nothing, with no error. It is the most frequently demonstrated NULL bug in
+      SQL and it still ships regularly.
+    fix: >-
+      NOT EXISTS. If NOT IN must stay, add `where col is not null` to the
+      subquery and a comment explaining why.
+
+  - mistake: Replacing EXISTS with a join and forgetting the fan-out
+    why: >-
+      A join returns one row per match. Counts, sums and averages over the
+      result are then multiplied by the number of matches per row.
+    fix: >-
+      Keep EXISTS when the question is existence. If a join is needed for its
+      columns, aggregate the right-hand side first or use DISTINCT deliberately.
+
+  - mistake: "Writing `where (select count(*) from t where ...) > 0`"
+    why: >-
+      It counts every matching row before comparing to zero. EXISTS stops at
+      the first. On a row with ten thousand matches the difference is ten
+      thousand to one.
+    fix: >-
+      `EXISTS`. Reserve counting for when the count itself is the answer.
+
+  - mistake: Assuming a subquery in ANY/ALL will always return rows
+    why: >-
+      The vacuous-truth behaviour of ALL over an empty set means an empty
+      subquery lets everything through, which looks like a filter that stopped
+      working.
+    fix: >-
+      Guard with an explicit existence check when an empty subquery is possible,
+      or use `> (select max(...))` with a COALESCE, where the empty case is
+      visible as a NULL.
+
+performance: |
+  PostgreSQL plans `EXISTS`, `IN (subquery)` and `= ANY (subquery)` as
+  **semi-joins**, and `NOT EXISTS` as an **anti-join**. Both can stop scanning
+  the inner side as soon as the question is answered for a given outer row,
+  which is the structural reason they beat counting.
+
+  `NOT IN` is the exception: because of the NULL semantics, the planner
+  generally cannot use an anti-join and falls back to a materialised subplan
+  evaluated per row. So `NOT IN` is both the incorrect choice and usually the
+  slow one.
+
+  The index that matters is on the **correlated column of the inner table** —
+  `orders(customer_id)` for the examples here. Without it, each outer row costs
+  a scan.
+
+  `IN` with a **literal list** is a different thing from `IN` with a subquery
+  and is efficiently handled; for a long list from an application, `= ANY($1)`
+  with an array parameter is better than building a thousand-element IN list,
+  because the statement text stays constant and can be reused from the plan
+  cache.
+
+interviewQuestions:
+  - question: What is the difference between EXISTS and IN?
+    answer: >-
+      Semantically they agree for a positive membership test, and PostgreSQL
+      plans both as a semi-join, so performance is usually identical. The
+      differences are that EXISTS is correlated and can express multi-column or
+      complex conditions naturally, while IN compares a single expression
+      against a list; and that NOT IN has NULL semantics that NOT EXISTS does
+      not. The practical rule is to use EXISTS by default, and particularly for
+      the negative case.
+
+  - question: Why does NOT IN return no rows when the subquery contains a NULL?
+    answer: >-
+      `x NOT IN (a, b, NULL)` expands to `x <> a AND x <> b AND x <> NULL`. The
+      last term is always NULL, and a conjunction containing NULL is either
+      false or NULL, never true, so no row satisfies the predicate. There is no
+      error. NOT EXISTS avoids this because it tests for the presence of a
+      matching row rather than comparing against every value, so a NULL simply
+      fails to match. This is the most common NULL question in SQL interviews.
+
+  - question: What is a semi-join?
+    answer: >-
+      A join that returns rows of the left input which have at least one match
+      on the right, each exactly once, discarding the right-hand columns. SQL
+      has no keyword for it — it is what the planner produces from EXISTS, IN
+      and `= ANY`. Its counterpart is the anti-join, produced from NOT EXISTS,
+      which returns left rows with no match. Both can stop scanning the inner
+      side early, which an ordinary join cannot. PostgreSQL labels them as
+      `Semi Join` and `Anti Join` in EXPLAIN output.
+
+  - question: What does `> ALL (SELECT ...)` return when the subquery is empty?
+    answer: >-
+      True, for every row. The condition asserts that the value exceeds every
+      element of the set, and an empty set has no element to contradict it — the
+      same vacuous truth that makes "all the unicorns in this room are purple"
+      true. `> ANY` over an empty set is false for the mirror reason. Both are
+      logically correct and both usually indicate that the author assumed the
+      subquery would return rows.
+
+exercises:
+  - prompt: >-
+      Find every product that has never appeared on any order. Return
+      product_id and product_name, ordered by product_id, using NOT EXISTS.
+    difficulty: Easy
+    hint: >-
+      Correlate on product_id. NOT IN would also work here but is the habit to
+      avoid.
+    solutionSql: |
+      select p.product_id, p.product_name
+      from products p
+      where not exists (
+            select 1 from order_items oi
+            where oi.product_id = p.product_id)
+      order by p.product_id
+
+  - prompt: >-
+      List the customers who have at least one completed order and no cancelled
+      orders. Columns customer_id, company_name, ordered by customer_id.
+    difficulty: Medium
+    hint: One EXISTS and one NOT EXISTS, both correlated on customer_id.
+    solutionSql: |
+      select c.customer_id, c.company_name
+      from customers c
+      where exists (
+            select 1 from orders o
+            where o.customer_id = c.customer_id and o.status = 'completed')
+        and not exists (
+            select 1 from orders o
+            where o.customer_id = c.customer_id and o.status = 'cancelled')
+      order by c.customer_id
+
+  - prompt: >-
+      Find every employee whose salary is greater than the salary of every
+      employee in department 30. Exclude department 30 itself. Columns
+      emp_id, full_name, dept_id, salary, ordered by salary descending.
+    difficulty: Medium
+    hint: "`> all (subquery)` — and think about whether the subject should be in the comparison set."
+    solutionSql: |
+      select emp_id,
+             first_name || ' ' || last_name as full_name,
+             dept_id,
+             salary
+      from employees
+      where dept_id is distinct from 30
+        and salary > all (select salary from employees where dept_id = 30)
+      order by salary desc, emp_id
+
+checklist:
+  - "EXISTS, IN and = ANY are semi-joins: each left row returned at most once"
+  - A join returns one row per match, which is a different shape of answer
+  - "EXISTS ignores the subquery's select list entirely; `select 1` is convention"
+  - NOT IN over a nullable subquery returns zero rows and gives no warning
+  - NOT EXISTS is the NULL-safe anti-join and is what the planner optimises
+  - "ANY and ALL work with any comparison operator, not just equality"
+  - "Over an empty subquery, `op ALL` is true and `op ANY` is false"
+  - "Prefer EXISTS to `(select count(*) ...) > 0` — it stops at the first match"
+
+related:
+  - f-nulls
+  - j-inner-outer
+  - i-subqueries
+  - p06-customers-who-never-ordered
+
+dialect:
+  standard: >-
+    EXISTS, IN, ANY/SOME and ALL are all standard SQL, including the NULL
+    semantics of NOT IN and the vacuous truth of ALL over an empty set.
+  postgres: >-
+    Plans EXISTS, IN and = ANY as semi-joins and NOT EXISTS as an anti-join, and
+    shows them as such in EXPLAIN. Adds `= ANY(array)` for list parameters,
+    which avoids building variable-length IN lists in application code.
+  mysql: >-
+    Historically optimised IN with a subquery very poorly, re-executing it per
+    row, which is why a generation of MySQL advice says "rewrite IN as a join".
+    MySQL 5.6 and later materialise or semi-join it properly. The NOT IN NULL
+    behaviour is identical and bites just as often.

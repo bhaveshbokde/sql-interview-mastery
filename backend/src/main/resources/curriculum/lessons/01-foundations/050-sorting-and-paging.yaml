@@ -1,0 +1,390 @@
+id: f-sorting-paging
+moduleId: foundations
+position: 50
+title: Sorting and paging
+slug: sorting-and-paging
+difficulty: Beginner
+estimatedMinutes: 20
+summary: >-
+  ORDER BY, LIMIT and OFFSET, and the two things nobody mentions until it
+  breaks: an unstable sort returns different rows on every page, and OFFSET
+  pagination gets slower the deeper you go.
+tags: [order-by, limit, offset, pagination, keyset]
+
+prerequisites:
+  - f-filtering
+
+objectives:
+  - Sort by several keys, by direction and by NULL placement
+  - Explain why a sort without a unique tiebreak is not reproducible
+  - Describe what OFFSET actually makes the database do
+  - Write a keyset (seek) pagination query and say when it is not applicable
+  - Use ORDER BY with an expression and with an output-column position
+
+concept: |
+  ## ORDER BY is the only source of order
+
+  A table is a set; a query result has no order unless you ask for one. Any
+  order you observe without `ORDER BY` is an accident of the plan the optimiser
+  chose, and adding an index, growing the table or upgrading the server can
+  change it.
+
+  `ORDER BY` can take:
+
+  - a column name — `order by salary`
+  - an output alias — `order by annual_salary` (works, unlike in WHERE)
+  - an expression — `order by salary * 12`, `order by lower(last_name)`
+  - an ordinal position — `order by 2 desc`, meaning the second select-list
+    item. Convenient in an ad-hoc query, and a liability in code, because
+    inserting a column silently changes the sort.
+
+  Each key has its own direction and NULL placement:
+
+  ```sql
+  order by dept_id asc, salary desc nulls last, emp_id
+  ```
+
+  ## Stable sorts and the tiebreak
+
+  SQL sorts are **not stable**. If two rows compare equal on every sort key,
+  their relative order is undefined and may differ between runs of the same
+  query on the same data.
+
+  On a single page of output this is harmless curiosity. Combined with
+  pagination it is a real bug: page 1 returns rows A and B, the plan changes,
+  and page 2 returns B again while A is never seen. Users report "a record went
+  missing", which is unreproducible because it depends on the plan.
+
+  The fix is one line: **always end ORDER BY with a unique column.** Usually the
+  primary key. It costs nothing and it makes the result a function of the data
+  rather than of the plan.
+
+  ## LIMIT and OFFSET
+
+  `LIMIT n` returns at most n rows. `OFFSET m` discards the first m. Both are
+  applied last, after sorting.
+
+  What `OFFSET 10000` makes the database do is the part worth internalising: it
+  produces all 10,010 rows in sorted order and throws 10,000 of them away. The
+  work is proportional to the offset, so page 500 costs 500 times what page 1
+  costs. That is the most common cause of "the app gets slower the further you
+  scroll" and it is invisible in testing, because nobody tests page 500.
+
+  The standard spelling, which PostgreSQL also accepts, is
+  `OFFSET m ROWS FETCH NEXT n ROWS ONLY`.
+
+  ## Keyset pagination
+
+  Instead of counting rows to skip, remember where the last page ended and ask
+  for rows after it:
+
+  ```sql
+  -- page 1
+  select * from orders order by order_date, order_id limit 20;
+
+  -- next page, given the last row of the previous one
+  select * from orders
+  where (order_date, order_id) > (date '2023-06-14', 1042)
+  order by order_date, order_id
+  limit 20;
+  ```
+
+  The row-value comparison `(a, b) > (x, y)` is standard SQL and compares
+  lexicographically — exactly matching the sort — so it is one predicate rather
+  than a nested OR. With an index on `(order_date, order_id)` the database jumps
+  straight to the position and reads 20 rows, and **every page costs the same**.
+
+  The trade-offs are real and worth being able to state: you cannot jump to an
+  arbitrary page number, you cannot easily go backwards without reversing the
+  sort, and the sort keys must be unique as a group. For an infinite-scroll
+  feed, those costs are nothing. For a table with numbered page links, OFFSET
+  may genuinely be the right answer.
+
+syntax:
+  - form: "ORDER BY expr [ASC|DESC] [NULLS FIRST|NULLS LAST] [, ...]"
+    notes: >-
+      Default is ASC with NULLS LAST. Each key is independent — `a desc, b asc`
+      is normal.
+  - form: "LIMIT n [OFFSET m]"
+    notes: >-
+      PostgreSQL and MySQL spelling. Applied after ORDER BY, so LIMIT without
+      ORDER BY returns an arbitrary n rows.
+  - form: "OFFSET m ROWS FETCH NEXT n ROWS ONLY"
+    notes: The standard spelling; PostgreSQL accepts both.
+  - form: "FETCH FIRST n ROWS WITH TIES"
+    notes: >-
+      Returns more than n rows when the nth and (n+1)th tie on the ORDER BY
+      keys. Requires an ORDER BY. Useful for "top 3, and show me the ties".
+  - form: "WHERE (a, b) > (?, ?) ORDER BY a, b LIMIT n"
+    notes: >-
+      Keyset pagination. The row-value comparison matches the sort
+      lexicographically.
+
+sampleTables: [employees, orders, daily_sales, exam_scores]
+
+examples:
+  - title: Several keys, each with its own direction
+    sql: |
+      select emp_id, dept_id, job_title, salary, hire_date
+      from employees
+      where dept_id is not null
+      order by dept_id asc, salary desc, emp_id
+      limit 12
+    walkthrough: |
+      Departments ascending, then salary descending within each department, then
+      `emp_id` as the tiebreak.
+
+      That third key is the one that matters. Employees 14 and 15 both earn
+      148000.00 in department 10; without `emp_id` the database is free to
+      return them in either order, and with `LIMIT 12` cutting through that
+      region, which of them appears is undefined.
+
+  - title: What an unstable sort looks like
+    sql: |
+      select subject, score, student_id
+      from exam_scores
+      where subject = 'Chemistry'
+      order by score desc
+      limit 4
+    walkthrough: |
+      Students 401, 402 and 403 all scored exactly 80 in Chemistry. The query
+      asks for the top 4 by score alone, so three of those four rows are
+      interchangeable.
+
+      The result you see is reproducible today because the table is small and
+      the plan is stable. It is not *guaranteed*, and that is the distinction:
+      a query can be correct by accident. Adding `, student_id` to the ORDER BY
+      makes it correct by construction.
+
+  - title: Keyset pagination, two pages
+    sql: |
+      select order_id, order_date, customer_id, status
+      from orders
+      where (order_date, order_id) > (date '2023-01-19', 1006)
+      order by order_date, order_id
+      limit 5
+    walkthrough: |
+      This is page 2, given that page 1 ended at order 1006 placed on
+      2023-01-19. The row-value comparison means "strictly after that point in
+      the sort", which expands to `order_date > '2023-01-19' OR (order_date =
+      '2023-01-19' AND order_id > 1006)` — but as a single predicate the planner
+      can match directly against an index on `(order_date, order_id)`.
+
+      Compare with `OFFSET 5`: that would re-sort from the beginning and discard
+      five rows. Here nothing is discarded. At page 2 the difference is
+      invisible; at page 2000 it is the difference between a query that works
+      and one that times out.
+
+  - title: Sorting by an expression and by position
+    sql: |
+      select region,
+             sale_date,
+             revenue,
+             round(revenue / 1000, 1) as revenue_k
+      from daily_sales
+      where sale_date >= date '2024-03-25'
+      order by 1, revenue desc
+    walkthrough: |
+      `order by 1` means "the first select-list item", which is `region`. It is
+      terse and it is fragile: adding a column at the front of the select list
+      changes what `1` refers to, with no error.
+
+      The second key sorts by `revenue`, the underlying column, rather than by
+      `revenue_k`. They would normally agree, but rounding creates ties that the
+      raw value does not have, so the two sorts are not interchangeable — a
+      small illustration of why sorting on a display-formatted value is usually
+      a mistake.
+
+edgeCases:
+  - title: LIMIT without ORDER BY returns arbitrary rows
+    body: >-
+      This query is a question with no answer: "five employees" is not a
+      specification. PostgreSQL will return five, consistently, until something
+      changes — a new index, an updated row, a vacuum, a version upgrade. Code
+      that samples data this way works in development and surprises people
+      later.
+    sql: |
+      select emp_id, first_name, salary
+      from employees
+      limit 5
+
+  - title: WITH TIES returns more rows than you asked for
+    body: >-
+      `FETCH FIRST 3 ROWS WITH TIES` returns four rows here, because the third
+      and fourth scores are equal. This is the correct behaviour for "the top
+      three scores" as a human means it, and it is why the clause exists — the
+      alternative is a window function with RANK.
+    sql: |
+      select student_id, subject, score
+      from exam_scores
+      where subject = 'Mathematics'
+      order by score desc
+      fetch first 3 rows with ties
+
+pitfalls:
+  - mistake: Paginating without a unique tiebreak in ORDER BY
+    why: >-
+      Rows that tie on every sort key have undefined relative order, so a row
+      can appear on two consecutive pages or on neither. It is intermittent and
+      depends on the plan, which makes it one of the hardest bugs to reproduce
+      from a bug report.
+    fix: >-
+      End every ORDER BY used for pagination with the primary key. There is no
+      case where this is wrong and no measurable cost.
+
+  - mistake: Using OFFSET for deep pagination
+    why: >-
+      The database must produce and discard every skipped row, so cost grows
+      linearly with the page number. It also interacts badly with concurrent
+      inserts: a row added before the offset shifts everything, so a row can be
+      skipped or repeated even with a stable sort.
+    fix: >-
+      Keyset pagination for feeds and infinite scroll. Keep OFFSET only when
+      arbitrary page jumps are a genuine requirement, and cap the page number.
+
+  - mistake: Sorting text and expecting ASCII order
+    why: >-
+      Text comparison follows the database collation. Under most modern
+      locales, case and accents are handled linguistically, so `apple` can sort
+      before `Banana` — which is not what a byte comparison would give.
+    fix: >-
+      `order by lower(col)` for a predictable case-insensitive sort, or
+      `order by col collate "C"` for a byte-wise one. Be aware both can prevent
+      a plain index from satisfying the sort.
+
+  - mistake: Using ORDER BY column positions in application code
+    why: >-
+      `order by 2` silently changes meaning when someone adds a column to the
+      select list. There is no error, because position 2 still exists.
+    fix: >-
+      Name the column or the alias. Positions are for the psql prompt.
+
+performance: |
+  An index can supply sorted order directly, letting PostgreSQL skip the sort
+  step entirely. For that it must match the ORDER BY in **column order and
+  direction** — an index on `(a, b)` serves `order by a, b` and `order by a
+  desc, b desc` (read backwards), but not `order by a, b desc` unless the index
+  was declared that way.
+
+  `ORDER BY ... LIMIT n` with a matching index is the best case in the whole
+  system: the database reads n index entries and stops. Without the index it
+  must sort the entire input to find the top n — though PostgreSQL uses a bounded
+  "top-N heapsort" that is much cheaper than a full sort.
+
+  When a sort does not fit in `work_mem` it spills to disk, and EXPLAIN ANALYZE
+  says `Sort Method: external merge  Disk: NNNkB`. That line is the single most
+  useful signal that a query needs either an index or more memory.
+
+interviewQuestions:
+  - question: Why can the same paginated query show a row twice?
+    answer: >-
+      Two reasons, often together. First, an ORDER BY without a unique tiebreak
+      leaves tied rows in undefined order, so consecutive pages can overlap or
+      gap. Second, OFFSET pagination re-evaluates the query for each page, so
+      concurrent inserts and deletes shift the row positions between requests.
+      A unique tiebreak fixes the first; keyset pagination fixes both, because
+      it anchors on a value rather than on a count.
+
+  - question: Why does OFFSET get slow and keyset pagination not?
+    answer: >-
+      OFFSET requires the database to produce every row up to the offset in
+      sorted order and discard them, so the work is proportional to the offset.
+      Keyset pagination turns the position into a WHERE predicate on the sort
+      keys, so with a matching index the database seeks directly to the starting
+      point and reads only the page. Cost per page is constant. The cost is
+      losing random page access, which infinite-scroll interfaces do not need.
+
+  - question: Can an index remove the sort step entirely?
+    answer: >-
+      Yes, when the index's column order and sort directions match the ORDER BY
+      and the scan is one the planner is willing to use. The plan then shows an
+      Index Scan with no Sort node above it. Mixed directions need a matching
+      multi-column index — `create index on t (a asc, b desc)` — because a single
+      B-tree can only be read forwards or backwards as a whole. Note that the
+      planner may still choose a sequential scan plus a sort if it estimates
+      that to be cheaper, which it often is when most of the table is returned.
+
+  - question: What does `FETCH FIRST n ROWS WITH TIES` do that LIMIT does not?
+    answer: >-
+      It includes any additional rows that tie with the nth row on the ORDER BY
+      keys, so "the top 3 scores" returns four rows if two students tie for
+      third. LIMIT always returns exactly n and picks arbitrarily among the ties.
+      WITH TIES requires an ORDER BY, for the obvious reason that ties are
+      defined relative to it. The portable equivalent is `RANK() OVER (ORDER BY
+      score DESC) <= 3`.
+
+exercises:
+  - prompt: >-
+      Return the five most recently hired active employees, with ties on
+      hire_date broken by emp_id. Columns emp_id, full_name, hire_date.
+    difficulty: Easy
+    hint: >-
+      Descending hire_date, then emp_id as a tiebreak — pick a direction for the
+      tiebreak and keep it consistent.
+    solutionSql: |
+      select emp_id,
+             first_name || ' ' || last_name as full_name,
+             hire_date
+      from employees
+      where is_active
+      order by hire_date desc, emp_id desc
+      limit 5
+
+  - prompt: >-
+      Using keyset pagination, return the 6 orders that come after order 1020
+      placed on 2023-03-06, sorted by order_date then order_id. Columns
+      order_id, order_date, status.
+    difficulty: Medium
+    hint: >-
+      One row-value comparison, `(order_date, order_id) > (date '...', 1020)`,
+      and an ORDER BY with the same two keys in the same order.
+    solutionSql: |
+      select order_id, order_date, status
+      from orders
+      where (order_date, order_id) > (date '2023-03-06', 1020)
+      order by order_date, order_id
+      limit 6
+
+  - prompt: >-
+      List projects ordered so that still-running projects (end_date is NULL)
+      come first, then the rest by end_date descending. Columns project_name,
+      end_date.
+    difficulty: Medium
+    hint: >-
+      `order by end_date desc nulls first` does it in one key, because NULLS
+      FIRST is independent of the direction.
+    solutionSql: |
+      select project_name, end_date
+      from projects
+      order by end_date desc nulls first, project_id
+
+checklist:
+  - Without ORDER BY there is no order, and any order you see is an accident
+  - SQL sorts are not stable — always end ORDER BY with a unique column
+  - LIMIT and OFFSET are applied after sorting
+  - "OFFSET m makes the database produce and discard m rows: deep pages are slow"
+  - Keyset pagination uses a row-value comparison and costs the same on every page
+  - An index can remove the sort step when its column order and directions match
+  - NULLS FIRST / NULLS LAST is independent of ASC / DESC
+  - ORDER BY by ordinal position is fine at a prompt and fragile in code
+
+related:
+  - f-filtering
+  - f-logical-order
+  - w-ranking
+  - p-query-patterns
+
+dialect:
+  standard: >-
+    ORDER BY with ASC/DESC, the OFFSET ... FETCH syntax, FETCH ... WITH TIES and
+    row-value comparisons are all standard SQL.
+  postgres: >-
+    Accepts both LIMIT/OFFSET and the standard FETCH syntax, supports NULLS
+    FIRST/LAST, and allows per-column sort direction in index definitions so an
+    index can serve a mixed-direction ORDER BY. Text ordering follows the
+    collation, and `COLLATE "C"` gives byte order.
+  mysql: >-
+    LIMIT n OFFSET m, or the older `LIMIT m, n` with the arguments reversed —
+    a frequent source of confusion. No NULLS FIRST/LAST clause, and NULLs sort
+    first in ascending order. No WITH TIES before MySQL 8.0.19 era syntax;
+    the window-function form is the portable one.

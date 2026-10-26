@@ -1,0 +1,513 @@
+id: i-ctes
+moduleId: intermediate
+position: 20
+title: Common table expressions
+slug: common-table-expressions
+difficulty: Intermediate
+estimatedMinutes: 20
+summary: >-
+  WITH turns a nested query that reads inside out into a sequence of named steps
+  that reads top to bottom. Plus the optimisation-fence history that makes older
+  advice about CTEs wrong on modern PostgreSQL.
+tags: [cte, with, readability, materialized, optimisation-fence]
+
+prerequisites:
+  - i-subqueries
+
+objectives:
+  - Rewrite a nested subquery chain as a CTE chain
+  - Reference one CTE from another and reuse a CTE twice
+  - Explain what an optimisation fence is and when PostgreSQL applies one
+  - Choose between MATERIALIZED and NOT MATERIALIZED deliberately
+  - Say what a CTE does not give you that a temporary table does
+
+concept: |
+  ## WITH names a step
+
+  A CTE is a named subquery declared before the statement that uses it:
+
+  ```sql
+  with active as (
+      select * from employees where is_active
+  ),
+  by_dept as (
+      select dept_id, count(*) as headcount, avg(salary) as avg_salary
+      from active
+      group by dept_id
+  )
+  select * from by_dept where headcount > 3
+  ```
+
+  Each CTE may reference the ones declared before it. The whole thing is one
+  statement — nothing is stored, nothing persists, and the names vanish when
+  the statement ends.
+
+  The benefit is almost entirely readability, and that is enough. The nested
+  equivalent must be read from the innermost parenthesis outwards; the CTE
+  version reads in the order the work happens.
+
+  ## Reuse
+
+  A CTE can be referenced more than once, which a derived table cannot:
+
+  ```sql
+  with monthly as (...)
+  select this.month, this.revenue, prev.revenue as previous
+  from monthly this
+  left join monthly prev on prev.month = this.month - interval '1 month'
+  ```
+
+  Whether the CTE is *computed* once is a different question from whether it is
+  *written* once, and the answer depends on materialisation.
+
+  ## The optimisation fence
+
+  Before PostgreSQL 12, every CTE was materialised: computed in full, stored in
+  memory or on disk, and only then used. No predicate from the outer query
+  could be pushed into it.
+
+  That had two consequences, and a lot of advice from that era still circulates:
+
+  - A CTE was a way to *force* a particular evaluation order — occasionally
+    useful, usually a way to defeat the planner.
+  - Filtering the result of a CTE meant computing the whole CTE first, even
+    when the filter would have eliminated 99% of it.
+
+  Since PostgreSQL 12 a CTE referenced **once** and containing no
+  data-modifying statement is **inlined** by default, exactly like a derived
+  table, with predicate pushdown. A CTE referenced more than once is still
+  materialised by default, on the reasoning that computing it twice is probably
+  worse.
+
+  You can override both:
+
+  ```sql
+  with x as materialized     (...)   -- force computing it once, up front
+  with x as not materialized (...)   -- force inlining
+  ```
+
+  `MATERIALIZED` is the right choice when the CTE is expensive and used several
+  times, or when it contains a volatile function that must be evaluated exactly
+  once. `NOT MATERIALIZED` is the right choice when a multiply-referenced CTE is
+  cheap and the outer filters would restrict it dramatically.
+
+  ## What a CTE is not
+
+  It is not a temporary table. There is no index on it, no statistics gathered
+  from it, and it does not survive the statement. When you need any of those —
+  because the intermediate result is large and will be probed many times — a
+  real `TEMPORARY TABLE` with an index is the tool, at the cost of a statement
+  that is no longer a single query.
+
+  A CTE is also not a view: it is private to one statement and is not stored in
+  the catalogue.
+
+  ## Data-modifying CTEs
+
+  PostgreSQL allows `WITH x AS (DELETE ... RETURNING *) SELECT ...`, which is a
+  genuinely write-capable statement whose first keyword is `WITH`. It is a
+  powerful feature for move-and-archive patterns, and it is the reason this
+  application's playground validator parses statements rather than checking
+  that they start with `SELECT`.
+
+syntax:
+  - form: "WITH name AS (query) SELECT ..."
+    notes: One CTE. The name is visible only within this statement.
+  - form: "WITH a AS (...), b AS (SELECT ... FROM a) SELECT ... FROM b"
+    notes: >-
+      A chain. Each CTE may reference those declared before it, not after.
+  - form: "WITH name AS MATERIALIZED (query) ..."
+    notes: >-
+      Forces computing it once and storing the result. Blocks predicate
+      pushdown.
+  - form: "WITH name AS NOT MATERIALIZED (query) ..."
+    notes: >-
+      Forces inlining even when referenced several times.
+  - form: "WITH RECURSIVE name AS (...) ..."
+    notes: >-
+      Self-referencing CTE for hierarchies and series. Its own lesson follows.
+
+sampleTables: [employees, departments, orders, order_items, customers, daily_sales]
+
+examples:
+  - title: A chain of steps that reads top to bottom
+    sql: |
+      with line_revenue as (
+          select oi.order_id,
+                 oi.quantity * oi.unit_price * (1 - oi.discount) as revenue
+          from order_items oi
+      ),
+      order_totals as (
+          select o.order_id,
+                 o.customer_id,
+                 o.order_date,
+                 sum(lr.revenue) as order_revenue
+          from orders o
+          join line_revenue lr on lr.order_id = o.order_id
+          where o.status = 'completed'
+          group by o.order_id, o.customer_id, o.order_date
+      ),
+      customer_totals as (
+          select customer_id,
+                 count(*)            as orders,
+                 sum(order_revenue)  as revenue
+          from order_totals
+          group by customer_id
+      )
+      select c.company_name,
+             ct.orders,
+             round(ct.revenue, 2)                     as revenue,
+             round(ct.revenue / ct.orders, 2)         as avg_order_value
+      from customer_totals ct
+      join customers c on c.customer_id = ct.customer_id
+      order by ct.revenue desc
+      limit 10
+    walkthrough: |
+      Four named steps: compute line revenue, roll up to orders, roll up to
+      customers, then attach the customer names.
+
+      Each step has one job and a name that says what it is. Written as nested
+      subqueries this is four levels of parentheses read from the inside out,
+      and the aggregation grain at each level is much harder to see — which
+      matters, because getting the grain wrong is how double-counting happens.
+
+      Note that each roll-up is a separate `GROUP BY` rather than one grouped
+      query over the whole join. That is deliberate: aggregating order revenue
+      and then summing it per customer is correct, while summing line revenue
+      grouped by customer in one step would be correct too but would make the
+      double-count risk invisible if an extra join were added later.
+
+  - title: Referencing a CTE twice
+    sql: |
+      with monthly as (
+          select date_trunc('month', sale_date)::date as month_start,
+                 region,
+                 sum(revenue)                         as revenue
+          from daily_sales
+          group by 1, 2
+      )
+      select this.region,
+             this.month_start,
+             round(this.revenue, 2)                                   as revenue,
+             round(prev.revenue, 2)                                   as previous_month,
+             round(100.0 * (this.revenue - prev.revenue)
+                   / nullif(prev.revenue, 0), 1)                      as pct_change
+      from monthly this
+      left join monthly prev
+             on prev.region      = this.region
+            and prev.month_start = this.month_start - interval '1 month'
+      order by this.region, this.month_start
+    walkthrough: |
+      `monthly` is written once and used twice — as the current month and as
+      the previous month. A derived table cannot do this; it would have to be
+      written out twice, and then kept in sync by hand.
+
+      Because it is referenced more than once, PostgreSQL materialises it by
+      default: computed once, then self-joined. That is the right call here.
+
+      The `LEFT JOIN` rather than an inner one keeps the first month of each
+      region, which has no predecessor. Its `pct_change` is NULL, which is
+      honest — there is no previous month to compare against. The window
+      function `LAG()` expresses this more directly and the windows module
+      shows it.
+
+  - title: A filter outside the CTE, pushed inside by the planner
+    sql: |
+      with dept_stats as (
+          select dept_id,
+                 count(*)              as headcount,
+                 round(avg(salary), 0) as avg_salary,
+                 max(salary)           as top_salary
+          from employees
+          where is_active and dept_id is not null
+          group by dept_id
+      )
+      select d.dept_name, s.headcount, s.avg_salary, s.top_salary
+      from dept_stats s
+      join departments d on d.dept_id = s.dept_id
+      where s.headcount >= 3
+      order by s.avg_salary desc
+    walkthrough: |
+      `dept_stats` is referenced once, so on PostgreSQL 12 and later it is
+      inlined: the planner treats it exactly as it would the equivalent derived
+      table, and `where s.headcount >= 3` becomes a `HAVING` on the aggregate
+      rather than a filter over a materialised copy.
+
+      Before version 12 the CTE would have been computed in full first. On a
+      large table with a highly selective outer filter, that difference was
+      large enough that people avoided `WITH` entirely — which is where the
+      "CTEs are slow in PostgreSQL" reputation comes from, and why it is now
+      out of date.
+
+      To override the default, PostgreSQL accepts `WITH x AS MATERIALIZED (...)`
+      and `AS NOT MATERIALIZED (...)`. Those keywords are not shown as a
+      runnable example here because this playground's parser does not accept
+      them; `EXPLAIN` on a local psql session is the place to experiment with
+      them.
+
+  - title: A CTE used to avoid repeating an expression
+    sql: |
+      with scored as (
+          select e.emp_id,
+                 e.first_name || ' ' || e.last_name            as employee,
+                 e.salary,
+                 e.salary * 12                                 as annual,
+                 extract(year from age(date '2025-01-01', e.hire_date))::int as years_at_2025
+          from employees e
+          where e.is_active
+      )
+      select employee, salary, annual, years_at_2025
+      from scored
+      where annual > 1500000
+        and years_at_2025 >= 4
+      order by annual desc, employee
+      limit 10
+    walkthrough: |
+      The foundations lesson noted that a select-list alias cannot be used in
+      `WHERE`. A CTE is the clean way round it: inside the CTE the expressions
+      are computed, and in the outer query they are ordinary columns that
+      `WHERE` can filter on.
+
+      This is the most common everyday use of `WITH` and it costs nothing — the
+      CTE is referenced once, so PostgreSQL inlines it and the plan is identical
+      to repeating the expressions. You get the readability for free.
+
+      `age()` returns an interval; extracting the year from it gives whole
+      years, which is the usual intent. The reference date is written as a
+      literal rather than `current_date` on purpose — every example in this
+      course has its output recorded by executing it, and a query whose answer
+      changes daily cannot have a recorded answer. The same reasoning applies
+      to any query whose result you want to be reproducible in a test.
+
+edgeCases:
+  - title: A CTE is not visible to the CTEs declared before it
+    body: >-
+      Names are introduced in order, so `a` cannot reference `b` if `b` comes
+      later — only `WITH RECURSIVE` permits a self-reference, and then only to
+      the CTE's own name. The ordering constraint is the same as declaring
+      variables in a procedural language, and it means a CTE chain has a
+      readable dependency order by construction.
+    sql: |
+      with a as (select 1 as n),
+           b as (select n + 1 as n from a),
+           c as (select n + 1 as n from b)
+      select a.n as from_a, b.n as from_b, c.n as from_c
+      from a, b, c
+
+  - title: A CTE does not persist or get indexed
+    body: >-
+      The CTE exists for the duration of one statement. There is no index on it
+      and no statistics gathered from it, so the planner estimates its size from
+      the underlying tables. When an intermediate result is large and probed
+      repeatedly, a real temporary table with an index is faster — at the cost
+      of no longer being a single statement, which also means no longer being
+      something the playground can run.
+    sql: |
+      with big as (
+          select o.order_id, o.customer_id, count(oi.product_id) as lines
+          from orders o
+          left join order_items oi on oi.order_id = o.order_id
+          group by o.order_id, o.customer_id
+      )
+      select count(*)                       as orders,
+             round(avg(lines), 2)           as avg_lines,
+             max(lines)                     as max_lines
+      from big
+
+pitfalls:
+  - mistake: Believing CTEs are always materialised
+    why: >-
+      It was true before PostgreSQL 12 and the advice outlived the behaviour.
+      People still add CTEs to "force" an evaluation order that no longer
+      happens, or avoid them for a performance reason that no longer applies.
+    fix: >-
+      Know your version. On 12 and later, a singly-referenced CTE is inlined.
+      Use the explicit keywords when you need a guarantee.
+
+  - mistake: Using a CTE as if it were a temporary table
+    why: >-
+      It is not stored, not indexed, and not analysed. A large CTE joined
+      repeatedly is re-scanned each time with no index to help.
+    fix: >-
+      For large intermediate results probed many times, create a real temporary
+      table and index it. Accept that the query is then several statements.
+
+  - mistake: A twelve-step CTE chain
+    why: >-
+      Readability does not increase without limit. Past a handful of steps the
+      reader is tracking a dozen intermediate shapes, and the planner is
+      optimising across all of them at once, which can produce poor estimates.
+    fix: >-
+      Break genuinely large pipelines into views, or into separate statements
+      with real intermediate tables. Name the steps for what they produce, not
+      for what they do.
+
+  - mistake: Assuming a CTE referenced twice is computed twice
+    why: >-
+      Or once, depending on which direction you assume. PostgreSQL materialises
+      a multiply-referenced CTE by default, so it is computed once — but
+      `NOT MATERIALIZED` changes that, and other databases differ.
+    fix: >-
+      Read the plan. If the CTE contains a volatile function and must be
+      evaluated exactly once, say `MATERIALIZED` rather than relying on the
+      default.
+
+performance: |
+  On PostgreSQL 12 and later, a CTE referenced once with no side effects is
+  inlined, so it plans identically to the equivalent derived table — including
+  predicate pushdown and join reordering across the boundary. There is no
+  performance reason to avoid `WITH` for readability.
+
+  A CTE referenced several times is materialised, appearing as a `CTE Scan` over
+  a `Materialize` node in EXPLAIN. That is usually right, and it is occasionally
+  wrong: if the outer query would have filtered the CTE down to a few rows,
+  materialising the whole thing first is wasted work, and `NOT MATERIALIZED`
+  fixes it.
+
+  Because a materialised CTE has no statistics, the planner's estimate of its
+  row count can be poor, which propagates into bad join choices above it. A
+  plan where the estimated and actual row counts diverge sharply at a `CTE Scan`
+  is the signal.
+
+interviewQuestions:
+  - question: What is a CTE and why use one?
+    answer: >-
+      A named subquery declared with WITH and scoped to a single statement. The
+      main reason is readability: a multi-step transformation reads top to
+      bottom as named steps rather than inside out as nested parentheses. A CTE
+      can also be referenced more than once in the same statement, which a
+      derived table cannot, and WITH RECURSIVE is the only way to express a
+      recursive query. It is not a temporary table — nothing is stored, indexed
+      or kept beyond the statement.
+
+  - question: Are CTEs an optimisation fence in PostgreSQL?
+    answer: >-
+      They were, before version 12 — every CTE was materialised and no predicate
+      could be pushed into it, which is where the "CTEs are slow" reputation
+      comes from. Since 12, a CTE referenced once and free of data-modifying
+      statements is inlined like a derived table; one referenced several times
+      is still materialised by default. Both can be overridden with the
+      MATERIALIZED and NOT MATERIALIZED keywords. Knowing which version you are
+      on matters, because the advice from the two eras is contradictory.
+
+  - question: When would you use MATERIALIZED explicitly?
+    answer: >-
+      When the CTE is expensive and referenced several times, and you want a
+      guarantee rather than a default. When it contains a volatile function —
+      random(), nextval(), now() in some forms — that must be evaluated exactly
+      once, so that every reference sees the same value. And when profiling
+      shows the planner pushing a predicate into a CTE in a way that makes
+      things worse, which is rare but does happen with poor estimates.
+
+  - question: What is the difference between a CTE and a temporary table?
+    answer: >-
+      A CTE lives for one statement, has no storage you can index, and gathers
+      no statistics. A temporary table persists for the session or transaction,
+      can be indexed and analysed, and can be written to and read from across
+      several statements. For a large intermediate result that will be probed
+      many times, the temporary table is usually much faster. For a readable
+      pipeline inside one query, the CTE is the right tool and the temporary
+      table is overkill.
+
+exercises:
+  - prompt: >-
+      Using a CTE, list departments whose average active-employee salary exceeds
+      the company-wide average active-employee salary. Columns dept_name,
+      dept_avg, company_avg, both rounded to whole rupees. Order by dept_avg
+      descending.
+    difficulty: Medium
+    hint: >-
+      One CTE for the per-department averages, one scalar subquery or a second
+      CTE for the company average.
+    solutionSql: |
+      with active as (
+          select dept_id, salary from employees where is_active and dept_id is not null
+      ),
+      per_dept as (
+          select dept_id, avg(salary) as dept_avg from active group by dept_id
+      ),
+      overall as (
+          select avg(salary) as company_avg from active
+      )
+      select d.dept_name,
+             round(p.dept_avg, 0)    as dept_avg,
+             round(o.company_avg, 0) as company_avg
+      from per_dept p
+      cross join overall o
+      join departments d on d.dept_id = p.dept_id
+      where p.dept_avg > o.company_avg
+      order by dept_avg desc, d.dept_name
+
+  - prompt: >-
+      Using a single CTE referenced twice, show each region's daily revenue
+      alongside the previous day's. Columns region, sale_date, revenue,
+      previous_day. Limit to March 2024, ordered by region then date.
+    difficulty: Medium
+    hint: >-
+      Self-join the CTE on `prev.sale_date = this.sale_date - 1`. Keep the join
+      outer so the first day survives.
+    solutionSql: |
+      with d as (
+          select region, sale_date, revenue from daily_sales
+      )
+      select this.region,
+             this.sale_date,
+             this.revenue,
+             prev.revenue as previous_day
+      from d this
+      left join d prev
+             on prev.region    = this.region
+            and prev.sale_date = this.sale_date - 1
+      where this.sale_date >= date '2024-03-01'
+        and this.sale_date <  date '2024-04-01'
+      order by this.region, this.sale_date
+
+  - prompt: >-
+      Rewrite as a CTE chain: for completed orders, compute revenue per order,
+      then return the five orders with the highest revenue. Columns order_id,
+      order_date, revenue.
+    difficulty: Easy
+    hint: One CTE for the per-order revenue, then select from it with a LIMIT.
+    solutionSql: |
+      with order_revenue as (
+          select o.order_id,
+                 o.order_date,
+                 sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue
+          from orders o
+          join order_items oi on oi.order_id = o.order_id
+          where o.status = 'completed'
+          group by o.order_id, o.order_date
+      )
+      select order_id, order_date, round(revenue, 2) as revenue
+      from order_revenue
+      order by revenue desc, order_id
+      limit 5
+
+checklist:
+  - "WITH names a step; the name is scoped to one statement"
+  - Each CTE may reference the ones declared before it, never after
+  - A CTE can be referenced several times; a derived table cannot
+  - "PostgreSQL 12+ inlines a singly-referenced CTE and materialises a multiply-referenced one"
+  - "MATERIALIZED and NOT MATERIALIZED override the default when you can justify it"
+  - A CTE has no index and no statistics — it is not a temporary table
+  - A CTE is the clean way to use a computed expression in WHERE
+  - "PostgreSQL allows data-modifying CTEs, so WITH does not imply read-only"
+
+related:
+  - i-subqueries
+  - i-recursive-cte
+  - w-basics
+  - p-explain
+
+dialect:
+  standard: >-
+    WITH and WITH RECURSIVE are standard SQL from SQL:1999. The MATERIALIZED
+    and NOT MATERIALIZED keywords are a PostgreSQL extension.
+  postgres: >-
+    Inlines singly-referenced CTEs from version 12; materialises them in 11 and
+    earlier. Supports data-modifying CTEs with RETURNING, which no other major
+    database does in the same form.
+  mysql: >-
+    CTEs arrived in MySQL 8.0 and are always treated as candidates for
+    merging — there is no MATERIALIZED hint, though optimizer hints can force
+    materialisation. No data-modifying CTEs.

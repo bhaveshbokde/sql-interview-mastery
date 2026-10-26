@@ -1,0 +1,482 @@
+id: s-normalisation
+moduleId: schema-design
+position: 20
+title: Normalisation up to BCNF
+slug: normalisation
+difficulty: Intermediate
+estimatedMinutes: 30
+summary: >-
+  1NF to BCNF, each defined by the anomaly it removes rather than by its
+  formal statement — and the practical point underneath all of them: store
+  each fact exactly once.
+tags: [normalisation, 1nf, 2nf, 3nf, bcnf, functional-dependency]
+
+prerequisites:
+  - s-keys-constraints
+
+objectives:
+  - State each normal form in terms of the anomaly it prevents
+  - Identify a partial dependency and a transitive dependency in a given table
+  - Explain the difference between 3NF and BCNF with an example
+  - Say what update, insert and delete anomalies are
+  - Decide when normalisation has gone far enough
+
+concept: |
+  ## The one-sentence version
+
+  Normalisation is the process of removing redundancy so that **every fact is
+  stored exactly once**. Every normal form is a different way a fact can end up
+  stored twice.
+
+  The reason redundancy matters is not disk space — it is **anomalies**:
+
+  - **Update anomaly.** A fact stored in many rows must be updated in all of
+    them. Miss one and the database contradicts itself.
+  - **Insert anomaly.** You cannot record one fact without inventing another.
+    If department location lives in the employee table, a department with no
+    employees cannot be recorded at all.
+  - **Delete anomaly.** Removing one fact removes another. Delete the last
+    employee of a department and the department's location is gone.
+
+  ## Functional dependency
+
+  `A → B` ("A determines B") means: for any two rows with the same `A`, the
+  `B` values must also be the same. `emp_id → salary`; `dept_id → dept_name`.
+
+  Every normal form is a statement about which functional dependencies are
+  allowed to exist.
+
+  ## First normal form
+
+  Every column holds a single atomic value; no repeating groups, no lists in a
+  column.
+
+  `skills = 'Java, SQL, Kubernetes'` violates it. So does `phone1, phone2,
+  phone3`, which is the same mistake laid out horizontally.
+
+  PostgreSQL arrays and JSONB complicate the classical statement. The useful
+  reading is practical rather than doctrinal: if you ever need to query,
+  filter, join or constrain on the individual elements, they want to be rows.
+  If the value is genuinely opaque to the database — a configuration blob, a
+  received payload — a JSONB column is not a 1NF violation worth worrying
+  about.
+
+  ## Second normal form
+
+  1NF, and **no non-key column depends on only part of a composite key**.
+
+  Only applies when the primary key is composite. Given
+  `order_items(order_id, product_id, quantity, product_name)`, the key is
+  `(order_id, product_id)` but `product_name` depends on `product_id` alone —
+  a **partial dependency**. The product name is repeated on every line for
+  that product, and renaming it means updating all of them.
+
+  Fix: move `product_name` to `products`.
+
+  ## Third normal form
+
+  2NF, and **no non-key column depends on another non-key column**.
+
+  Given `employees(emp_id, name, dept_id, dept_name, dept_location)`, the key
+  is `emp_id`, but `dept_name` depends on `dept_id`, which depends on
+  `emp_id` — a **transitive dependency**. The department's name is repeated
+  once per employee.
+
+  Fix: a `departments` table, with `employees` keeping only `dept_id`. That is
+  exactly the schema this course's dataset uses.
+
+  The informal statement, worth memorising: **every non-key column depends on
+  the key, the whole key, and nothing but the key.**
+
+  ## Boyce-Codd normal form
+
+  3NF, and **every determinant is a candidate key**.
+
+  BCNF is stricter than 3NF, and the difference only appears in a table with
+  **overlapping candidate keys**. The classic example:
+
+  `tutoring(student, subject, tutor)` where each tutor teaches exactly one
+  subject, and a student has one tutor per subject.
+
+  - Candidate keys: `(student, subject)` and `(student, tutor)`.
+  - Dependency: `tutor → subject`.
+
+  This is in 3NF — `subject` is part of a candidate key, so it is a prime
+  attribute and 3NF's rule does not apply. It is not in BCNF, because `tutor`
+  determines `subject` and `tutor` is not a candidate key. The redundancy is
+  real: the tutor-to-subject fact is repeated for every student they teach.
+
+  Fix: split into `tutors(tutor, subject)` and `assignments(student, tutor)`.
+
+  BCNF decomposition is not always **dependency-preserving** — some functional
+  dependencies can only be enforced by a join after the split. That is the
+  recognised cost, and it is why 3NF is sometimes deliberately kept.
+
+  ## Beyond BCNF
+
+  4NF removes multivalued dependencies (two independent one-to-many
+  relationships in one table, producing a cross product). 5NF concerns join
+  dependencies. Both come up in theory questions and almost never in design
+  work.
+
+  ## How far to go
+
+  **3NF or BCNF for transactional schemas**, and stop. Normalisation past that
+  usually trades real clarity for theoretical purity.
+
+  Deliberate denormalisation for read performance is a separate decision, made
+  after measuring, and it is the next lesson's subject.
+
+syntax:
+  - form: "A → B"
+    notes: >-
+      A functional dependency: rows agreeing on A must agree on B. The
+      vocabulary all the normal forms are stated in.
+  - form: "1NF"
+    notes: Atomic column values. No lists, no repeating column groups.
+  - form: "2NF"
+    notes: >-
+      1NF and no partial dependency on a composite key. Vacuous when the key is
+      a single column.
+  - form: "3NF"
+    notes: >-
+      2NF and no transitive dependency. "The key, the whole key, and nothing but
+      the key."
+  - form: "BCNF"
+    notes: >-
+      Every determinant is a candidate key. Differs from 3NF only when
+      candidate keys overlap.
+
+sampleTables: [employees, departments, products, order_items, orders, customers]
+
+examples:
+  - title: A normalised schema, and the fact stored once
+    sql: |
+      select d.dept_id,
+             d.dept_name,
+             d.location,
+             count(e.emp_id) as employees
+      from departments d
+      left join employees e on e.dept_id = d.dept_id
+      group by d.dept_id, d.dept_name, d.location
+      order by d.dept_id
+    walkthrough: |
+      `dept_name` and `location` appear exactly once each, in `departments`.
+      `employees` holds only `dept_id`.
+
+      Every anomaly is removed by that one decision. Renaming a department is
+      one `UPDATE`. Research exists with zero employees, so there is no insert
+      anomaly. Removing the last employee from a department leaves the
+      department intact, so there is no delete anomaly.
+
+      Had `dept_name` been stored on `employees`, this query would not even be
+      answerable for Research — the department would have no rows to be
+      counted from.
+
+  - title: What a transitive dependency would look like
+    sql: |
+      select e.emp_id,
+             e.first_name || ' ' || e.last_name as employee,
+             e.dept_id,
+             d.dept_name,
+             d.location,
+             count(*) over (partition by e.dept_id) as rows_repeating_this_dept_name
+      from employees e
+      join departments d on d.dept_id = e.dept_id
+      where e.dept_id in (10, 50)
+      order by e.dept_id, e.emp_id
+    walkthrough: |
+      This query **produces** the denormalised shape that 3NF forbids storing:
+      `dept_name` and `location` repeated once per employee.
+
+      `rows_repeating_this_dept_name` makes the cost visible. If this were a
+      stored table rather than a query result, renaming Engineering would mean
+      updating 13 rows, and the update anomaly is the possibility of updating
+      12 of them.
+
+      That is the distinction worth being precise about in an interview:
+      repetition in a **query result** is normal and harmless, because it is
+      derived. Repetition in **stored data** is redundancy, because it can
+      become inconsistent.
+
+  - title: A partial dependency, and why order_items avoids it
+    sql: |
+      select oi.order_id,
+             oi.product_id,
+             p.product_name,
+             oi.quantity,
+             oi.unit_price      as price_charged,
+             p.unit_price       as price_today,
+             oi.unit_price - p.unit_price as difference
+      from order_items oi
+      join products p on p.product_id = oi.product_id
+      where oi.order_id in (1002, 1003)
+      order by oi.order_id, oi.product_id
+    walkthrough: |
+      `order_items` has the composite key `(order_id, product_id)` and stores
+      no `product_name` — that would depend on `product_id` alone, a partial
+      dependency and a 2NF violation.
+
+      But it **does** store `unit_price`, which looks like the same mistake and
+      is not. The price on the line is the price **at the time of the order**;
+      the price in `products` is the price today. They are different facts, and
+      the `difference` column shows they genuinely differ.
+
+      This is the most important practical point in the whole module. A column
+      that looks redundant may be recording a value at a point in time, and
+      normalising it away destroys information. "Is this the same fact or a
+      snapshot of it?" is the question to ask before removing a duplicate.
+
+  - title: Detecting a functional dependency in the data
+    sql: |
+      select 'dept_id -> dept_name'           as dependency,
+             count(*)                          as distinct_pairs,
+             count(distinct dept_id)           as distinct_determinants,
+             count(*) = count(distinct dept_id) as holds
+      from (select distinct dept_id, dept_name from departments) t
+      union all
+      select 'country -> city',
+             count(*),
+             count(distinct country),
+             count(*) = count(distinct country)
+      from (select distinct country, city from customers) t
+      union all
+      select 'customer_id -> country',
+             count(*),
+             count(distinct customer_id),
+             count(*) = count(distinct customer_id)
+      from (select distinct customer_id, country from customers) t
+    walkthrough: |
+      A functional dependency `A → B` holds in the data when the number of
+      distinct `(A, B)` pairs equals the number of distinct `A` values — each
+      `A` maps to exactly one `B`.
+
+      `dept_id → dept_name` holds and `customer_id → country` holds.
+      `country → city` does not: the United Kingdom appears with Leeds,
+      Bristol, Manchester, York and Norwich.
+
+      This technique **cannot prove** a dependency — it only shows that none is
+      violated by the current data. A dependency is a statement about what is
+      permitted, not about what happens to be present, and only a constraint
+      makes it true. But it is a very good way to discover candidate
+      dependencies in a schema you did not design.
+
+edgeCases:
+  - title: Repetition in a result is not redundancy
+    body: >-
+      This result repeats the customer's company name once per order, which is
+      exactly what a denormalised table would do. It is not a normalisation
+      problem, because the result is derived and discarded — there is no second
+      copy that can drift from the first. Normal forms constrain stored
+      relations, not query output, and conflating the two is a common
+      confusion in interviews.
+    sql: |
+      select c.company_name,
+             o.order_id,
+             o.order_date,
+             o.status
+      from customers c
+      join orders o on o.customer_id = c.customer_id
+      where c.customer_id = 319
+      order by o.order_id
+
+  - title: A 1NF violation hiding in a JSONB column
+    body: >-
+      The colours array is a repeating group inside a column, which the
+      classical definition of 1NF forbids. In practice this is fine as long as
+      nobody needs to constrain or join on individual colours — and the moment
+      somebody does, as this query does by unnesting them, the argument for a
+      proper product_colours table becomes concrete. The test is use, not
+      doctrine.
+    sql: |
+      select colour,
+             count(*)                              as products,
+             string_agg(product_name, ', ' order by product_id) as names
+      from products p
+      cross join lateral jsonb_array_elements_text(p.attributes -> 'colours') as colour
+      group by colour
+      order by products desc, colour
+
+pitfalls:
+  - mistake: Normalising away a point-in-time snapshot
+    why: >-
+      `order_items.unit_price` duplicates `products.unit_price` today and will
+      not tomorrow. Removing it as redundant makes every historical order
+      reprice itself whenever the catalogue changes.
+    fix: >-
+      Ask whether the column is the same fact or a record of what it was at a
+      moment. Snapshots are not redundancy and belong where they are.
+
+  - mistake: Treating normal forms as a target rather than a tool
+    why: >-
+      Decomposing to 5NF because the theory exists produces a schema where
+      every query is a six-way join and nobody can read it.
+    fix: >-
+      3NF or BCNF for transactional schemas, then stop. Go further only when a
+      specific anomaly justifies it.
+
+  - mistake: Confusing a query result with a stored relation
+    why: >-
+      Any join produces repeated values. People see the repetition and conclude
+      the schema is denormalised.
+    fix: >-
+      Normal forms apply to stored tables. Repetition in output is derived and
+      cannot become inconsistent.
+
+  - mistake: Inferring a functional dependency from the current data
+    why: >-
+      A dependency that holds today may be an accident of the sample. If every
+      customer happens to be in a distinct city, the data satisfies `city →
+      customer`, which is obviously not a rule.
+    fix: >-
+      Dependencies come from the domain and are enforced by constraints. Data
+      analysis finds candidates; a conversation with the business confirms
+      them.
+
+performance: |
+  A normalised schema has smaller tables, so more rows fit per page and more of
+  the working set fits in cache. Writes are cheaper: one fact in one place
+  means one row to update, and narrower rows mean less write amplification.
+
+  The cost is joins. A normalised read assembles its answer from several
+  tables, and a query that needs columns from five of them does five joins.
+  With correct indexes those joins are usually cheap — but "usually" is the
+  honest word, and a join across five large tables with poor selectivity is
+  not.
+
+  Normalisation also helps concurrency: separate tables mean separate rows and
+  separate locks, so two transactions updating unrelated facts do not contend.
+  A wide denormalised row is a single point of contention for everything stored
+  in it.
+
+  The crucial sequencing point: **normalise first, denormalise with
+  measurements**. A denormalised schema cannot easily be normalised later,
+  because the duplicated data has already diverged. The reverse direction is
+  always available.
+
+interviewQuestions:
+  - question: Explain the normal forms up to 3NF.
+    answer: >-
+      1NF requires atomic column values — no lists and no repeating column
+      groups. 2NF adds that no non-key column may depend on only part of a
+      composite key, which is a partial dependency and only arises with
+      composite keys. 3NF adds that no non-key column may depend on another
+      non-key column, which is a transitive dependency. The informal summary is
+      that every non-key column depends on the key, the whole key, and nothing
+      but the key. Each form removes a class of update, insert and delete
+      anomaly caused by storing one fact more than once.
+
+  - question: What is the difference between 3NF and BCNF?
+    answer: >-
+      BCNF requires that every determinant be a candidate key; 3NF permits a
+      determinant that is not, provided the dependent attribute is part of some
+      candidate key. The difference therefore only appears in tables with
+      overlapping candidate keys. The classic example is
+      tutoring(student, subject, tutor) where a tutor teaches one subject: it is
+      3NF because subject is a prime attribute, and not BCNF because tutor
+      determines subject without being a key. BCNF decomposition is not always
+      dependency-preserving, which is the recognised reason to sometimes stop
+      at 3NF.
+
+  - question: What are update, insert and delete anomalies?
+    answer: >-
+      Update: a fact stored in many rows must be changed in all of them, and
+      missing one leaves the database self-contradictory. Insert: you cannot
+      record one fact without supplying an unrelated one — a department with no
+      employees cannot exist if department details live in the employee table.
+      Delete: removing one fact removes another, so deleting the last employee
+      of a department loses the department. All three are symptoms of a single
+      cause, which is storing the same fact more than once.
+
+  - question: How do you decide how far to normalise?
+    answer: >-
+      Normalise to 3NF or BCNF as the default for transactional data, because
+      the anomalies those forms prevent are real and the cost is joins, which
+      indexes handle. Go further only for a specific demonstrated problem.
+      Denormalise deliberately and afterwards, with measurements, accepting the
+      maintenance burden explicitly. The sequencing matters: going from
+      normalised to denormalised is a refactor, while going the other way means
+      reconciling data that has already diverged.
+
+exercises:
+  - prompt: >-
+      Check whether category_id determines category_name in the categories
+      table, by comparing the number of distinct pairs to the number of
+      distinct category_ids. Columns distinct_pairs, distinct_ids, holds.
+    difficulty: Easy
+    hint: >-
+      Count over a DISTINCT subquery of the two columns.
+    solutionSql: |
+      select count(*)                              as distinct_pairs,
+             count(distinct category_id)           as distinct_ids,
+             count(*) = count(distinct category_id) as holds
+      from (select distinct category_id, category_name from categories) t
+
+  - prompt: >-
+      Show that shipping_country is not functionally determined by
+      customer_id — that is, find customers who have shipped to more than one
+      country. Columns customer_id, countries, country_list.
+    difficulty: Medium
+    hint: >-
+      Group orders by customer_id and count distinct shipping_country.
+    solutionSql: |
+      select customer_id,
+             count(distinct shipping_country)                                as countries,
+             string_agg(distinct shipping_country, ', ' order by shipping_country) as country_list
+      from orders
+      group by customer_id
+      having count(distinct shipping_country) > 1
+      order by countries desc, customer_id
+
+  - prompt: >-
+      Find order lines where the price charged differs from the product's
+      current price, demonstrating that unit_price on order_items is a
+      snapshot rather than redundancy. Columns order_id, product_name,
+      price_charged, price_today, difference. Limit to 10, ordered by the
+      absolute difference descending.
+    difficulty: Medium
+    hint: >-
+      Join order_items to products and compare the two unit_price columns.
+    solutionSql: |
+      select oi.order_id,
+             p.product_name,
+             oi.unit_price                as price_charged,
+             p.unit_price                 as price_today,
+             oi.unit_price - p.unit_price as difference
+      from order_items oi
+      join products p on p.product_id = oi.product_id
+      where oi.unit_price <> p.unit_price
+      order by abs(oi.unit_price - p.unit_price) desc, oi.order_id, p.product_id
+      limit 10
+
+checklist:
+  - Normalisation means storing every fact exactly once
+  - "The reason is anomalies — update, insert and delete — not disk space"
+  - "1NF: atomic values. 2NF: no partial dependency. 3NF: no transitive dependency"
+  - "\"The key, the whole key, and nothing but the key\""
+  - BCNF requires every determinant to be a candidate key and differs from 3NF only with overlapping keys
+  - BCNF decomposition is not always dependency-preserving
+  - A point-in-time snapshot is not redundancy and must not be normalised away
+  - "Repetition in a query result is derived; only stored repetition can go stale"
+
+related:
+  - s-keys-constraints
+  - s-relationships
+  - f-relational-model
+  - i-json
+
+dialect:
+  standard: >-
+    Normalisation is relational theory rather than SQL syntax, so it is
+    identical everywhere. The normal forms were defined by Codd (1NF to 3NF),
+    Boyce and Codd (BCNF) and Fagin (4NF, 5NF).
+  postgres: >-
+    Arrays, composite types, hstore and JSONB all allow non-atomic column
+    values, which makes 1NF a design judgement rather than something the type
+    system enforces. The judgement is whether you need to query the elements
+    individually.
+  mysql: >-
+    Identical theory. MySQL's historical weaknesses — no CHECK constraints
+    before 8.0.16, silent truncation in non-strict mode — meant that schemas
+    often relied on the application for invariants, which tends to push designs
+    towards denormalisation for convenience.

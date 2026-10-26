@@ -1,0 +1,456 @@
+id: w-basics
+moduleId: windows
+position: 10
+title: What a window function is
+slug: window-function-basics
+difficulty: Intermediate
+estimatedMinutes: 25
+summary: >-
+  An aggregate collapses rows; a window function computes across a set of rows
+  and leaves them all in place. Once that distinction is clear, OVER,
+  PARTITION BY and the whole family follow.
+tags: [window-functions, over, partition-by, interview-favourite]
+
+prerequisites:
+  - a-group-by-having
+
+objectives:
+  - State the difference between an aggregate and a window function in one sentence
+  - Write OVER with and without PARTITION BY
+  - Explain why a window function cannot appear in WHERE
+  - Use the same aggregate as both a group aggregate and a window function
+  - Name a window with the WINDOW clause and reuse it
+
+concept: |
+  ## The one-sentence difference
+
+  An **aggregate** collapses a group of rows into one row. A **window
+  function** computes a value from a group of rows and attaches it to **every
+  row in that group**, which all remain.
+
+  ```sql
+  -- aggregate: 5 rows out, one per department
+  select dept_id, avg(salary) from employees group by dept_id;
+
+  -- window: 40 rows out, each carrying its department's average
+  select emp_id, dept_id, salary,
+         avg(salary) over (partition by dept_id) as dept_avg
+  from employees;
+  ```
+
+  That is the whole idea. Everything else is detail about how the set of rows
+  is defined.
+
+  The practical consequence is that a window function lets you compare a row
+  to its group **without a self-join and without a correlated subquery**. "How
+  does this salary compare to the department average?" is one pass instead of
+  two.
+
+  ## OVER defines the window
+
+  `OVER ()` with an empty parenthesis means "every row in the result" — the
+  whole set as one window.
+
+  `OVER (PARTITION BY dept_id)` splits the rows into independent windows by
+  department. The function restarts for each partition, exactly as `GROUP BY`
+  forms groups — but without collapsing them.
+
+  `OVER (PARTITION BY dept_id ORDER BY salary)` adds an ordering within each
+  partition. For ranking functions the order *is* the point. For aggregates it
+  silently changes the meaning: adding `ORDER BY` to `sum()` turns a partition
+  total into a **running total**, because an ORDER BY implies a default frame
+  of "everything up to and including the current row". That surprise has its
+  own lesson.
+
+  ## Where window functions may appear
+
+  Only in the **SELECT list** and in **ORDER BY**. Not in `WHERE`, not in
+  `GROUP BY`, not in `HAVING`.
+
+  The reason is the logical order: window functions are evaluated after
+  `GROUP BY` and `HAVING`, because they operate on the result of grouping. By
+  the time a window function runs, `WHERE` has long since finished.
+
+  To filter on a window function's output, compute it in a subquery or CTE and
+  filter the outer query:
+
+  ```sql
+  with ranked as (
+      select *, row_number() over (partition by dept_id order by salary desc) as rn
+      from employees
+  )
+  select * from ranked where rn <= 3;
+  ```
+
+  This two-step shape is the single most useful pattern in the module, and
+  top-N-per-group has a lesson of its own.
+
+  ## Window functions and GROUP BY together
+
+  They compose, and the order matters: grouping happens first, and the window
+  function then operates over the **grouped rows**.
+
+  ```sql
+  select dept_id,
+         count(*)                                    as headcount,
+         sum(count(*)) over ()                       as total_headcount,
+         round(100.0 * count(*) / sum(count(*)) over (), 1) as pct
+  from employees
+  group by dept_id;
+  ```
+
+  `sum(count(*)) over ()` looks alarming and is straightforward: `count(*)` is
+  the group aggregate, and `sum(...) over ()` adds those group counts across
+  all groups. This is how you get a percentage-of-total column without a
+  subquery, and recognising it is worth the five seconds of double-take.
+
+  ## The WINDOW clause
+
+  When several functions share a window definition, name it once:
+
+  ```sql
+  select ...,
+         rank()       over w,
+         dense_rank() over w,
+         sum(salary)  over w
+  from employees
+  window w as (partition by dept_id order by salary desc)
+  ```
+
+  The clause goes after `HAVING` and before `ORDER BY`. It is purely a
+  readability device — and a maintenance one, since three copies of a window
+  specification is three places to update.
+
+syntax:
+  - form: "function(args) OVER ()"
+    notes: The window is every row of the result.
+  - form: "function(args) OVER (PARTITION BY expr [, expr])"
+    notes: Independent windows, one per distinct combination. No collapsing.
+  - form: "function(args) OVER (PARTITION BY ... ORDER BY ...)"
+    notes: >-
+      Ordered within each partition. For aggregates this introduces a default
+      frame and turns a total into a running total.
+  - form: "WINDOW name AS (spec)  ... OVER name"
+    notes: >-
+      Declares a reusable window. Placed after HAVING and before ORDER BY.
+  - form: "aggregate(aggregate(x)) OVER ()"
+    notes: >-
+      Legal when the query has a GROUP BY — the inner aggregate produces the
+      group value and the window aggregates across groups.
+
+sampleTables: [employees, departments, orders, daily_sales, exam_scores]
+
+examples:
+  - title: The same question, aggregated and windowed
+    sql: |
+      select e.emp_id,
+             e.first_name || ' ' || e.last_name            as employee,
+             e.dept_id,
+             e.salary,
+             round(avg(e.salary) over (partition by e.dept_id), 0) as dept_avg,
+             round(e.salary - avg(e.salary) over (partition by e.dept_id), 0) as vs_dept_avg,
+             round(avg(e.salary) over (), 0)               as company_avg,
+             count(*) over (partition by e.dept_id)        as dept_headcount
+      from employees e
+      where e.dept_id is not null
+      order by e.dept_id, e.salary desc
+    walkthrough: |
+      38 rows out — every employee, each carrying their department's average,
+      their difference from it, the company average and their department's
+      headcount.
+
+      The equivalent without window functions needs a correlated subquery per
+      column, or a join to a grouped derived table, and the arithmetic column
+      `vs_dept_avg` would mean writing the average expression twice.
+
+      Three different windows appear here: `partition by dept_id` for the
+      department figures, the empty `over ()` for the company-wide average, and
+      `partition by dept_id` again for the count. Each is independent; a query
+      can mix as many as it needs.
+
+  - title: Percentage of total, without a subquery
+    sql: |
+      select d.dept_name,
+             count(*)                                            as headcount,
+             sum(count(*)) over ()                               as company_headcount,
+             round(100.0 * count(*) / sum(count(*)) over (), 1)  as pct_of_company,
+             round(sum(e.salary), 0)                             as payroll,
+             round(100.0 * sum(e.salary) / sum(sum(e.salary)) over (), 1) as pct_of_payroll
+      from employees e
+      join departments d on d.dept_id = e.dept_id
+      group by d.dept_name
+      order by headcount desc, d.dept_name
+    walkthrough: |
+      `sum(count(*)) over ()` is the construction worth slowing down for.
+      `GROUP BY` runs first and produces one row per department with its
+      `count(*)`. The window function then runs over those five rows and sums
+      their counts, giving the company total on every row.
+
+      Without it you would need the total from a scalar subquery — a second
+      pass over the table — or a join to a one-row derived table.
+
+      The percentage columns sum to 100 across the result, which is the usual
+      sanity check on a share-of-total calculation.
+
+  - title: A named window, reused
+    sql: |
+      select student_id,
+             subject,
+             score,
+             round(avg(score) over w, 1)          as subject_avg,
+             max(score) over w                    as subject_max,
+             min(score) over w                    as subject_min,
+             count(*) over w                      as students_in_subject,
+             score - round(avg(score) over w)     as vs_subject_avg
+      from exam_scores
+      window w as (partition by subject)
+      order by subject, score desc, student_id
+    walkthrough: |
+      Five functions, one window definition. Writing `(partition by subject)`
+      five times would work identically and would be five places to edit when
+      the partitioning changes.
+
+      The `WINDOW` clause sits after any `HAVING` and before `ORDER BY`, which
+      is an unusual position and the main reason people forget the clause
+      exists.
+
+      A named window can also be extended at the point of use — `over (w order
+      by score)` adds an ordering to the named spec — which keeps the shared
+      part shared.
+
+  - title: Why a window function cannot go in WHERE
+    sql: |
+      with ranked as (
+          select e.emp_id,
+                 e.first_name || ' ' || e.last_name as employee,
+                 e.dept_id,
+                 e.salary,
+                 avg(e.salary) over (partition by e.dept_id) as dept_avg
+          from employees e
+          where e.dept_id is not null
+      )
+      select emp_id, employee, dept_id, salary, round(dept_avg, 0) as dept_avg
+      from ranked
+      where salary > dept_avg
+      order by dept_id, salary desc
+    walkthrough: |
+      `where salary > avg(salary) over (partition by dept_id)` is not valid
+      SQL — window functions are evaluated after `WHERE`, so the value does not
+      exist yet.
+
+      The fix is always the same shape: compute the window value in a CTE or
+      subquery, then filter the outer query. It costs nothing, because the CTE
+      is inlined.
+
+      Compare this with the correlated-subquery version in the subqueries
+      lesson. Same answer; this one computes each department's average once
+      instead of once per candidate row, and says what it means more directly.
+
+edgeCases:
+  - title: OVER () with no partition is the whole result
+    body: >-
+      An empty OVER means one window containing every row the query returns —
+      after WHERE, but regardless of ORDER BY. Note what that implies: the
+      window sees only rows that survived the WHERE clause, so a "total" column
+      computed this way is a total of the filtered set, not of the table. That
+      is usually what is wanted and is worth being deliberate about.
+    sql: |
+      select count(*) over ()                    as rows_in_result,
+             (select count(*) from employees)    as rows_in_table,
+             emp_id,
+             salary,
+             round(100.0 * salary / sum(salary) over (), 2) as pct_of_filtered_payroll
+      from employees
+      where dept_id = 40
+      order by salary desc
+
+  - title: A window function sees rows a GROUP BY would have collapsed
+    body: >-
+      The first query returns one row per department; the second returns one
+      row per employee, each carrying the same department average. Both compute
+      the identical aggregate. The difference is entirely in what survives into
+      the result, which is the distinction the whole module rests on.
+    sql: |
+      select 'grouped' as form, count(*) as rows_returned
+      from (select dept_id, avg(salary) from employees
+            where dept_id is not null group by dept_id) g
+      union all
+      select 'windowed', count(*)
+      from (select dept_id, avg(salary) over (partition by dept_id)
+            from employees where dept_id is not null) w
+
+pitfalls:
+  - mistake: Putting a window function in WHERE or HAVING
+    why: >-
+      It reads naturally — "where the row number is 1" — and it is a syntax
+      error, because window functions are evaluated after both clauses.
+    fix: >-
+      Compute it in a CTE or subquery and filter outside. This is the standard
+      two-step shape and the planner handles it well.
+
+  - mistake: Adding ORDER BY to a window aggregate without meaning to
+    why: >-
+      `sum(x) over (partition by p order by d)` is a **running** total, not a
+      partition total, because an ORDER BY introduces a default frame ending at
+      the current row. The numbers look plausible and are cumulative.
+    fix: >-
+      Omit ORDER BY when you want the partition total. If the ordering is
+      needed for other functions sharing the window, give the aggregate its own
+      window or an explicit full frame.
+
+  - mistake: Expecting the window to see rows removed by WHERE
+    why: >-
+      Windows operate on the query's result rows, after filtering. A
+      "percentage of total" computed alongside a filter is a percentage of the
+      filtered total.
+    fix: >-
+      If the denominator should be the unfiltered total, move the filter
+      outside — compute the window in a CTE over everything and filter the
+      outer query.
+
+  - mistake: Using a window function where a plain aggregate was wanted
+    why: >-
+      The result has one row per input row rather than one per group, so
+      downstream counts and sums are multiplied. It is the mirror image of
+      forgetting a GROUP BY.
+    fix: >-
+      Ask what shape the answer should be. One row per group means GROUP BY;
+      one row per input row with group context means a window function.
+
+performance: |
+  A window function requires its input **sorted by the partition and order
+  keys**. PostgreSQL adds a `WindowAgg` node, usually above a `Sort`. An index
+  matching `(partition_key, order_key)` can supply that order and remove the
+  sort, which is the main optimisation available.
+
+  Several window functions **sharing the same window specification** are
+  computed in a single pass over one sort. Functions with different
+  specifications each need their own sort, so a query with four differently
+  partitioned windows does four sorts. Consolidating window definitions —
+  which the `WINDOW` clause encourages — is therefore a real optimisation and
+  not just tidiness.
+
+  Compared with the alternatives, a window function is usually the cheapest
+  way to attach group context to rows: a correlated subquery is evaluated per
+  row, and a self-join to a grouped derived table needs a second pass plus a
+  join. The exception is top-N-per-group with a small N and many groups, where
+  `LATERAL` with a `LIMIT` can beat it decisively.
+
+interviewQuestions:
+  - question: What is the difference between an aggregate function and a window function?
+    answer: >-
+      An aggregate with GROUP BY collapses each group into a single row; a
+      window function computes over a set of rows and returns a value for every
+      row, leaving the row count unchanged. The same function name can be used
+      both ways — `avg(salary)` with GROUP BY versus `avg(salary) OVER
+      (PARTITION BY dept_id)`. The window form is what lets you compare a row to
+      its group without a self-join or a correlated subquery.
+
+  - question: Why can't you use a window function in a WHERE clause?
+    answer: >-
+      Because of the logical evaluation order: WHERE is processed before the
+      SELECT list, and window functions are evaluated with the SELECT list,
+      after GROUP BY and HAVING. The value does not exist when WHERE runs. The
+      standard workaround is to compute the window function in a subquery or
+      CTE and filter in the outer query, which is also the shape of every
+      top-N-per-group solution.
+
+  - question: What does PARTITION BY do, and how is it different from GROUP BY?
+    answer: >-
+      Both divide rows into groups by the value of some expressions. GROUP BY
+      then collapses each group to one row and restricts the select list to
+      grouping keys and aggregates; PARTITION BY leaves every row in place and
+      places no such restriction. They can be used together, in which case
+      grouping happens first and the window function operates over the grouped
+      rows — which is how `sum(count(*)) over ()` produces a grand total
+      alongside per-group counts.
+
+  - question: How do you compute each row's share of the total in one query?
+    answer: >-
+      Divide by `sum(x) over ()`, which gives the total across the whole
+      result set on every row — no subquery and no second pass. If the query
+      also has a GROUP BY, the form is `sum(sum(x)) over ()`: the inner
+      aggregate produces each group's value and the window sums across groups.
+      Remember the window is over the rows the query returns, so any WHERE
+      clause is already applied to the denominator.
+
+exercises:
+  - prompt: >-
+      For each employee in department 10, show their salary, the department's
+      highest salary, and the difference. Columns full_name, salary,
+      dept_max, gap. Order by salary descending.
+    difficulty: Easy
+    hint: >-
+      `max(salary) over ()` is enough, since the WHERE clause already restricts
+      the result to one department.
+    solutionSql: |
+      select first_name || ' ' || last_name as full_name,
+             salary,
+             max(salary) over ()            as dept_max,
+             max(salary) over () - salary   as gap
+      from employees
+      where dept_id = 10
+      order by salary desc, emp_id
+
+  - prompt: >-
+      For each subject, show every student's score alongside the subject
+      average and whether they are above it. Columns subject, student_id,
+      score, subject_avg, above_average. Order by subject then score
+      descending.
+    difficulty: Medium
+    hint: >-
+      `avg(score) over (partition by subject)` twice, or once with a named
+      window.
+    solutionSql: |
+      select subject,
+             student_id,
+             score,
+             round(avg(score) over w, 1)        as subject_avg,
+             score > avg(score) over w          as above_average
+      from exam_scores
+      window w as (partition by subject)
+      order by subject, score desc, student_id
+
+  - prompt: >-
+      Show each order status with its order count and that count as a
+      percentage of all orders, rounded to one decimal. Columns status,
+      orders, pct. Order by orders descending.
+    difficulty: Medium
+    hint: "`sum(count(*)) over ()` is the denominator."
+    solutionSql: |
+      select status,
+             count(*)                                            as orders,
+             round(100.0 * count(*) / sum(count(*)) over (), 1)  as pct
+      from orders
+      group by status
+      order by orders desc, status
+
+checklist:
+  - An aggregate collapses rows; a window function keeps them and adds a value
+  - "OVER () is one window over the whole result; PARTITION BY splits it"
+  - Window functions may appear only in SELECT and ORDER BY
+  - To filter on one, compute it in a CTE and filter the outer query
+  - Grouping happens before windowing, so `sum(count(*)) over ()` is a grand total
+  - The window sees only rows that survived WHERE
+  - Adding ORDER BY to a window aggregate makes it a running total
+  - Functions sharing one window specification are computed in a single pass
+
+related:
+  - a-group-by-having
+  - w-ranking
+  - w-frames
+  - i-subqueries
+
+dialect:
+  standard: >-
+    Window functions, OVER, PARTITION BY and the WINDOW clause are standard SQL
+    from SQL:2003.
+  postgres: >-
+    Full support including the WINDOW clause, GROUPS framing, EXCLUDE options
+    and all the standard functions. Shares one sort between window functions
+    with identical specifications.
+  mysql: >-
+    Window functions arrived in MySQL 8.0 with the same syntax, including the
+    WINDOW clause. Before 8.0 the equivalents were user variables and
+    self-joins, which is why a lot of older MySQL code solves these problems in
+    ways that look nothing like the standard answer.

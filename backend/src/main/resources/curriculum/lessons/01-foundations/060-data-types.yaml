@@ -1,0 +1,413 @@
+id: f-data-types
+moduleId: foundations
+position: 60
+title: Data types, casting and type pitfalls
+slug: data-types
+difficulty: Beginner
+estimatedMinutes: 25
+summary: >-
+  Which type to choose and why it matters: numeric versus float for money,
+  timestamptz versus timestamp, text versus varchar(n), and the implicit casts
+  that quietly turn a fast query into a slow one.
+tags: [types, numeric, timestamp, casting, money]
+
+prerequisites:
+  - f-select-basics
+
+objectives:
+  - Choose between integer, numeric and double precision for a given column
+  - Explain why money must never be stored in a floating-point type
+  - State the difference between timestamp and timestamptz in one sentence
+  - Cast explicitly, and recognise where PostgreSQL is casting for you
+  - Describe how a type mismatch can prevent an index from being used
+
+concept: |
+  ## Numbers
+
+  PostgreSQL has three families and they are not interchangeable.
+
+  - **Integers** — `smallint` (2 bytes), `integer` (4), `bigint` (8). Exact,
+    fast, and the default choice for counts and identifiers. Division between
+    two integers **truncates**: `7 / 2` is `3`, with no warning.
+  - **`numeric(p, s)`** (= `decimal`) — exact decimal arithmetic with up to `p`
+    significant digits and `s` after the point. Slower than the others because
+    it is implemented in software rather than on the CPU. **This is the type
+    for money.**
+  - **`real` / `double precision`** — IEEE 754 binary floating point. Fast,
+    compact, and *approximate*. `0.1 + 0.2` is not `0.3`. Correct for
+    measurements, physics and statistics; wrong for currency.
+
+  The money rule is worth stating as a rule because the failure is slow and
+  cumulative: floats accumulate rounding error, so a ledger that balances today
+  is off by a few paise after a million transactions, and nobody can say where
+  it went. PostgreSQL also has a `money` type; it is locale-dependent and
+  generally avoided in favour of `numeric`.
+
+  ## Text
+
+  `text`, `varchar(n)` and `char(n)` are the same implementation underneath in
+  PostgreSQL, and `text` is the default choice. `varchar(n)` adds a length
+  check — useful when the limit is a genuine business rule, pointless when it is
+  a guess, and awkward to change later because it requires a table rewrite in
+  older versions. `char(n)` pads with spaces and is almost never what anyone
+  wants.
+
+  There is no performance advantage to a shorter declared length in PostgreSQL.
+  That surprises people coming from databases where fixed-width columns are
+  stored differently.
+
+  ## Dates and times
+
+  - `date` — a calendar day, no time, no zone.
+  - `time` — a clock time with no date. Rarely the right type on its own.
+  - `timestamp` (without time zone) — a date and time with **no zone
+    information**. It is a wall-clock reading: "2024-03-10 14:00" with no
+    statement about where.
+  - `timestamptz` (with time zone) — an absolute point in time. It does not
+    store a zone; it stores UTC and converts to the session's `TimeZone` on
+    output.
+  - `interval` — a duration. `timestamptz - timestamptz` yields one.
+
+  **Default to `timestamptz`** for anything that records when something
+  happened. Use `timestamp` only for a wall-clock concept that genuinely has no
+  zone, such as a recurring 09:00 local opening time. The classic production
+  incident is storing event times as `timestamp`, deploying to a server in a
+  different zone, and discovering that an hour of history is ambiguous.
+
+  ## Booleans, and everything else
+
+  `boolean` holds true, false or NULL — the three-valued logic again. PostgreSQL
+  also offers `uuid`, `jsonb`, arrays of any type, `inet`, ranges and
+  enumerated types, all of which are covered where they are used.
+
+  ## Casting
+
+  `expr::type` is the PostgreSQL shorthand; `CAST(expr AS type)` is the standard
+  and survives a port. They are identical.
+
+  PostgreSQL will insert casts for you in many contexts, and that is where the
+  surprises are. A literal `'2024-01-01'` is an untyped string until context
+  tells it what to be. Comparing a `text` column to an `integer` either casts
+  one side — potentially defeating an index on the column — or fails outright,
+  depending on the types involved. PostgreSQL is stricter here than MySQL,
+  which happily compares `'abc'` to `0` and calls them equal.
+
+syntax:
+  - form: "expr::type   |   CAST(expr AS type)"
+    notes: Identical. The second is portable.
+  - form: "numeric(precision, scale)"
+    notes: >-
+      `numeric(10,2)` holds up to 10 significant digits with 2 after the point.
+      Unconstrained `numeric` accepts any precision.
+  - form: "date 'YYYY-MM-DD'   |   timestamptz '2024-01-01 09:00+05:30'"
+    notes: >-
+      A typed literal. Clearer than a bare string and removes any doubt about
+      what PostgreSQL will infer.
+  - form: "extract(field from source)   |   date_trunc('unit', source)"
+    notes: >-
+      `extract(year from d)` returns a number; `date_trunc('month', ts)` returns
+      a timestamp rounded down. The second keeps the type, which matters for
+      sorting and for index use.
+  - form: "value IS OF (type)  — not in PostgreSQL; use pg_typeof(value)"
+    notes: >-
+      `pg_typeof(expr)` returns the resolved type name, which is the quickest
+      way to settle an argument about what an expression actually produced.
+
+sampleTables: [employees, products, orders, payments]
+
+examples:
+  - title: Integer division, and the two ways out of it
+    sql: |
+      select 7 / 2                        as integer_division,
+             7.0 / 2                      as numeric_literal,
+             7::numeric / 2               as explicit_cast,
+             7 % 2                        as remainder,
+             round(7.0 / 2, 3)            as rounded,
+             pg_typeof(7 / 2)             as type_of_first,
+             pg_typeof(7.0 / 2)           as type_of_second
+    walkthrough: |
+      `7 / 2` is `3`. Both operands are integers, so PostgreSQL picks integer
+      division, and the fractional part is discarded rather than rounded.
+
+      Making either operand non-integer changes the resolved operator. Writing
+      `7.0` is the shortest fix; `::numeric` is the explicit one and the one to
+      prefer when the operands are columns rather than literals, because it says
+      what you meant instead of relying on a literal's spelling.
+
+      `pg_typeof` makes the difference visible: `integer` versus `numeric`.
+
+  - title: Why money is numeric and not double precision
+    sql: |
+      select 0.1::double precision + 0.2::double precision         as float_sum,
+             (0.1::double precision + 0.2::double precision) = 0.3 as float_equals_point_three,
+             0.1::numeric + 0.2::numeric                           as numeric_sum,
+             (0.1::numeric + 0.2::numeric) = 0.3                   as numeric_equals_point_three,
+             sum(amount)                                           as total_payments,
+             pg_typeof(sum(amount))                                as payments_type
+      from payments
+    walkthrough: |
+      The float sum prints as `0.30000000000000004` and compares unequal to
+      `0.3`. That is not a PostgreSQL defect; it is binary floating point
+      working exactly as specified, because 0.1 has no finite representation in
+      base 2.
+
+      The numeric sum is exactly `0.3` and compares equal. `payments.amount` is
+      `numeric(10,2)`, so `sum(amount)` is `numeric` and the total is exact to
+      the paisa — which is the property an accounting system is built on.
+
+  - title: timestamp versus timestamptz
+    sql: |
+      select timestamp   '2024-03-10 14:00:00'            as naive,
+             timestamptz '2024-03-10 14:00:00+05:30'      as absolute,
+             timestamptz '2024-03-10 14:00:00+05:30' at time zone 'UTC'   as as_utc,
+             timestamptz '2024-03-10 14:00:00+05:30' at time zone 'America/New_York' as as_new_york,
+             date_trunc('month', timestamp '2024-03-10 14:00:00')         as month_start,
+             extract(dow from date '2024-03-10')                          as day_of_week
+    walkthrough: |
+      The first value carries no zone: it is a reading off a clock, and nothing
+      in it says which clock. The second names an offset, so it identifies a
+      single instant, and the two `at time zone` conversions show that same
+      instant expressed in two places.
+
+      `at time zone` is a conversion operator in both directions, which is
+      confusing until you look at the types: applied to a `timestamptz` it
+      returns a `timestamp` in that zone; applied to a `timestamp` it interprets
+      it as being in that zone and returns a `timestamptz`.
+
+      `date_trunc` keeps the type, which is why `date_trunc('month', ts) =
+      date '2024-03-01'` can use an index on `ts` through a range rewrite,
+      whereas `extract(month from ts) = 3` cannot.
+
+  - title: Casting in a filter, and what it costs
+    sql: |
+      select p.product_id,
+             p.product_name,
+             p.unit_price,
+             p.unit_price::integer                 as price_truncated,
+             round(p.unit_price)::integer          as price_rounded,
+             (p.attributes ->> 'warranty_months')  as warranty_text,
+             (p.attributes ->> 'warranty_months')::int as warranty_months
+      from products p
+      where p.category_id = 3
+      order by p.product_id
+    walkthrough: |
+      `::integer` on a `numeric` **rounds** in PostgreSQL rather than
+      truncating, which differs from the C-style behaviour people expect — hence
+      showing both columns. If truncation is wanted, `trunc()` says so.
+
+      The last two columns are the JSONB case. `->>` always returns `text`,
+      because JSON has no fixed schema, so arithmetic on it needs an explicit
+      cast. A filter such as `where (attributes ->> 'warranty_months')::int >
+      12` cannot use an ordinary index on `attributes`; indexing a JSONB field
+      for range queries needs an expression index on exactly that cast
+      expression.
+
+edgeCases:
+  - title: numeric keeps trailing zeros, and that is deliberate
+    body: >-
+      `numeric` stores scale as part of the value, so `1.10` and `1.1` are equal
+      but display differently and `scale()` reports different values. This
+      matters when a result is compared as text rather than as a number — a test
+      that asserts on the string "1.1" fails against "1.10" even though the
+      arithmetic is identical.
+    sql: |
+      select 1.10::numeric                as with_trailing_zero,
+             1.1::numeric                 as without,
+             1.10::numeric = 1.1::numeric as are_equal,
+             scale(1.10::numeric)         as scale_of_first,
+             scale(1.1::numeric)          as scale_of_second
+
+  - title: Dividing by zero aborts the whole query
+    body: >-
+      Integer and numeric division by zero raise an error, which cancels the
+      entire statement — not just the offending row. Floating-point division by
+      zero also raises in PostgreSQL, unlike IEEE 754's infinity. `NULLIF(d, 0)`
+      is the standard guard, and it is why the aggregation lessons use it in
+      every percentage calculation.
+    sql: |
+      select 10 / nullif(0, 0)      as guarded_division,
+             10.0 / nullif(0, 0)    as guarded_numeric,
+             coalesce(10 / nullif(0, 0), -1) as with_fallback
+
+pitfalls:
+  - mistake: Storing currency in double precision
+    why: >-
+      It is the obvious choice if you think of money as "a number with
+      decimals", and it works perfectly in every test. The error is in the
+      fifteenth significant digit and accumulates across millions of rows.
+    fix: >-
+      `numeric(12,2)`, or store integer minor units (paise, cents) in a
+      `bigint`. Both are exact; the second is faster and shifts the formatting
+      burden to the application.
+
+  - mistake: Using timestamp without time zone for events
+    why: >-
+      It looks simpler, and on a single server in a single zone it behaves
+      correctly. It stops behaving correctly the first time a server, a client
+      or a developer is in a different zone, and the stored history is then
+      genuinely ambiguous — the information needed to fix it was never recorded.
+    fix: >-
+      `timestamptz` by default. Store the instant; convert for display at the
+      edge. Use `timestamp` only for zone-less wall-clock concepts.
+
+  - mistake: Comparing a column to a differently-typed literal
+    why: >-
+      PostgreSQL may cast the **column** rather than the literal, which turns
+      `col = '123'` into `col::text = '123'` and makes an index on `col`
+      unusable. The query is correct and slow, which is harder to notice than
+      incorrect and fast.
+    fix: >-
+      Match the types, or cast the literal: `col = '123'::integer`. Check with
+      EXPLAIN whether the index is still being used.
+
+  - mistake: Choosing varchar(n) by guessing n
+    why: >-
+      There is no storage or speed benefit in PostgreSQL, and the guess
+      eventually turns into a production error when a real value exceeds it.
+    fix: >-
+      Use `text` unless the limit is a real rule you would want enforced — a
+      two-letter country code, a fixed-length reference. Then `varchar(2)` or a
+      CHECK constraint documents it.
+
+performance: |
+  `numeric` arithmetic is roughly an order of magnitude slower than `bigint` or
+  `double precision` because it runs in software. For a reporting query over a
+  few million rows that is usually irrelevant next to the I/O. For a hot inner
+  loop over hundreds of millions it is not, and integer minor units are the
+  standard answer.
+
+  Type mismatches are a common invisible cost. An implicit cast on the
+  **indexed side** of a comparison prevents the index from being used; a cast on
+  the literal side is free, because it happens once. `EXPLAIN` shows the
+  difference as `Seq Scan` versus `Index Scan`, and the query text looks
+  identical in both cases.
+
+  Narrower integer types save space but rarely time, because PostgreSQL aligns
+  columns on word boundaries. Ordering columns in a table from widest to
+  narrowest can genuinely reduce row size through reduced padding — a real
+  optimisation, and a micro one.
+
+interviewQuestions:
+  - question: Why should money not be stored as a float?
+    answer: >-
+      Binary floating point cannot represent most decimal fractions exactly, so
+      values such as 0.1 are approximations and the error accumulates over
+      repeated addition. Totals then disagree with hand-calculated figures by
+      tiny amounts that cannot be traced to any single transaction, and equality
+      comparisons behave unpredictably. The correct types are `numeric`/`decimal`,
+      which is exact decimal arithmetic, or an integer count of minor units.
+      The cost of numeric is CPU time, which is almost always the right trade.
+
+  - question: What is the difference between timestamp and timestamptz?
+    answer: >-
+      `timestamptz` identifies an absolute instant: PostgreSQL normalises the
+      input to UTC on storage and converts to the session time zone on output.
+      `timestamp` is a wall-clock reading with no zone attached, so the same
+      stored value means different instants in different places. Neither type
+      stores the original zone name. Default to `timestamptz` for recorded
+      events; `timestamp` is appropriate only for genuinely zone-less concepts.
+
+  - question: Does varchar(50) perform better than text in PostgreSQL?
+    answer: >-
+      No. They use the same storage and the same code path; `varchar(n)` adds a
+      length check on write. Choose `varchar(n)` when the limit is a business
+      rule worth enforcing and `text` otherwise. This differs from some other
+      systems where declared length affects row layout, which is where the
+      belief comes from.
+
+  - question: How can a type mismatch make a query slow?
+    answer: >-
+      When PostgreSQL resolves a comparison by casting the indexed column rather
+      than the constant — for example comparing a `bigint` column to a `numeric`
+      literal in a way that promotes the column — the index is on the original
+      values and no longer matches the expression being tested, so the planner
+      falls back to a sequential scan. The query still returns the right answer.
+      The tell is an `Index Scan` becoming a `Seq Scan` in EXPLAIN after a
+      seemingly cosmetic change, and the fix is to make the literal's type match
+      the column's.
+
+exercises:
+  - prompt: >-
+      For each payment method, return the number of payments and the total
+      amount rounded to two decimal places, plus the average payment as a
+      numeric with two decimals. Columns method, payments, total, average.
+    difficulty: Easy
+    hint: >-
+      `amount` is already numeric, so no cast is needed — but `avg` returns a
+      numeric with many decimal places, so round it.
+    solutionSql: |
+      select method,
+             count(*)                 as payments,
+             round(sum(amount), 2)    as total,
+             round(avg(amount), 2)    as average
+      from payments
+      group by method
+      order by method
+
+  - prompt: >-
+      Return each product's warranty in months as an integer, treating a missing
+      warranty_months attribute as 0. Columns product_id, product_name,
+      warranty_months. Order by warranty_months descending then product_id.
+    difficulty: Medium
+    hint: >-
+      `attributes ->> 'warranty_months'` gives text or NULL; cast it and wrap in
+      COALESCE. Cast first, then coalesce, so the types line up.
+    solutionSql: |
+      select product_id,
+             product_name,
+             coalesce((attributes ->> 'warranty_months')::int, 0) as warranty_months
+      from products
+      order by warranty_months desc, product_id
+
+  - prompt: >-
+      Show, for each order placed in 2023, the number of whole days between
+      order_date and ship_date, leaving it NULL when the order never shipped.
+      Return order_id, order_date, ship_date, days_to_ship for the first ten
+      orders by order_id.
+    difficulty: Medium
+    hint: >-
+      Subtracting one date from another in PostgreSQL gives an integer number of
+      days directly — no interval, no extract.
+    solutionSql: |
+      select order_id,
+             order_date,
+             ship_date,
+             ship_date - order_date as days_to_ship
+      from orders
+      where order_date >= date '2023-01-01'
+        and order_date <  date '2024-01-01'
+      order by order_id
+      limit 10
+
+checklist:
+  - Integer division truncates; make one operand numeric to avoid it
+  - "Money is numeric or integer minor units, never float"
+  - text and varchar(n) perform identically in PostgreSQL; text is the default
+  - timestamptz stores an instant, timestamp stores a wall-clock reading
+  - "Default to timestamptz for events; convert at the edges"
+  - "`::` and CAST are the same; CAST is portable"
+  - A cast applied to the indexed column defeats the index; a cast on the literal does not
+  - "`->>` always returns text, so JSON values need an explicit cast before arithmetic"
+
+related:
+  - f-select-basics
+  - i-datetime-string
+  - i-json
+  - p-indexes
+
+dialect:
+  standard: >-
+    CAST, numeric/decimal, the date and time types, and intervals are standard.
+    So is the rule that integer division truncates.
+  postgres: >-
+    Adds the `::` cast shorthand, `pg_typeof`, `timestamptz` as a distinct type,
+    `at time zone` in both directions, arrays, ranges, `jsonb` and `uuid`.
+    Casting numeric to integer rounds rather than truncates. Division by zero
+    raises an error for floats too, rather than producing infinity.
+  mysql: >-
+    DATETIME is zone-less and TIMESTAMP is zone-converted but limited to 2038;
+    the naming is close to the opposite of PostgreSQL's and is a frequent
+    migration bug. MySQL performs much looser implicit conversion — comparing a
+    string to a number coerces the string, so `'abc' = 0` is true in
+    non-strict mode. VARCHAR length does affect index size in MySQL, so the
+    "use text" advice does not transfer.

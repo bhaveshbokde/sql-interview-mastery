@@ -1,0 +1,271 @@
+id: p14-rank-vs-dense-rank
+position: 130
+title: Rank, dense rank and the ties that separate them
+slug: rank-vs-dense-rank
+difficulty: Easy
+topic: Window functions
+tags: [ranking, ties, row-number, comparison]
+
+orderSensitive: true
+
+statement: |
+  Produce a leaderboard of Chemistry scores showing all three ranking
+  functions side by side, plus the gap to the top score and each student's
+  percentile.
+
+  Order by score descending then student id. The point of the exercise is to
+  make the three columns disagree, so the result must include the tied group.
+
+tables: [exam_scores]
+
+expectedColumns: [student_id, score, row_num, rank, dense_rank, gap_to_top, percentile]
+
+edgeCases:
+  - >-
+    Three Chemistry students share a score of 80, which is what makes the
+    three functions differ.
+  - >-
+    ROW_NUMBER without a tiebreak is not reproducible, so the window needs
+    student_id as a second key even though the question is about ties.
+  - >-
+    percent_rank and cume_dist return double precision, so rounding them
+    requires a cast.
+  - "RANK leaves gaps after a tie; DENSE_RANK does not. Neither is a defect."
+
+hints:
+  - Three ranking functions over one shared window definition.
+  - "`max(score) over ()` gives the top score on every row."
+  - A named WINDOW clause keeps the three definitions from drifting apart.
+
+solutionSql: |
+  select student_id,
+         score,
+         row_number() over w                                          as row_num,
+         rank()       over (order by score desc)                      as rank,
+         dense_rank() over (order by score desc)                      as dense_rank,
+         max(score) over () - score                                   as gap_to_top,
+         round((cume_dist() over (order by score))::numeric, 3)       as percentile
+  from exam_scores
+  where subject = 'Chemistry'
+  window w as (order by score desc, student_id)
+  order by score desc, student_id
+
+explanation:
+  lineByLine:
+    - clause: "window w as (order by score desc, student_id)"
+      note: >-
+        A named window with a unique tiebreak, used by ROW_NUMBER. The
+        tiebreak makes the numbering reproducible; without it the three tied
+        students could be numbered in any order.
+    - clause: "rank() over (order by score desc)"
+      note: >-
+        Deliberately **without** the tiebreak. Adding student_id would make
+        every row's ordering key unique, so no rows would tie and RANK would
+        behave like ROW_NUMBER — which would hide the very difference the
+        query is demonstrating.
+    - clause: "dense_rank() over (order by score desc)"
+      note: >-
+        Same window as RANK. The two differ only in whether the number after
+        a tie skips.
+    - clause: "max(score) over ()"
+      note: >-
+        An unordered window, so the frame is every row and the value is the
+        overall maximum. Subtracting gives each student's distance from the
+        leader.
+    - clause: "(cume_dist() over (order by score))::numeric"
+      note: >-
+        Ascending order, so a high score gives a high percentile. The cast is
+        needed because cume_dist returns double precision and the
+        two-argument round exists only for numeric.
+
+  walkthrough: |
+    Eight Chemistry scores, with three students tied at 80 — the highest
+    score in the subject.
+
+    `row_num` gives those three 1, 2 and 3, chosen by the student_id
+    tiebreak. `rank` gives all three 1 and then jumps to 4. `dense_rank`
+    gives all three 1 and then 2.
+
+    So "who came second in Chemistry?" has three different answers depending
+    on the function. `row_number = 2` is one of the tied leaders.
+    `rank = 2` is nobody at all. `dense_rank = 2` is the student on 73, which
+    is the answer a human would give.
+
+    `gap_to_top` is 0 for the tied group and grows below it, which is a more
+    useful column than any of the ranks when the question is "how far behind
+    are they".
+
+    `percentile` from `cume_dist` reaches exactly 1.0 at the top, since
+    cume_dist is the proportion of rows at or before the current one.
+
+  alternatives:
+    - title: NTILE buckets instead of ranks
+      sql: |
+        select student_id,
+               score,
+               ntile(4) over (order by score desc, student_id) as quartile,
+               round((percent_rank() over (order by score))::numeric, 3) as percent_rank,
+               round((cume_dist()    over (order by score))::numeric, 3) as cume_dist
+        from exam_scores
+        where subject = 'Chemistry'
+        order by score desc, student_id
+      when: >-
+        When the question is "which quarter of the class" rather than "what
+        position". Note that NTILE splits by row position, so two of the
+        three students tied on 80 land in quartile 1 and one in quartile 2 —
+        a value-based split would not do that.
+      equivalent: false
+
+    - title: Counting higher scores, the pre-window-function form
+      sql: |
+        select e.student_id,
+               e.score,
+               (select count(*) from exam_scores e2
+                where e2.subject = e.subject and e2.score > e.score) + 1 as rank_manual,
+               (select count(distinct e2.score) from exam_scores e2
+                where e2.subject = e.subject and e2.score > e.score) + 1 as dense_rank_manual
+        from exam_scores e
+        where e.subject = 'Chemistry'
+        order by e.score desc, e.student_id
+      when: >-
+        On a database without window functions, and as a way to see what the
+        two functions mean. Counting **rows** above gives RANK; counting
+        **distinct values** above gives DENSE_RANK. That is the definition,
+        and seeing it written out is the clearest explanation of the
+        difference.
+      equivalent: true
+
+  performance: |
+    All the ranking functions need the input sorted by the window's ordering
+    keys. Functions sharing an identical window specification share one sort —
+    here `rank` and `dense_rank` share one, and `row_number` needs a different
+    one because its window has the extra tiebreak.
+
+    That is a real cost worth knowing: the apparently cosmetic decision to add
+    a tiebreak to one window and not another doubles the number of sorts. In
+    this query it is deliberate, because the comparison requires it.
+
+    An index on `(subject, score desc)` would supply the ordering for the
+    two-key windows and remove their sorts. The `over ()` window for
+    `max(score)` needs no sort at all.
+
+    The counting alternative runs two correlated subqueries per row and is
+    quadratic. On eight rows it is instant; it is shown for its explanatory
+    value, not as a technique.
+
+  wrongApproaches:
+    - title: Adding a tiebreak to RANK and losing the point
+      sql: |
+        select student_id,
+               score,
+               row_number() over w as row_num,
+               rank()       over w as rank,
+               dense_rank() over w as dense_rank
+        from exam_scores
+        where subject = 'Chemistry'
+        window w as (order by score desc, student_id)
+        order by score desc, student_id
+      whyWrong: >-
+        With student_id in the window's ORDER BY, no two rows tie on the
+        ordering keys, so all three functions return identical values. The
+        query runs and produces a table in which RANK and DENSE_RANK appear
+        to be the same thing — which is exactly the misconception the exercise
+        exists to correct.
+
+    - title: Using ROW_NUMBER to answer "who came second"
+      sql: |
+        select student_id, score
+        from (select student_id, score,
+                     row_number() over (order by score desc, student_id) as rn
+              from exam_scores
+              where subject = 'Chemistry') t
+        where rn = 2
+      whyWrong: >-
+        Returns one of the three students tied at the top, because ROW_NUMBER
+        numbers rows rather than positions. The student it picks is decided
+        by the tiebreak, so the query is reproducible and wrong — the worst
+        combination, since the answer never varies and never has to be
+        explained.
+
+  extraTests:
+    - name: No ties at all (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt's Physics scores are all distinct, so the three
+        functions agree on every row. Running the query there and here is the
+        clearest demonstration that they differ only on ties — and that a
+        query validated on data without ties tells you nothing about which
+        function you needed.
+      sql: |
+        select student_id,
+               score,
+               row_number() over w                                     as row_num,
+               rank()       over (order by score desc)                 as rank,
+               dense_rank() over (order by score desc)                 as dense_rank,
+               max(score) over () - score                              as gap_to_top,
+               round((cume_dist() over (order by score))::numeric, 3)  as percentile
+        from exam_scores
+        where subject = 'Physics'
+        window w as (order by score desc, student_id)
+        order by score desc, student_id
+
+    - name: A tie at the very top (alternate dataset)
+      schema: learning_alt
+      note: >-
+        Mathematics in learning_alt has two students on exactly 50. RANK gives
+        both 1 and there is no rank 2; DENSE_RANK also gives both 1 and there
+        is no rank 2 either, because there is no second distinct value. The
+        two agree here for a different reason than usual, which is worth
+        seeing.
+      sql: |
+        select student_id,
+               score,
+               row_number() over (order by score desc, student_id) as row_num,
+               rank()       over (order by score desc)             as rank,
+               dense_rank() over (order by score desc)             as dense_rank
+        from exam_scores
+        where subject = 'Mathematics'
+        order by score desc, student_id
+
+  followUps:
+    - question: Which ranking function would you use for "the top 3 scores"?
+      answer: >-
+        RANK, filtered to `<= 3`, if "top 3 scores" means the three highest
+        positions and ties at the boundary should all be included. DENSE_RANK
+        if it means the three highest distinct values, which can be many more
+        rows. ROW_NUMBER only if exactly three rows are required and an
+        arbitrary choice among ties is acceptable — in which case a
+        deterministic tiebreak makes that arbitrary choice at least
+        reproducible.
+
+    - question: Why does RANK skip numbers?
+      answer: >-
+        Because it reports the position in the ordering, and three rows tied
+        at the top genuinely occupy positions 1, 2 and 3 — so the next
+        distinct value is in position 4. It is the convention a sporting
+        league uses. DENSE_RANK reports the position among distinct values
+        instead, so it never skips. Neither is more correct; they answer
+        different questions and the question should decide.
+
+    - question: What does cume_dist tell you that percent_rank does not?
+      answer: >-
+        `cume_dist` is the proportion of rows at or before the current one, so
+        it ends at exactly 1 and never starts at 0. `percent_rank` is
+        `(rank - 1) / (n - 1)`, so it starts at exactly 0 and ends at 1, and a
+        single-row partition gives 0. For "what percentile is this value in",
+        cume_dist matches the usual meaning; percent_rank is more useful when
+        comparing relative position across partitions of different sizes.
+
+    - question: How would you rank within each subject rather than across one?
+      answer: >-
+        Add `partition by subject` to each window and drop the WHERE clause.
+        Every function then restarts at 1 for each subject, which is the
+        top-N-per-group shape. The fact that this requires only a partition
+        clause, and no restructuring, is the strongest practical argument for
+        learning window functions before the self-join alternatives.
+
+  related:
+    - w-ranking
+    - w-top-n-per-group
+    - p01-second-highest-salary
+    - p10-median-score

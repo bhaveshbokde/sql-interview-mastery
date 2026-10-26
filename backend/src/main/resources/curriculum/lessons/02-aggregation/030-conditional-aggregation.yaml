@@ -1,0 +1,429 @@
+id: a-conditional-aggregation
+moduleId: aggregation
+position: 30
+title: Conditional aggregation and pivoting
+slug: conditional-aggregation
+difficulty: Intermediate
+estimatedMinutes: 25
+summary: >-
+  Counting and summing subsets inside a single grouped query. This is the
+  technique that turns three queries into one, pivots rows into columns, and
+  answers most "show me X by Y broken down by Z" interview questions.
+tags: [filter, case, pivot, conditional-aggregation, interview-favourite]
+
+prerequisites:
+  - a-group-by-having
+
+objectives:
+  - Write a conditional aggregate with FILTER and with CASE
+  - Explain why count(CASE WHEN c THEN 1 ELSE 0 END) is wrong
+  - Pivot rows into columns without any vendor-specific PIVOT syntax
+  - Compute a ratio between two subsets of the same group safely
+  - Use bool_and and bool_or for "all" and "any" questions
+
+concept: |
+  ## The idea
+
+  An aggregate normally consumes every row in its group. A **conditional**
+  aggregate consumes only the rows matching a condition, and several of them
+  with different conditions can sit side by side in one select list over the
+  same group.
+
+  Two spellings:
+
+  ```sql
+  count(*) filter (where status = 'completed')            -- standard SQL
+  count(case when status = 'completed' then 1 end)        -- works everywhere
+  sum(case when status = 'completed' then amount else 0 end)
+  ```
+
+  `FILTER` is standard SQL, supported by PostgreSQL, and clearer. `CASE` is the
+  portable fallback and the one to know for an interview where the database is
+  not specified.
+
+  ## The CASE trap
+
+  These two are not the same:
+
+  ```sql
+  count(case when status = 'cancelled' then 1 end)            -- correct
+  count(case when status = 'cancelled' then 1 else 0 end)     -- WRONG
+  ```
+
+  The second counts every row. `count` ignores NULL, and the first form's
+  implicit `ELSE NULL` is what makes it skip the non-matching rows. Writing
+  `ELSE 0` supplies a value, and 0 is not NULL, so every row is counted.
+
+  With `sum` the relationship is reversed: `sum(case when c then 1 else 0 end)`
+  is correct, and `else 0` can be omitted only because `sum` ignores the NULLs
+  anyway. Getting this backwards is a classic interview stumble, and `FILTER`
+  sidesteps it entirely.
+
+  ## Pivoting
+
+  A pivot turns distinct values of a column into columns of the result. SQL has
+  no portable `PIVOT` operator; conditional aggregation *is* the portable
+  pivot:
+
+  ```sql
+  select country,
+         sum(revenue) filter (where quarter = 1) as q1,
+         sum(revenue) filter (where quarter = 2) as q2,
+         ...
+  from sales group by country
+  ```
+
+  The limitation is structural rather than syntactic: the set of columns must
+  be known when the query is written, because a SQL statement's result shape is
+  fixed before execution. A genuinely dynamic pivot requires generating the SQL
+  from a prior query, or returning JSON and pivoting in the application.
+
+  ## Ratios between subsets
+
+  The reason this technique earns its place is questions like "what share of
+  each customer's orders were cancelled?" — two different subsets of the same
+  group, divided:
+
+  ```sql
+  round(100.0 * count(*) filter (where status = 'cancelled')
+        / nullif(count(*), 0), 1)
+  ```
+
+  Three things are doing work. `100.0` rather than `100` avoids integer
+  division. `nullif(..., 0)` avoids a division-by-zero error that would abort
+  the whole statement. And both counts come from one pass over the data rather
+  than two correlated subqueries.
+
+  ## "All" and "any"
+
+  `bool_and(cond)` is true when every row in the group satisfies the condition;
+  `bool_or(cond)` is true when at least one does. They read better than
+  `count(*) filter (where not cond) = 0` and compute the same thing.
+
+syntax:
+  - form: "aggregate(expr) FILTER (WHERE condition)"
+    notes: >-
+      Standard SQL. Applies to any aggregate, including count(*), and can be
+      combined with DISTINCT.
+  - form: "count(CASE WHEN condition THEN 1 END)"
+    notes: >-
+      The portable conditional count. Never add ELSE 0 — count would then count
+      every row.
+  - form: "sum(CASE WHEN condition THEN value ELSE 0 END)"
+    notes: >-
+      The portable conditional sum. ELSE 0 is safe here and ELSE NULL is
+      equivalent, since sum ignores NULLs.
+  - form: "bool_and(condition) | bool_or(condition)"
+    notes: '"Every row" and "at least one row". PostgreSQL spelling of EVERY/SOME.'
+  - form: "avg(expr) FILTER (WHERE condition)"
+    notes: >-
+      Averages only the matching rows, and returns NULL when none match — which
+      is correct, since the average of nothing is undefined.
+
+sampleTables: [orders, order_items, customers, employees, daily_sales]
+
+examples:
+  - title: FILTER and CASE, and the ELSE 0 trap
+    sql: |
+      select count(*)                                              as all_orders,
+             count(*) filter (where status = 'cancelled')          as cancelled_filter,
+             count(case when status = 'cancelled' then 1 end)      as cancelled_case_ok,
+             count(case when status = 'cancelled' then 1 else 0 end) as cancelled_case_wrong,
+             sum(case when status = 'cancelled' then 1 else 0 end) as cancelled_sum
+      from orders
+    walkthrough: |
+      Three of these columns are the same number and one is not.
+      `cancelled_case_wrong` equals `all_orders`, because every row produced
+      either 1 or 0 and `count` counts both — it only skips NULL.
+
+      `cancelled_case_ok` omits the ELSE, so non-matching rows produce NULL and
+      are skipped. `cancelled_sum` adds 1 per match and 0 otherwise, which is
+      the correct form for `sum`.
+
+      The lesson is not "remember which" but "use FILTER", which has no version
+      that silently means something else.
+
+  - title: Pivoting quarters into columns
+    sql: |
+      select o.shipping_country,
+             count(*)                                                          as orders,
+             count(*) filter (where extract(quarter from o.order_date) = 1)    as q1,
+             count(*) filter (where extract(quarter from o.order_date) = 2)    as q2,
+             count(*) filter (where extract(quarter from o.order_date) = 3)    as q3,
+             count(*) filter (where extract(quarter from o.order_date) = 4)    as q4
+      from orders o
+      where o.order_date >= date '2023-01-01'
+        and o.order_date <  date '2024-01-01'
+        and o.status <> 'cancelled'
+      group by o.shipping_country
+      order by orders desc, o.shipping_country
+    walkthrough: |
+      One row per country, four quarter columns, one scan of the table. The
+      alternative — four queries joined together, or four correlated
+      subqueries — reads the data four times for the same answer.
+
+      The four quarter columns sum to `orders` in every row, which is a useful
+      self-check to build into a pivot: if they do not, a row fell outside every
+      bucket and the conditions do not cover the domain.
+
+      The column list is fixed at write time. Pivoting on something open-ended,
+      like product name, cannot be done this way in one statement.
+
+  - title: Ratios between two subsets of the same group
+    sql: |
+      select c.segment,
+             count(distinct c.customer_id)                                as customers,
+             count(o.order_id)                                            as orders,
+             count(o.order_id) filter (where o.status = 'cancelled')      as cancelled,
+             count(o.order_id) filter (where o.ship_date is not null)     as shipped,
+             round(100.0 * count(o.order_id) filter (where o.status = 'cancelled')
+                   / nullif(count(o.order_id), 0), 1)                     as cancel_pct,
+             round(avg(o.ship_date - o.order_date)
+                   filter (where o.ship_date is not null), 1)             as avg_days_to_ship
+      from customers c
+      left join orders o on o.customer_id = c.customer_id
+      group by c.segment
+      order by c.segment
+    walkthrough: |
+      `nullif(count(o.order_id), 0)` guards a segment in which nobody ordered.
+      Without it, one such segment raises a division-by-zero error that cancels
+      the entire query — not just that row.
+
+      The last column shows `FILTER` on something other than `count`. Averaging
+      `ship_date - order_date` over only the shipped orders is more honest than
+      letting the unshipped ones be silently excluded by NULL propagation,
+      because the intent is written down rather than inferred.
+
+      The LEFT JOIN keeps segments with no orders at all, and `count(o.order_id)`
+      rather than `count(*)` reports 0 for them.
+
+  - title: All, any, and a quick data-quality check
+    sql: |
+      select d.dept_id,
+             count(e.emp_id)                                          as employees,
+             bool_and(e.is_active)                                    as everyone_active,
+             bool_or(e.salary > 200000)                               as has_a_200k_earner,
+             bool_and(e.manager_id is not null)                       as everyone_has_a_manager,
+             count(*) filter (where e.manager_id is null)             as without_manager
+      from departments d
+      join employees e on e.dept_id = d.dept_id
+      group by d.dept_id
+      order by d.dept_id
+    walkthrough: |
+      `bool_and` and `bool_or` are the aggregate forms of "for all" and "there
+      exists". They are shorter than the equivalent counts and they say what
+      they mean.
+
+      One subtlety: `bool_and` over an empty group returns NULL, not true. The
+      mathematically-minded expect true, since every element of the empty set
+      satisfies anything. SQL returns NULL because that is what every aggregate
+      does with no input. An inner join is used here precisely to avoid the
+      empty group; with a LEFT JOIN, Research would show NULL in all three
+      boolean columns.
+
+edgeCases:
+  - title: FILTER combined with DISTINCT
+    body: >-
+      The two modifiers compose: DISTINCT inside the parentheses, FILTER after
+      them. The combination answers "how many distinct customers ordered in
+      each quarter" in a single pass, which is awkward to express any other way.
+    sql: |
+      select extract(quarter from order_date)                  as quarter,
+             count(distinct customer_id)                       as customers,
+             count(distinct customer_id) filter (where status = 'completed') as completed_customers
+      from orders
+      where order_date >= date '2023-01-01'
+        and order_date <  date '2024-01-01'
+      group by 1
+      order by 1
+
+  - title: An aggregate whose filter matches nothing
+    body: >-
+      `count` returns 0 and `avg` returns NULL, consistently with the
+      empty-input rule. The group still appears — the filter restricts what the
+      aggregate consumes, not which groups exist. That is the difference between
+      FILTER and a WHERE clause, and the reason both exist.
+    sql: |
+      select status,
+             count(*)                                             as orders,
+             count(*) filter (where shipping_country = 'Antarctica') as antarctic,
+             avg(order_id) filter (where shipping_country = 'Antarctica') as antarctic_avg
+      from orders
+      group by status
+      order by status
+
+pitfalls:
+  - mistake: "count(case when c then 1 else 0 end)"
+    why: >-
+      count ignores NULL, not zero. With ELSE 0 every row produces a non-NULL
+      value, so the result is the group size. It is a very common interview
+      answer and it is wrong.
+    fix: >-
+      Drop the ELSE, use sum instead of count, or use FILTER. FILTER has no
+      variant that means something else.
+
+  - mistake: Dividing two conditional counts without guarding the denominator
+    why: >-
+      A group where the denominator is zero raises division by zero, which
+      aborts the entire statement. It will not happen in your sample data and
+      will happen in production.
+    fix: >-
+      `nullif(denominator, 0)`. The cell becomes NULL, which is the honest
+      answer for a ratio that is undefined.
+
+  - mistake: Forgetting that FILTER does not remove groups
+    why: >-
+      It restricts what one aggregate sees, so a group where nothing matches
+      still appears with 0 or NULL. People expect it to behave like WHERE.
+    fix: >-
+      That is usually the desired behaviour. When it is not, add a HAVING
+      clause on the filtered aggregate.
+
+  - mistake: Trying to pivot on a value set that is not known in advance
+    why: >-
+      A SQL statement's result columns are fixed before execution, so the
+      column list cannot depend on the data.
+    fix: >-
+      Generate the SQL from a prior query, aggregate into JSON or an array and
+      expand in the application, or use PostgreSQL's `crosstab` from the
+      tablefunc extension — which still requires the column list up front.
+
+performance: |
+  Several `FILTER` aggregates over one group are computed in a **single pass**.
+  The equivalent written as several correlated subqueries, or as a join of
+  several grouped queries, reads the table once per metric. On a large fact
+  table that is the difference between one scan and six.
+
+  `FILTER` and the `CASE` form compile to essentially the same plan, so the
+  choice is about clarity rather than speed.
+
+  `count(distinct x) filter (...)` is the expensive combination: each group must
+  deduplicate, and the filter does not reduce that work proportionally. When
+  several such columns appear together, aggregating in two stages — distinct
+  first in a CTE, then counted — is sometimes dramatically faster.
+
+interviewQuestions:
+  - question: How do you count two different conditions in one query without subqueries?
+    answer: >-
+      Conditional aggregation: `count(*) filter (where cond1)` and `count(*)
+      filter (where cond2)` side by side in one grouped select, or the portable
+      `count(case when cond then 1 end)` form. Both are computed in a single
+      pass over the data, whereas correlated subqueries or joined grouped
+      queries read the table once per metric.
+
+  - question: Why is `count(case when x then 1 else 0 end)` wrong?
+    answer: >-
+      Because count ignores only NULL, and `ELSE 0` supplies a non-NULL value
+      for every non-matching row, so the result is the total row count. The
+      correct forms are `count(case when x then 1 end)`, relying on the implicit
+      ELSE NULL, or `sum(case when x then 1 else 0 end)`, or `count(*) filter
+      (where x)`. The sum form is the one where ELSE 0 is appropriate, which is
+      exactly why the two get confused.
+
+  - question: How would you pivot rows into columns in standard SQL?
+    answer: >-
+      Conditional aggregation — one aggregate per output column, each filtered
+      to its value. There is no portable PIVOT operator; SQL Server and Oracle
+      have proprietary ones and PostgreSQL offers crosstab in the tablefunc
+      extension. All of them require the column list to be known when the query
+      is written, because a statement's result shape is fixed before execution.
+      A truly dynamic pivot means generating SQL or returning JSON.
+
+  - question: What does FILTER do that WHERE cannot?
+    answer: >-
+      WHERE removes rows before grouping, so it affects every aggregate in the
+      query and can eliminate groups entirely. FILTER restricts one aggregate's
+      input while leaving the group and the other aggregates intact, which is
+      what makes several differently-filtered metrics possible in the same row.
+      FILTER is standard SQL since SQL:2003 and is implemented by PostgreSQL and
+      SQLite, but not by MySQL or SQL Server.
+
+exercises:
+  - prompt: >-
+      For each order status, show the number of orders, how many shipped within
+      7 days, and the percentage that did, rounded to one decimal. Columns
+      status, orders, within_7_days, pct_within_7_days.
+    difficulty: Medium
+    hint: >-
+      `ship_date - order_date <= 7` inside a FILTER. Guard the division with
+      nullif even though count(*) cannot be zero here — the habit is the point.
+    solutionSql: |
+      select status,
+             count(*)                                                     as orders,
+             count(*) filter (where ship_date - order_date <= 7)          as within_7_days,
+             round(100.0 * count(*) filter (where ship_date - order_date <= 7)
+                   / nullif(count(*), 0), 1)                              as pct_within_7_days
+      from orders
+      group by status
+      order by status
+
+  - prompt: >-
+      Pivot employees by department: one row per dept_id with counts of
+      employees in three salary bands — under 100000, 100000 to 199999, and
+      200000 or more. Columns dept_id, band_low, band_mid, band_high, total.
+    difficulty: Medium
+    hint: >-
+      Three FILTER counts whose conditions do not overlap. The three should sum
+      to total in every row.
+    solutionSql: |
+      select dept_id,
+             count(*) filter (where salary < 100000)                        as band_low,
+             count(*) filter (where salary >= 100000 and salary < 200000)   as band_mid,
+             count(*) filter (where salary >= 200000)                       as band_high,
+             count(*)                                                       as total
+      from employees
+      where dept_id is not null
+      group by dept_id
+      order by dept_id
+
+  - prompt: >-
+      For each region in daily_sales, return total revenue in January 2024,
+      total revenue in February 2024, and the percentage change between them
+      rounded to one decimal. Columns region, jan, feb, pct_change.
+    difficulty: Hard
+    hint: >-
+      Two filtered sums, then `(feb - jan) / jan * 100` — repeat the sums in the
+      expression or wrap the whole thing in a subquery to reuse the aliases.
+    solutionSql: |
+      select region,
+             round(jan, 2) as jan,
+             round(feb, 2) as feb,
+             round(100.0 * (feb - jan) / nullif(jan, 0), 1) as pct_change
+      from (select region,
+                   sum(revenue) filter (where sale_date >= date '2024-01-01'
+                                          and sale_date <  date '2024-02-01') as jan,
+                   sum(revenue) filter (where sale_date >= date '2024-02-01'
+                                          and sale_date <  date '2024-03-01') as feb
+            from daily_sales
+            group by region) m
+      order by region
+
+checklist:
+  - "FILTER (WHERE ...) restricts one aggregate's input; WHERE restricts the whole query's"
+  - "count(case when c then 1 else 0 end) counts every row — drop the ELSE or use sum"
+  - Several filtered aggregates over one group cost one pass, not one pass each
+  - Conditional aggregation is the portable pivot, and the column list must be fixed
+  - Always guard a ratio's denominator with nullif(x, 0)
+  - "Multiply by 100.0, not 100, to avoid integer division"
+  - FILTER leaves the group in place even when nothing matches
+  - "bool_and and bool_or express \"all\" and \"any\"; both return NULL over an empty group"
+
+related:
+  - a-group-by-having
+  - a-aggregates
+  - w-basics
+  - p15-pivot-sales-by-quarter
+
+dialect:
+  standard: >-
+    FILTER (WHERE ...) is standard SQL from SQL:2003. CASE is standard. EVERY()
+    and SOME()/ANY() are the standard names for bool_and and bool_or.
+  postgres: >-
+    Implements FILTER on every aggregate, including with DISTINCT, and provides
+    bool_and/bool_or as well as the standard EVERY. The tablefunc extension adds
+    crosstab for pivoting, which still needs a static column list.
+  mysql: >-
+    No FILTER clause — conditional aggregation must use CASE, or the fact that a
+    boolean expression evaluates to 1 or 0, so `sum(status = 'cancelled')`
+    works. No bool_and/bool_or; `min(cond)` and `max(cond)` over the 0/1 values
+    serve the same purpose.

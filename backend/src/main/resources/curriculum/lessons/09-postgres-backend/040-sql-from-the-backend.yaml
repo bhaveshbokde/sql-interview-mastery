@@ -1,0 +1,525 @@
+id: pg-backend-integration
+moduleId: postgres-backend
+position: 40
+title: SQL from a Spring Boot backend
+slug: sql-from-the-backend
+difficulty: Advanced
+estimatedMinutes: 30
+summary: >-
+  Connection pooling, prepared statements, transaction boundaries, the JPA
+  behaviours that generate surprising SQL, and SQL injection — the part of the
+  interview where the database meets the application that calls it.
+tags: [jdbc, jpa, hikari, connection-pool, sql-injection, spring]
+
+prerequisites:
+  - t-acid-isolation
+  - p-query-patterns
+
+objectives:
+  - Size a connection pool and say why bigger is not better
+  - Explain how a prepared statement prevents SQL injection
+  - Place transaction boundaries correctly and name the usual mistakes
+  - Recognise N+1, LazyInitializationException and the open-session-in-view trap
+  - Choose between JDBC, JdbcTemplate and JPA for a given problem
+
+concept: |
+  ## Connection pooling
+
+  Opening a PostgreSQL connection forks a backend process — expensive, tens of
+  milliseconds. A pool keeps a set open and hands them out. Spring Boot uses
+  **HikariCP** by default.
+
+  The counter-intuitive part is **sizing**. More connections is not faster
+  past a modest number, because the database can only usefully run as many
+  queries at once as it has cores and disk bandwidth. Beyond that, extra
+  connections add context switching, lock contention and memory. PostgreSQL's
+  own guidance is roughly `((core_count * 2) + effective_spindle_count)`,
+  which for a typical 8-core server is around 20 — far smaller than the 100
+  people guess.
+
+  A pool that is too large turns a database problem into a worse database
+  problem. A pool that is too small shows up as connection-acquisition
+  timeouts, which is a clearer signal.
+
+  Each PostgreSQL connection is a process with its own memory, and `work_mem`
+  is per sort node per connection, so the worst-case memory use is roughly
+  `max_connections × work_mem × nodes`. That multiplication is why
+  `max_connections = 1000` with a generous `work_mem` is a way to run a server
+  out of memory. **PgBouncer** in transaction-pooling mode is the standard
+  answer when many application instances each need a pool.
+
+  Settings worth knowing: `maximum-pool-size`, `connection-timeout` (how long
+  a caller waits for a connection), `max-lifetime` (recycle below any network
+  idle timeout), and `leak-detection-threshold`, which logs a stack trace for
+  a connection held too long and is the fastest way to find the code that
+  forgot to close one.
+
+  ## Prepared statements and injection
+
+  ```java
+  // Vulnerable
+  "select * from users where email = '" + email + "'"
+
+  // Safe
+  jdbc.query("select * from users where email = ?", mapper, email);
+  ```
+
+  The protection is **structural**, not sanitising. The statement is parsed
+  and planned **before** the parameter is supplied, so the parameter can never
+  become part of the statement's structure. There is no string to escape and
+  no escaping to get wrong.
+
+  What parameters cannot do is substitute **identifiers** — table names,
+  column names, sort directions. `order by ?` does not work. When those must
+  be dynamic, validate against an allow-list of known-good values and
+  concatenate the value from the list, never the user's string. That is
+  exactly what `DatasetController.requireAllowedSchema` in this application
+  does, and the reason it returns the matched entry rather than the caller's
+  input.
+
+  PostgreSQL also caches plans for prepared statements, which saves parsing on
+  repeated execution. The subtlety is that after five executions the driver
+  may switch to a **generic plan** computed without knowledge of the
+  parameters — usually fine, occasionally much worse for skewed data.
+  `plan_cache_mode` controls it.
+
+  ## Transaction boundaries
+
+  `@Transactional` on a service method is the normal placement: one
+  transaction per business operation, started as late as possible and
+  committed as soon as possible.
+
+  Four things that catch people:
+
+  - **Self-invocation does not work.** Spring's proxy intercepts calls from
+    outside the bean. A method calling another `@Transactional` method on
+    `this` gets no new transaction, silently.
+  - **Checked exceptions do not roll back by default.** Only
+    `RuntimeException` and `Error` do. `@Transactional(rollbackFor =
+    Exception.class)` changes it.
+  - **Slow work inside a transaction.** An HTTP call or a file write inside a
+    transaction holds its connection, its locks and its snapshot for the
+    duration of someone else's latency. This is the most damaging of the four.
+  - **`readOnly = true`** is more than a hint: it sets the transaction read
+    only, which lets PostgreSQL skip some work and makes an accidental write
+    fail loudly.
+
+  ## JPA behaviours worth knowing
+
+  **N+1** — the default. Fetching N entities and touching a lazy association
+  in a loop issues N more queries. Fixes: `join fetch`, an entity graph, or
+  `@BatchSize`. The diagnosis is to log the SQL, and `spring.jpa.show-sql` is
+  not enough — use `logging.level.org.hibernate.SQL=DEBUG` with
+  `BasicBinder=TRACE` for the parameters.
+
+  **`LazyInitializationException`** — touching a lazy association after the
+  session closed. The correct fix is to fetch what you need inside the
+  transaction, or to use a projection. The common fix is
+  `spring.jpa.open-in-view=true`, which is on by default and keeps the session
+  open for the whole request — holding a connection for the duration of view
+  rendering and quietly hiding every N+1. Turning it off is generally right
+  and will surface problems that were always there.
+
+  **`FetchType.EAGER`** on `@ManyToOne` is the JPA default, and it means every
+  load of the child also loads the parent. On an entity with four
+  `@ManyToOne`s that is four joins on every query, forever. Make associations
+  `LAZY` and fetch explicitly.
+
+  **The write-behind cache.** Changes to a managed entity are flushed at
+  commit or before a query that might be affected, not when you call the
+  setter. So the SQL happens later than the code reads, which matters for
+  ordering and for debugging.
+
+  ## When to drop to SQL
+
+  JPA is good at loading and saving object graphs. It is poor at reporting
+  queries, bulk operations, window functions, CTEs and anything where you care
+  about the exact SQL.
+
+  `JdbcTemplate` — or jOOQ, or a native query — is the right tool for those,
+  and mixing them in one application is normal rather than a design failure.
+  This application uses `spring-boot-starter-jdbc` with no ORM at all, because
+  its subject is SQL and hiding the SQL would defeat the point.
+
+syntax:
+  - form: "jdbcTemplate.query(\"select ... where col = ?\", mapper, value)"
+    notes: >-
+      A parameterised statement. The structure is fixed before the value is
+      bound, which is what makes it injection-proof. Parameters cannot
+      substitute identifiers.
+  - form: "@Transactional(readOnly = true)"
+    notes: >-
+      Sets the transaction read only, which lets PostgreSQL skip some work and
+      makes an accidental write fail loudly. Not merely a hint.
+  - form: "@Transactional(rollbackFor = Exception.class)"
+    notes: >-
+      By default only RuntimeException and Error trigger a rollback. A checked
+      exception commits unless this is specified.
+  - form: "spring.datasource.hikari.maximum-pool-size"
+    notes: >-
+      Start near (cores × 2) + spindles and measure. Also worth setting
+      leak-detection-threshold, which logs a stack trace for a connection held
+      too long.
+  - form: "spring.jpa.open-in-view=false"
+    notes: >-
+      Stops the persistence context staying open for the whole request. Turning
+      it off surfaces lazy-loading problems that were already there.
+  - form: "SET LOCAL work_mem = '64MB'"
+    notes: >-
+      Raise it for one transaction rather than globally — it is per sort node
+      per worker, so a global increase multiplies.
+
+sampleTables: [employees, orders, order_items, customers, products]
+
+examples:
+  - title: The query a parameterised statement runs
+    sql: |
+      select e.emp_id,
+             e.first_name || ' ' || e.last_name as employee,
+             e.job_title,
+             e.salary
+      from employees e
+      where e.dept_id = 10
+        and e.salary > 120000
+        and e.is_active
+      order by e.salary desc
+    walkthrough: |
+      In application code the two literals would be parameters:
+      `where e.dept_id = ? and e.salary > ?`. The statement text is then
+      constant, which has three consequences.
+
+      It is **injectable-proof**: the structure is fixed before any value
+      arrives, so no value can change it.
+
+      It is **cacheable**: PostgreSQL and the JDBC driver can reuse the parse
+      and, after a few executions, the plan.
+
+      And it is **groupable in monitoring**: `pg_stat_statements` normalises by
+      statement text, so a parameterised query appears as one row with a call
+      count, where a string-concatenated one appears as thousands of distinct
+      statements — which both floods the view and hides the problem.
+
+      That last point is a practical argument for parameters that is rarely
+      mentioned and matters as soon as you try to find a slow query.
+
+  - title: An N+1 collapsed into one statement
+    sql: |
+      select c.customer_id,
+             c.company_name,
+             count(distinct o.order_id)                                      as orders,
+             coalesce(round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2), 0) as revenue,
+             max(o.order_date)                                               as last_order
+      from customers c
+      left join orders o       on o.customer_id = c.customer_id
+      left join order_items oi on oi.order_id   = o.order_id
+      where c.country = 'Ireland'
+      group by c.customer_id, c.company_name
+      order by revenue desc, c.customer_id
+    walkthrough: |
+      The JPA version of this is `customerRepository.findByCountry("Ireland")`
+      followed by a loop touching `customer.getOrders()` and then
+      `order.getItems()` — one query, then N, then N×M.
+
+      Here it is one. The `count(distinct o.order_id)` is necessary rather
+      than stylistic: the join to `order_items` multiplies each order row by
+      its line count, so a plain `count(o.order_id)` would count lines.
+
+      That interaction is the usual reason a hand-written replacement for an
+      N+1 returns different numbers from the loop it replaced, and it is worth
+      checking against the original before shipping.
+
+      In JPA the equivalent fix is
+      `@Query("select c from Customer c left join fetch c.orders where ...")`,
+      which has its own trap: a fetch join to a collection cannot be combined
+      with pagination without Hibernate silently paginating in memory.
+
+  - title: What a read-only transaction can rely on
+    sql: |
+      select current_setting('transaction_read_only')   as read_only,
+             current_setting('transaction_isolation')   as isolation,
+             current_setting('application_name')        as application_name,
+             current_setting('search_path')             as search_path,
+             current_setting('statement_timeout')       as statement_timeout
+    walkthrough: |
+      These are the settings on the connection serving this query, and every
+      one of them was set by the pool's connection-init SQL or by the role
+      definition rather than by the statement.
+
+      `read_only` is `on`, `search_path` is `learning`, and
+      `statement_timeout` is the playground's limit. That configuration lives
+      in `DataSourceConfig.learnerDataSource` and in the role, which means it
+      applies to every connection from that pool regardless of what any
+      individual query does.
+
+      This is the pattern worth copying: connection-level configuration is
+      enforced once, at the pool, rather than remembered at each call site.
+      `@Transactional(readOnly = true)` does the same thing at the Spring
+      level, and the two together mean a write has to get past both.
+
+      Setting `application_name` per pool is a small thing with a large payoff
+      — it appears in `pg_stat_activity`, so "which service is running this
+      query" becomes answerable during an incident.
+
+  - title: A query whose shape JPA would not have produced
+    sql: |
+      with monthly as (
+          select date_trunc('month', o.order_date)::date as month,
+                 sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue
+          from orders o
+          join order_items oi on oi.order_id = o.order_id
+          where o.status = 'completed'
+          group by date_trunc('month', o.order_date)
+      )
+      select month,
+             round(revenue, 2)                                              as revenue,
+             round(lag(revenue) over (order by month), 2)                   as previous_month,
+             round(100.0 * (revenue - lag(revenue) over (order by month))
+                   / nullif(lag(revenue) over (order by month), 0), 1)      as pct_change,
+             round(sum(revenue) over (order by month
+                   rows between unbounded preceding and current row), 2)    as cumulative
+      from monthly
+      order by month
+    walkthrough: |
+      A CTE, a window function, a running total and a month-over-month
+      comparison. This is the shape of a real reporting query and there is no
+      reasonable way to express it through an entity mapping.
+
+      JPQL has no CTEs and limited window-function support; Criteria API would
+      be unreadable even if it could. The options are a native query or
+      `JdbcTemplate`, and either is the right answer.
+
+      The point is not that JPA is bad — it is that it solves a different
+      problem. Loading and persisting an object graph with change tracking is
+      genuinely hard and JPA does it well. Reporting is a different job, and
+      using the entity layer for it produces either an unmaintainable query or
+      an N+1.
+
+      Most real applications want both, which is why `spring-boot-starter-jdbc`
+      and `spring-boot-starter-data-jpa` coexist happily in one project.
+
+edgeCases:
+  - title: Why parameters cannot be identifiers
+    body: >-
+      A parameter is a value supplied after the statement has been parsed and
+      planned, so it cannot change the statement's structure — which is exactly
+      what makes it injection-proof and also what stops `order by ?` working.
+      A dynamic sort column must be validated against an allow-list and then
+      concatenated. The three sort orders below are three different statements,
+      and an application offering them must choose between them in Java, not
+      pass the choice to the database.
+    sql: |
+      select 'by salary'  as sort_order, emp_id, salary from employees where dept_id = 40
+      union all
+      select 'by hire_date', emp_id, salary from employees where dept_id = 40
+      order by sort_order, salary desc
+
+  - title: The connection-level settings a pool applies
+    body: >-
+      Every setting here was applied once when the connection was opened, not
+      per query. That is the right level for a guarantee: a statement cannot
+      forget to apply it, and a new code path inherits it automatically. The
+      learner pool in this application sets five of them, which together mean
+      a playground query cannot write, cannot run for more than three seconds,
+      cannot hold a lock for more than two, and resolves unqualified names in
+      the learning schema.
+    sql: |
+      select current_setting('transaction_read_only')                as read_only,
+             current_setting('statement_timeout')                    as statement_timeout,
+             current_setting('lock_timeout')                         as lock_timeout,
+             current_setting('idle_in_transaction_session_timeout')  as idle_timeout,
+             current_setting('search_path')                          as search_path
+
+pitfalls:
+  - mistake: Sizing the connection pool by guessing
+    why: >-
+      A large pool feels safer and makes throughput worse past the point the
+      database can use the connections, because of context switching and lock
+      contention. It also multiplies worst-case memory use by work_mem.
+    fix: >-
+      Start near `(cores × 2) + spindles`, measure, and use PgBouncer when
+      many application instances each need a pool. Treat
+      connection-acquisition timeouts as the signal to investigate, not to
+      raise the limit.
+
+  - mistake: Building SQL with string concatenation
+    why: >-
+      Every escaping scheme has been bypassed. It also defeats plan caching
+      and floods pg_stat_statements with thousands of near-identical entries,
+      which hides the query you need to find.
+    fix: >-
+      Parameters for values, always. For identifiers, validate against an
+      allow-list and use the matched value from the list, never the input.
+
+  - mistake: Doing slow work inside a transaction
+    why: >-
+      An HTTP call inside an open transaction holds a pooled connection, its
+      locks and its snapshot for the duration of a third party's latency —
+      blocking vacuum and exhausting the pool under load.
+    fix: >-
+      Commit first, then do the external work. If it must be atomic with the
+      database change, use an outbox table and process it asynchronously.
+
+  - mistake: Leaving spring.jpa.open-in-view enabled
+    why: >-
+      It keeps the persistence context open for the whole request, so a
+      connection is held during view rendering and every lazy-loading N+1 is
+      silently serviced instead of failing visibly.
+    fix: >-
+      Set it to false and fix what breaks. The breakages were already there;
+      they were being paid for in connections and queries rather than in
+      exceptions.
+
+performance: |
+  **Pool size** is the parameter with the largest and least intuitive effect.
+  Throughput against a database rises with concurrency up to roughly the
+  number of cores and then falls, so an oversized pool makes a loaded system
+  slower. The practical procedure is to load-test at several sizes and pick
+  the knee of the curve.
+
+  **Prepared statement caching** saves parsing on repeated execution. The
+  PostgreSQL JDBC driver switches to a server-side prepared statement after
+  `prepareThreshold` executions (5 by default), and PostgreSQL may then use a
+  **generic plan** that ignores the actual parameter values. For a column with
+  a skewed distribution — a status where one value is 99% of rows — the
+  generic plan can be much worse than the custom one. `plan_cache_mode =
+  force_custom_plan` is the escape hatch, and the symptom is a query that is
+  fast for the first few executions and then is not.
+
+  **Batching** matters more than it looks. `JdbcTemplate.batchUpdate` or
+  Hibernate's `hibernate.jdbc.batch_size` turn N round trips into one, and on
+  a bulk insert that is routinely a 10× difference. Hibernate also needs
+  `order_inserts` and `order_updates` enabled for batching to be effective
+  across entity types.
+
+  **Fetch size** controls how many rows the driver materialises at once. The
+  PostgreSQL driver fetches the **entire** result set by default, which is a
+  genuine out-of-memory risk on a large query. Setting a fetch size requires
+  autocommit to be off, which is one of the more surprising constraints in the
+  driver.
+
+interviewQuestions:
+  - question: How do you size a connection pool?
+    answer: >-
+      Start from the database's capacity rather than the application's
+      concurrency: roughly (cores × 2) + effective spindles, which for a
+      typical server is around 20 — far smaller than people expect. Throughput
+      rises with concurrency up to about the core count and then falls, because
+      extra connections add context switching and lock contention, and each
+      PostgreSQL connection is a process whose worst-case memory is work_mem
+      times the number of sort nodes. Measure at several sizes and pick the
+      knee. When many application instances each need a pool, PgBouncer in
+      transaction mode multiplexes them onto far fewer server connections.
+
+  - question: How do prepared statements prevent SQL injection?
+    answer: >-
+      The statement is parsed and planned before any parameter value is
+      supplied, so the parameter is bound as a value into an already-fixed
+      structure and can never become part of the SQL. The protection is
+      structural rather than a matter of escaping, which is why it has no
+      bypasses. The limitation is that parameters cannot substitute
+      identifiers — table or column names, sort directions — because those are
+      structure; those must be validated against an allow-list and the matched
+      value used, never the caller's string.
+
+  - question: What is the N+1 problem in JPA and how do you fix it?
+    answer: >-
+      Loading N entities and then touching a lazy association in a loop issues
+      one query per entity, so N+1 round trips where two would do. Each query
+      is fast, so it survives testing on small data and the cost is latency
+      times N. Fixes are a fetch join, an entity graph, or @BatchSize to turn N
+      queries into N/size IN-list queries. Diagnosis means logging the actual
+      SQL. It is worth noting that open-in-view, enabled by default in Spring
+      Boot, hides the problem by keeping the session open for the whole
+      request — turning it off makes these failures visible.
+
+  - question: When would you bypass JPA and write SQL directly?
+    answer: >-
+      For reporting and analytics, anything using CTEs or window functions,
+      bulk operations, and any query where the exact SQL and its plan matter.
+      JPA is designed for loading and persisting object graphs with change
+      tracking, and it does that well; expressing a windowed month-over-month
+      report through an entity mapping produces either an unreadable query or
+      an N+1. Mixing JdbcTemplate or jOOQ with JPA in one application is normal
+      and is not a sign of a design failure — they solve different problems.
+
+exercises:
+  - prompt: >-
+      Write the query behind a paginated customer list filtered by country,
+      with the filter as a value a parameter could supply. Return customer_id,
+      company_name, city for Germany, ordered by company_name, first page of
+      5.
+    difficulty: Easy
+    hint: >-
+      The country is the parameter; the sort column and direction are
+      structure and would be chosen in Java.
+    solutionSql: |
+      select customer_id, company_name, city
+      from customers
+      where country = 'Germany'
+      order by company_name, customer_id
+      limit 5
+
+  - prompt: >-
+      Collapse a two-level N+1 into one query: for each employee in
+      department 10, their name, the number of projects and their total
+      allocation, including employees on no projects. Columns full_name,
+      projects, total_allocation.
+    difficulty: Medium
+    hint: LEFT JOIN the junction table and count a column from it.
+    solutionSql: |
+      select e.first_name || ' ' || e.last_name    as full_name,
+             count(ep.project_id)                  as projects,
+             coalesce(sum(ep.allocation_pct), 0)   as total_allocation
+      from employees e
+      left join employee_projects ep on ep.emp_id = e.emp_id
+      where e.dept_id = 10
+      group by e.emp_id, e.first_name, e.last_name
+      order by total_allocation desc, full_name
+
+  - prompt: >-
+      Report every transaction-related setting this connection carries, to
+      document what the pool guarantees. Columns read_only, isolation,
+      statement_timeout, lock_timeout, idle_timeout.
+    difficulty: Easy
+    hint: Five calls to current_setting().
+    solutionSql: |
+      select current_setting('transaction_read_only')               as read_only,
+             current_setting('transaction_isolation')               as isolation,
+             current_setting('statement_timeout')                   as statement_timeout,
+             current_setting('lock_timeout')                        as lock_timeout,
+             current_setting('idle_in_transaction_session_timeout') as idle_timeout
+
+checklist:
+  - "Pool size comes from the database's capacity, not the application's concurrency"
+  - "Each PostgreSQL connection is a process; work_mem multiplies per sort node"
+  - Prepared statements prevent injection structurally, not by escaping
+  - "Parameters cannot be identifiers — allow-list and concatenate the matched value"
+  - "@Transactional does not apply to self-invocation, and checked exceptions do not roll back"
+  - Never do slow external work inside an open transaction
+  - "Turn off open-in-view; it hides N+1 and holds connections through rendering"
+  - "Drop to SQL for reporting, CTEs, window functions and bulk work"
+
+related:
+  - t-acid-isolation
+  - p-query-patterns
+  - pg-upsert-returning
+  - t-mvcc-locks
+
+dialect:
+  standard: >-
+    JDBC is a Java standard rather than a SQL one. Prepared statements with
+    parameter placeholders are standard SQL; the placeholder syntax differs —
+    `?` in JDBC, `$1` in PostgreSQL's native protocol.
+  postgres: >-
+    One process per connection, which is what makes pooling essential and
+    PgBouncer common. The JDBC driver switches to server-side prepared
+    statements after prepareThreshold executions and may then use a generic
+    plan. It also fetches the whole result set by default unless a fetch size
+    is set with autocommit off.
+  mysql: >-
+    One thread per connection rather than one process, so connections are
+    cheaper and large pools are less immediately harmful — which is why pool
+    sizing advice from MySQL experience understates the problem on PostgreSQL.
+    The MySQL JDBC driver streams results only with a specific fetch-size
+    incantation, and prepared statements are emulated client-side by default
+    unless useServerPrepStmts is enabled.

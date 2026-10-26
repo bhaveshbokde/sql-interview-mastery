@@ -1,0 +1,455 @@
+id: w-ranking
+moduleId: windows
+position: 20
+title: Ranking functions
+slug: ranking-functions
+difficulty: Intermediate
+estimatedMinutes: 25
+summary: >-
+  ROW_NUMBER, RANK, DENSE_RANK and NTILE differ only in how they treat ties —
+  and "which one, and why" is probably the most frequently asked window
+  function question in interviews.
+tags: [row-number, rank, dense-rank, ntile, ties, interview-favourite]
+
+prerequisites:
+  - w-basics
+
+objectives:
+  - State the difference between ROW_NUMBER, RANK and DENSE_RANK in one sentence each
+  - Choose the right one for a given requirement about ties
+  - Make a ranking deterministic with a tiebreak column
+  - Use NTILE for quartiles and say where it is uneven
+  - Use PERCENT_RANK and CUME_DIST for relative position
+
+concept: |
+  ## The three, and the ties
+
+  All three number rows within a window, ordered by the window's `ORDER BY`.
+  They differ only when two rows tie on the ordering keys.
+
+  Given scores 95, 88, 88, 79:
+
+  | score | ROW_NUMBER | RANK | DENSE_RANK |
+  |-------|-----------|------|------------|
+  | 95 | 1 | 1 | 1 |
+  | 88 | 2 | **2** | **2** |
+  | 88 | **3** | **2** | **2** |
+  | 79 | 4 | **4** | **3** |
+
+  - **`ROW_NUMBER()`** — always 1, 2, 3, 4. Ties get different numbers, chosen
+    arbitrarily. Never has gaps, never repeats.
+  - **`RANK()`** — ties share a number, and the next rank **skips** by the
+    number of tied rows. "Joint second, then fourth", like a sports league.
+  - **`DENSE_RANK()`** — ties share a number and the next rank does **not**
+    skip. "Joint second, then third" — it counts *distinct values*.
+
+  The one-line test for which to use:
+
+  - "Give me exactly N rows" → `ROW_NUMBER`
+  - "Give me the top N, including everyone tied at the boundary" → `RANK`
+  - "The Nth highest **distinct** value" → `DENSE_RANK`
+
+  That third line is the answer to the second-highest-salary interview
+  question, and the reason it is asked: `DENSE_RANK() = 2` is the distinct
+  second-highest, while `RANK() = 2` is whoever is second after ties are
+  accounted for, and `ROW_NUMBER() = 2` is an arbitrary one of them.
+
+  ## Determinism
+
+  `ROW_NUMBER()` over a non-unique ordering is **non-deterministic**. The same
+  query on the same data can give different numbers on different runs, because
+  the order among tied rows is not defined.
+
+  This matters most for pagination and for "pick one representative row", where
+  a changing answer looks like a data problem. The fix is to end the window's
+  `ORDER BY` with a unique column:
+
+  ```sql
+  row_number() over (partition by dept_id order by salary desc, emp_id)
+  ```
+
+  Exactly the same discipline as a top-level `ORDER BY` for pagination, for
+  exactly the same reason.
+
+  ## NTILE
+
+  `NTILE(n)` divides each partition into n buckets as evenly as it can and
+  returns the bucket number. Quartiles are `NTILE(4)`.
+
+  Two things to know. When the row count does not divide evenly, the **earlier
+  buckets get the extra rows** — 10 rows into 4 buckets gives 3, 3, 2, 2.
+  And `NTILE` splits by **position, not by value**, so two rows with the same
+  value can land in different buckets. If the buckets must respect value
+  boundaries, `NTILE` is the wrong function and `PERCENT_RANK` or an explicit
+  `CASE` over `CUME_DIST` is right.
+
+  ## PERCENT_RANK and CUME_DIST
+
+  - `PERCENT_RANK()` = `(rank - 1) / (total_rows - 1)`. Runs from 0 to 1, with
+    the first row always 0. A single-row partition gives 0.
+  - `CUME_DIST()` = the proportion of rows at or before this one. Runs from
+    just above 0 to exactly 1.
+
+  The difference is at the ends: `PERCENT_RANK` starts at 0, `CUME_DIST` ends
+  at 1. For "what percentile is this row in", `CUME_DIST` is usually the one
+  meant.
+
+syntax:
+  - form: "ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)"
+    notes: >-
+      Sequential, no gaps, no repeats. Add a unique tiebreak or the result is
+      not reproducible.
+  - form: "RANK() OVER (ORDER BY ...)"
+    notes: Ties share a rank; the following rank skips. Gaps are possible.
+  - form: "DENSE_RANK() OVER (ORDER BY ...)"
+    notes: Ties share a rank; no gaps. Counts distinct values.
+  - form: "NTILE(n) OVER (ORDER BY ...)"
+    notes: >-
+      n buckets by position. Earlier buckets get the extra rows. Equal values
+      may land in different buckets.
+  - form: "PERCENT_RANK() | CUME_DIST() OVER (ORDER BY ...)"
+    notes: >-
+      Relative position as a fraction. PERCENT_RANK starts at 0; CUME_DIST ends
+      at 1.
+
+sampleTables: [employees, exam_scores, products, daily_sales]
+
+examples:
+  - title: The three ranking functions on real ties
+    sql: |
+      select student_id,
+             score,
+             row_number() over (order by score desc, student_id) as row_number,
+             rank()       over (order by score desc)             as rank,
+             dense_rank() over (order by score desc)             as dense_rank,
+             count(*)     over ()                                as total_students
+      from exam_scores
+      where subject = 'Chemistry'
+      order by score desc, student_id
+    walkthrough: |
+      Three students scored 80, which is what makes this table worth reading.
+
+      `row_number` gives them 1, 2 and 3 — distinct numbers, and the
+      assignment among them is arbitrary until the `, student_id` tiebreak
+      pins it down, which is why it is there.
+
+      `rank` gives all three a 1 and then jumps to 4: three rows occupied the
+      first three positions. `dense_rank` gives all three a 1 and then 2,
+      because it counts distinct scores.
+
+      So "the second-highest score in Chemistry" is 73 by `dense_rank`, and
+      `rank = 2` matches nobody at all. That gap is the whole reason the
+      distinction is examined.
+
+  - title: Ranking within partitions
+    sql: |
+      select e.dept_id,
+             e.first_name || ' ' || e.last_name as employee,
+             e.salary,
+             row_number() over w as rn,
+             rank()       over w as rnk,
+             dense_rank() over w as dense,
+             count(*)     over (partition by e.dept_id) as in_dept
+      from employees e
+      where e.dept_id in (10, 30)
+      window w as (partition by e.dept_id order by e.salary desc, e.emp_id)
+      order by e.dept_id, rn
+    walkthrough: |
+      The ranking restarts at 1 for each department — that is what
+      `PARTITION BY` does, and it is the mechanism behind every
+      top-N-per-group query.
+
+      Department 30 contains a genuine tie: two content strategists on 97000.
+      `rn` separates them by `emp_id`; `rnk` and `dense` give them the same
+      number.
+
+      Department 10 has a tie at 148000 as well. Comparing how the three
+      columns behave in the two departments, on the same data, is the quickest
+      way to internalise the difference.
+
+  - title: Quartiles with NTILE, and where it splits a tie
+    sql: |
+      select student_id,
+             subject,
+             score,
+             ntile(4) over (partition by subject order by score desc, student_id) as quartile,
+             round((percent_rank() over (partition by subject order by score))::numeric, 3) as percent_rank,
+             round((cume_dist()    over (partition by subject order by score))::numeric, 3) as cume_dist
+      from exam_scores
+      where subject in ('Chemistry', 'Physics')
+      order by subject, score desc, student_id
+    walkthrough: |
+      Chemistry has 8 rows, so `NTILE(4)` gives a clean 2, 2, 2, 2. Physics has
+      10, so the buckets are 3, 3, 2, 2 — the **earlier** buckets take the
+      extra rows, which is the rule to remember.
+
+      Look at the Chemistry rows scoring 80: they are split across quartile 1
+      and quartile 2. `NTILE` divides by position, not by value, so identical
+      values can land in different buckets. For "top 25% by score" with tie
+      handling, use `percent_rank` or `cume_dist` and a comparison instead.
+
+      `percent_rank` starts at exactly 0 for the lowest score and `cume_dist`
+      ends at exactly 1 for the highest. That asymmetry at the ends is their
+      only real difference.
+
+      Both return `double precision`, which is why the `::numeric` casts are
+      there: the two-argument form of `round` exists only for `numeric`.
+      Without the cast PostgreSQL reports `function round(double precision,
+      integer) does not exist`, which is a confusing message for what is really
+      a type mismatch.
+
+  - title: Second highest, three ways
+    sql: |
+      with ranked as (
+          select emp_id,
+                 first_name || ' ' || last_name as employee,
+                 salary,
+                 dense_rank() over (order by salary desc) as dr,
+                 rank()       over (order by salary desc) as rk,
+                 row_number() over (order by salary desc, emp_id) as rn
+          from employees
+      )
+      select 'dense_rank = 2'  as method, employee, salary from ranked where dr = 2
+      union all
+      select 'rank = 2',          employee, salary from ranked where rk = 2
+      union all
+      select 'row_number = 2',    employee, salary from ranked where rn = 2
+      order by method, salary desc, employee
+    walkthrough: |
+      All three agree here, because the top salaries in this dataset happen to
+      be distinct. That is worth seeing: the three functions differ **only**
+      when there is a tie, and a query that works on data without ties tells
+      you nothing about whether you picked the right one.
+
+      Run the same query against the alternate dataset, where Ada Lovelace and
+      Alan Turing both earn 180000, and the three methods disagree:
+      `dense_rank = 2` finds the genuinely second-highest distinct salary,
+      `rank = 2` finds nobody, and `row_number = 2` finds the other person on
+      the top salary.
+
+      That is the real lesson. Choose the function from the requirement, not
+      from whichever one worked on the sample.
+
+edgeCases:
+  - title: The same query on data with ties at the top
+    sql: |
+      with ranked as (
+          select emp_id,
+                 first_name || ' ' || last_name as employee,
+                 salary,
+                 dense_rank() over (order by salary desc) as dr,
+                 rank()       over (order by salary desc) as rk,
+                 row_number() over (order by salary desc, emp_id) as rn
+          from employees
+      )
+      select 'dense_rank = 2'  as method, employee, salary from ranked where dr = 2
+      union all
+      select 'rank = 2',          employee, salary from ranked where rk = 2
+      union all
+      select 'row_number = 2',    employee, salary from ranked where rn = 2
+      order by method, salary desc, employee
+    schema: learning_alt
+    body: >-
+      The identical query against the alternate dataset, where two employees
+      share the top salary of 180000. Now `rank = 2` returns nothing at all,
+      `row_number = 2` returns one of the two top earners, and `dense_rank = 2`
+      returns the genuine runner-up. This is why the alternate dataset exists:
+      a solution that looks correct on clean data has to be checked against
+      data that has ties.
+
+  - title: ROW_NUMBER without a tiebreak is not reproducible
+    body: >-
+      Both columns number the rows 1 to 6. The first has no tiebreak, so the
+      numbering among employees on equal salaries is not defined and may change
+      between runs or after an index is added. The second is pinned by emp_id.
+      Only one of them is safe to use for pagination or for picking a
+      representative row.
+    sql: |
+      select emp_id,
+             dept_id,
+             salary,
+             row_number() over (order by salary desc)          as unstable,
+             row_number() over (order by salary desc, emp_id)  as stable
+      from employees
+      where dept_id = 30
+      order by salary desc, emp_id
+
+pitfalls:
+  - mistake: Using ROW_NUMBER when the requirement says "the Nth highest value"
+    why: >-
+      With ties at the top, ROW_NUMBER returns an arbitrary row rather than the
+      row with the Nth distinct value. The query returns an answer, and it is
+      the wrong one only when ties exist — so it passes every test built on
+      data without ties.
+    fix: >-
+      DENSE_RANK for "Nth distinct value". ROW_NUMBER for "exactly N rows".
+      Read the requirement for the word "distinct", spoken or implied.
+
+  - mistake: ROW_NUMBER with no unique tiebreak
+    why: >-
+      Among tied rows the order is undefined, so the numbering can differ
+      between executions. In paginated output this manifests as rows appearing
+      twice or never.
+    fix: >-
+      End the window's ORDER BY with the primary key. Costs nothing.
+
+  - mistake: Using NTILE when bucket boundaries must respect equal values
+    why: >-
+      NTILE splits by row position, so two rows with identical values can end
+      up in different buckets. A "top quartile of scores" built this way splits
+      a tied group.
+    fix: >-
+      Use CUME_DIST or PERCENT_RANK with a threshold, which are value-based, or
+      rank first and bucket the ranks.
+
+  - mistake: Confusing RANK's gaps for a bug
+    why: >-
+      Seeing 1, 1, 1, 4 looks like missing rows. It is the defined behaviour —
+      three rows occupied positions 1 to 3.
+    fix: >-
+      If gaps are unwanted, DENSE_RANK is the function you meant.
+
+performance: |
+  All ranking functions need the window's input sorted by the partition and
+  order keys, so the cost is dominated by that sort. An index on
+  `(partition_key, order_key)` can supply it and remove the `Sort` node, which
+  is the main available optimisation.
+
+  Functions sharing one window specification share one sort. `ROW_NUMBER`,
+  `RANK` and `DENSE_RANK` over the same `OVER` clause cost one sort, not three
+  — which is a good reason to declare a named `WINDOW` and reuse it.
+
+  For top-N-per-group with a small N and many groups, ranking over the whole
+  table and filtering is often beaten by `LATERAL` with a per-group `LIMIT`,
+  because the ranking approach computes a number for every row before throwing
+  most of them away. The top-N lesson measures both.
+
+interviewQuestions:
+  - question: What is the difference between ROW_NUMBER, RANK and DENSE_RANK?
+    answer: >-
+      They differ only in how they handle ties. ROW_NUMBER always produces
+      consecutive numbers with no repeats, assigning tied rows arbitrary
+      distinct numbers. RANK gives tied rows the same number and then skips, so
+      three rows tied at 1 are followed by 4. DENSE_RANK gives tied rows the
+      same number without skipping, so the next is 2 — it effectively ranks
+      distinct values. Choose ROW_NUMBER for "exactly N rows", RANK for "top N
+      including ties", and DENSE_RANK for "the Nth distinct value".
+
+  - question: How do you find the second-highest salary?
+    answer: >-
+      `DENSE_RANK() OVER (ORDER BY salary DESC) = 2` if "second highest" means
+      the second distinct salary value, which is the usual intent. ROW_NUMBER
+      would return an arbitrary row when the top salary is tied, and RANK would
+      return nothing at all in that case, since rank 2 would be skipped. The
+      non-window alternatives are `ORDER BY salary DESC LIMIT 1 OFFSET 1`, which
+      has the ROW_NUMBER problem, and a subquery for the max of salaries below
+      the max, which handles ties correctly and returns NULL rather than no
+      rows when there is no second value — a difference worth mentioning.
+
+  - question: Why might the same ROW_NUMBER query give different results on two runs?
+    answer: >-
+      Because the window's ORDER BY does not uniquely determine the order. Rows
+      that tie on every ordering key may be numbered in any order, and the
+      actual order depends on the plan, which can change with statistics,
+      indexes or server version. The fix is to add a unique column — typically
+      the primary key — as the last ordering key. This is the same reasoning as
+      for a top-level ORDER BY used with pagination.
+
+  - question: What is NTILE and what should you watch out for?
+    answer: >-
+      NTILE(n) divides each partition into n buckets as evenly as possible and
+      returns the bucket number, so NTILE(4) gives quartiles. Two things catch
+      people: when the row count is not divisible by n, the earlier buckets
+      receive the extra rows; and the split is by row position rather than by
+      value, so rows with identical values can land in different buckets. When
+      bucket boundaries must respect equal values, CUME_DIST or PERCENT_RANK
+      with a threshold is the correct tool.
+
+exercises:
+  - prompt: >-
+      Rank products by unit_price descending within their category, showing the
+      ranking three ways. Columns category_id, product_name, unit_price, rn,
+      rnk, dense. Order by category_id then unit_price descending.
+    difficulty: Easy
+    hint: >-
+      One named window partitioned by category_id, ordered by unit_price desc
+      with product_id as a tiebreak.
+    solutionSql: |
+      select category_id,
+             product_name,
+             unit_price,
+             row_number() over w as rn,
+             rank()       over w as rnk,
+             dense_rank() over w as dense
+      from products
+      window w as (partition by category_id order by unit_price desc, product_id)
+      order by category_id, unit_price desc, product_id
+
+  - prompt: >-
+      Find the third-highest distinct salary in the company and everyone who
+      earns it. Columns full_name, salary. Order by full_name.
+    difficulty: Medium
+    hint: DENSE_RANK in a CTE, filtered to 3 in the outer query.
+    solutionSql: |
+      with ranked as (
+          select first_name || ' ' || last_name as full_name,
+                 salary,
+                 dense_rank() over (order by salary desc) as dr
+          from employees
+      )
+      select full_name, salary
+      from ranked
+      where dr = 3
+      order by full_name
+
+  - prompt: >-
+      Divide the daily_sales rows for the North region into four quartiles by
+      revenue, and report how many days and what revenue range each quartile
+      covers. Columns quartile, days, min_revenue, max_revenue.
+    difficulty: Medium
+    hint: >-
+      NTILE(4) in a CTE, then group by the quartile.
+    solutionSql: |
+      with bucketed as (
+          select revenue,
+                 ntile(4) over (order by revenue, sale_date) as quartile
+          from daily_sales
+          where region = 'North'
+      )
+      select quartile,
+             count(*)               as days,
+             round(min(revenue), 2) as min_revenue,
+             round(max(revenue), 2) as max_revenue
+      from bucketed
+      group by quartile
+      order by quartile
+
+checklist:
+  - The three ranking functions differ only on ties
+  - "ROW_NUMBER: consecutive, arbitrary among ties, never repeats"
+  - "RANK: ties share a number and the next rank skips"
+  - "DENSE_RANK: ties share a number and nothing is skipped — ranks distinct values"
+  - "\"Nth highest distinct value\" means DENSE_RANK"
+  - ROW_NUMBER without a unique tiebreak is not reproducible
+  - "NTILE splits by position: earlier buckets get the extra rows and ties can split"
+  - "PERCENT_RANK starts at 0; CUME_DIST ends at 1"
+
+related:
+  - w-basics
+  - w-top-n-per-group
+  - p01-second-highest-salary
+  - p14-rank-vs-dense-rank
+
+dialect:
+  standard: >-
+    ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK and CUME_DIST are all
+    standard SQL from SQL:2003.
+  postgres: >-
+    Implements all of them. Shares a single sort between functions with
+    identical window specifications, so declaring a named WINDOW is a genuine
+    optimisation as well as a readability one.
+  mysql: >-
+    All available from MySQL 8.0 with identical syntax. Before 8.0 the
+    idiomatic workarounds used session variables incremented in the select
+    list, which depend on evaluation order that MySQL does not guarantee — a
+    well-known source of subtly wrong results in legacy code.

@@ -1,0 +1,332 @@
+id: p07-consecutive-login-days
+position: 70
+title: Longest run of consecutive active days
+slug: consecutive-login-days
+difficulty: Hard
+topic: Window functions
+tags: [gaps-and-islands, row-number, streaks, classic]
+
+orderSensitive: false
+
+statement: |
+  For each customer in `user_activity`, find their longest unbroken run of
+  consecutive calendar days with at least one activity.
+
+  Return one row per customer: the start and end of their longest run and its
+  length in days. Where a customer has two runs of equal length, return the
+  earlier one.
+
+  A customer with several activities on one day has been active on one day,
+  not several.
+
+tables: [user_activity]
+
+expectedColumns: [customer_id, run_start, run_end, days]
+
+edgeCases:
+  - >-
+    Several activities on the same date must count once — the trick breaks if
+    the dates are not distinct within the customer.
+  - A customer with a single active day has a run of length 1.
+  - >-
+    Two runs of the same length need a deterministic rule for which to return,
+    or the answer is not reproducible.
+  - >-
+    The runs are per customer, so the row numbering must restart for each one.
+
+hints:
+  - >-
+    Within a run of consecutive dates, the date and a row number increase
+    together. What does their difference do?
+  - The trick requires distinct dates. Deal with that before anything else.
+  - >-
+    Once each run has a group key, min, max and count over that key give you
+    everything.
+
+solutionSql: |
+  with distinct_days as (
+      select distinct customer_id, activity_date
+      from user_activity
+  ),
+  grouped as (
+      select customer_id,
+             activity_date,
+             activity_date - (row_number() over (partition by customer_id
+                                                 order by activity_date))::int as island_key
+      from distinct_days
+  ),
+  runs as (
+      select customer_id,
+             min(activity_date) as run_start,
+             max(activity_date) as run_end,
+             count(*)           as days
+      from grouped
+      group by customer_id, island_key
+  ),
+  ranked as (
+      select customer_id, run_start, run_end, days,
+             row_number() over (partition by customer_id
+                                order by days desc, run_start) as rn
+      from runs
+  )
+  select customer_id, run_start, run_end, days
+  from ranked
+  where rn = 1
+  order by days desc, customer_id
+
+explanation:
+  lineByLine:
+    - clause: "select distinct customer_id, activity_date"
+      note: >-
+        The deduplication step, and the one most often forgotten. A customer
+        with two activities on one date would otherwise advance the row number
+        twice while the date advanced once, breaking the key inside a run.
+    - clause: "activity_date - (row_number() over (...))::int"
+      note: >-
+        The island key. Within consecutive dates both sides increase by one
+        per row, so the difference is constant; at a gap the date jumps ahead
+        and the difference changes. The `::int` cast is needed because
+        row_number returns bigint and `date - bigint` has no operator.
+    - clause: "partition by customer_id order by activity_date"
+      note: >-
+        Restarts the numbering for each customer, so one customer's gaps
+        cannot affect another's key.
+    - clause: "group by customer_id, island_key"
+      note: >-
+        Each group is now exactly one unbroken run. min, max and count give
+        its start, end and length.
+    - clause: "row_number() over (partition by customer_id order by days desc, run_start)"
+      note: >-
+        Ranks each customer's runs so the longest can be picked. `run_start`
+        breaks ties in favour of the earlier run, as the question specifies.
+    - clause: "where rn = 1"
+      note: >-
+        One row per customer. A second filter step is needed because the
+        ranking is itself a window function.
+
+  walkthrough: |
+    Take customer 301, who was active on 1 to 12 May 2024 with no gaps. After
+    deduplication there are twelve rows; the row numbers run 1 to 12 and the
+    dates run 1 May to 12 May, so `date - row_number` is the same value for
+    all twelve and they form a single island of length 12.
+
+    Customer 302 was active on 11 May and then 20 May. The row numbers are 1
+    and 2, so the keys are `11 May - 1` and `20 May - 2` — different, so two
+    islands of length 1 each. The tiebreak on `run_start` picks 11 May.
+
+    The four CTEs are four distinct steps: deduplicate, key, collapse, pick.
+    Each is independently checkable, which matters because this is a query
+    whose intermediate state is hard to hold in your head. Running it up to
+    `grouped` and looking at the keys is the standard way to debug it.
+
+  alternatives:
+    - title: LAG and a running sum of gap markers
+      sql: |
+        with distinct_days as (
+            select distinct customer_id, activity_date from user_activity
+        ),
+        marked as (
+            select customer_id,
+                   activity_date,
+                   case when activity_date
+                             - lag(activity_date) over (partition by customer_id
+                                                        order by activity_date) = 1
+                        then 0 else 1 end as is_new_run
+            from distinct_days
+        ),
+        grouped as (
+            select customer_id,
+                   activity_date,
+                   sum(is_new_run) over (partition by customer_id
+                                         order by activity_date
+                                         rows between unbounded preceding and current row) as run_id
+            from marked
+        ),
+        runs as (
+            select customer_id,
+                   min(activity_date) as run_start,
+                   max(activity_date) as run_end,
+                   count(*)           as days
+            from grouped
+            group by customer_id, run_id
+        ),
+        ranked as (
+            select customer_id, run_start, run_end, days,
+                   row_number() over (partition by customer_id
+                                      order by days desc, run_start) as rn
+            from runs
+        )
+        select customer_id, run_start, run_end, days
+        from ranked where rn = 1
+        order by days desc, customer_id
+      when: >-
+        When the step between values is not a constant 1, or when the "what
+        counts as a gap" rule is more complex than adjacency — allowing a
+        one-day break, say. Marking the boundaries explicitly is more flexible
+        than the subtraction trick and easier to explain.
+      equivalent: true
+
+  performance: |
+    The dominant cost is the sort needed for the row numbering, over the
+    deduplicated set. An index on `(customer_id, activity_date)` — which
+    exists in this schema as `idx_user_activity_cust_date` — supplies that
+    order and also makes the DISTINCT cheap, because duplicates are adjacent.
+
+    There are four passes in the window version and five in the LAG version,
+    but each operates on a progressively smaller set: the full table, then
+    distinct days, then runs, then one row per customer. The CTEs do not
+    materialise separately, so the planner fuses most of this into a single
+    sort plus aggregations.
+
+    On a very large activity table the real optimisation is to narrow the
+    input — a date range, or an incremental computation that only re-examines
+    recent activity and joins to a stored history of completed runs.
+
+  wrongApproaches:
+    - title: Forgetting to deduplicate the dates
+      sql: |
+        with grouped as (
+            select customer_id,
+                   activity_date,
+                   activity_date - (row_number() over (partition by customer_id
+                                                       order by activity_date))::int as island_key
+            from user_activity
+        )
+        select customer_id,
+               min(activity_date) as run_start,
+               max(activity_date) as run_end,
+               count(*)           as days
+        from grouped
+        group by customer_id, island_key
+        order by days desc, customer_id
+        limit 10
+      whyWrong: >-
+        With two activities on one date the row number advances twice while
+        the date advances once, so the key changes inside what should be a
+        single run and the run fragments. The `days` figure also counts
+        activities rather than days, so a customer with three logins on one
+        day reports a three-day streak.
+
+    - title: Self-joining on the previous calendar day
+      sql: |
+        select a.customer_id,
+               count(*) as days_with_a_predecessor
+        from (select distinct customer_id, activity_date from user_activity) a
+        join (select distinct customer_id, activity_date from user_activity) b
+          on b.customer_id   = a.customer_id
+         and b.activity_date = a.activity_date - 1
+        group by a.customer_id
+        order by a.customer_id
+      whyWrong: >-
+        Counts days that happen to have a predecessor, which is not the same
+        as the longest run — a customer with three separate two-day runs
+        scores the same as one with a four-day run. Extending the self join to
+        measure run length requires a join per day of the run, which is not a
+        technique so much as a demonstration that the problem needs window
+        functions.
+
+  extraTests:
+    - name: Short runs and a same-day duplicate (alternate dataset)
+      schema: learning_alt
+      note: >-
+        learning_alt's user_activity has customer 301 active on 1 and 2 June
+        with **two** activities on 2 June, and customer 302 active on a single
+        day. The deduplication must collapse 2 June to one day, giving 301 a
+        run of 2 and 302 a run of 1.
+      sql: |
+        with distinct_days as (
+            select distinct customer_id, activity_date from user_activity
+        ),
+        grouped as (
+            select customer_id,
+                   activity_date,
+                   activity_date - (row_number() over (partition by customer_id
+                                                       order by activity_date))::int as island_key
+            from distinct_days
+        ),
+        runs as (
+            select customer_id,
+                   min(activity_date) as run_start,
+                   max(activity_date) as run_end,
+                   count(*)           as days
+            from grouped
+            group by customer_id, island_key
+        ),
+        ranked as (
+            select customer_id, run_start, run_end, days,
+                   row_number() over (partition by customer_id
+                                      order by days desc, run_start) as rn
+            from runs
+        )
+        select customer_id, run_start, run_end, days
+        from ranked where rn = 1
+        order by days desc, customer_id
+
+    - name: Every run, not just the longest
+      schema: learning
+      note: >-
+        Dropping the final ranking step shows all the runs, which is how you
+        check the islands were formed correctly before trusting the maximum.
+        Customers with a single long run appear once; fragmented ones appear
+        several times.
+      sql: |
+        with distinct_days as (
+            select distinct customer_id, activity_date from user_activity
+        ),
+        grouped as (
+            select customer_id,
+                   activity_date,
+                   activity_date - (row_number() over (partition by customer_id
+                                                       order by activity_date))::int as island_key
+            from distinct_days
+        )
+        select customer_id,
+               min(activity_date) as run_start,
+               max(activity_date) as run_end,
+               count(*)           as days
+        from grouped
+        group by customer_id, island_key
+        order by customer_id, run_start
+
+  followUps:
+    - question: Why does subtracting a row number identify a run?
+      answer: >-
+        Within a run of consecutive dates both the date and the row number
+        increase by exactly one per row, so their difference is invariant. At a
+        gap the date jumps by more than one while the row number still
+        increases by one, so the difference changes and a new group begins. The
+        technique requires the values to be distinct within the partition and
+        the step to be constant; with duplicates the row number outruns the
+        date, and with a variable step the date outruns the row number.
+
+    - question: How would you allow a one-day break without ending the run?
+      answer: >-
+        The subtraction trick cannot express that, because it depends on a
+        fixed step. Switch to the LAG form and change the boundary condition to
+        `activity_date - lag(activity_date) <= 2`, then take a running sum of
+        the boundary markers as the run id. Making the gap rule explicit is
+        exactly why the LAG variant is worth knowing even though it is longer.
+
+    - question: How would you find the current streak rather than the longest?
+      answer: >-
+        Compute the runs as here, then keep the run whose `run_end` is the most
+        recent date — and decide what "current" means when the last activity
+        was three days ago. Usually it means the run must include today or
+        yesterday, which is a condition on `run_end` against a reference date,
+        and that reference date should be a parameter rather than
+        current_date if the result needs to be reproducible.
+
+    - question: Would this work for consecutive integers rather than dates?
+      answer: >-
+        Identically. Subtract the row number from the integer instead of from
+        the date and the key is an integer. The pattern applies to any
+        monotonically increasing sequence with a constant step — invoice
+        numbers to find gaps in a series, version numbers, seat allocations.
+        Finding the *gaps* rather than the islands is the same query with the
+        complement taken, which is the other half of the name.
+
+  related:
+    - w-top-n-per-group
+    - w-frames
+    - w-ranking
+    - i-ctes

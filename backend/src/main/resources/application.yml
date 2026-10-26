@@ -1,0 +1,115 @@
+spring:
+  application:
+    name: sql-interview-mastery
+
+  # Boot would normally build the DataSource from spring.datasource.*. This
+  # application defines two of them by hand in DataSourceConfig, because the
+  # whole security model rests on the playground using a different identity
+  # from the rest of the app, so the auto-configuration is switched off.
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+
+  flyway:
+    enabled: true
+    # Runs against the primary (app) DataSource, which owns both schemas.
+    schemas: public
+    locations: classpath:db/migration
+    # Resolved into V2__learning_schema.sql so the grants name whatever role
+    # the deployment actually provisioned.
+    placeholders:
+      learnerRole: ${SQLMASTERY_LEARNER_USERNAME:sqlmastery_learner}
+
+  jackson:
+    default-property-inclusion: non_null
+
+  threads:
+    virtual:
+      enabled: true
+
+server:
+  port: ${SQLMASTERY_SERVER_PORT:8085}
+  error:
+    include-message: never
+    include-stacktrace: never
+  # A request body cannot be larger than this, which caps the size of a SQL
+  # statement before any of the application's own code sees it.
+  tomcat:
+    max-http-form-post-size: 64KB
+  max-http-request-header-size: 16KB
+
+sqlmastery:
+  datasource:
+    url: jdbc:postgresql://${SQLMASTERY_DB_HOST:127.0.0.1}:${SQLMASTERY_DB_PORT:5433}/${SQLMASTERY_DB_NAME:sqlmastery_db}
+    app:
+      username: ${SQLMASTERY_APP_USERNAME:sqlmastery_app}
+      password: ${SQLMASTERY_APP_PASSWORD:}
+    learner:
+      username: ${SQLMASTERY_LEARNER_USERNAME:sqlmastery_learner}
+      password: ${SQLMASTERY_LEARNER_PASSWORD:}
+
+  playground:
+    statement-timeout-ms: ${SQLMASTERY_PLAYGROUND_STATEMENT_TIMEOUT_MS:3000}
+    max-rows: ${SQLMASTERY_PLAYGROUND_MAX_ROWS:500}
+    max-sql-length: ${SQLMASTERY_PLAYGROUND_MAX_SQL_LENGTH:10000}
+    # The ONLY schemas a learner query may name. `app` is absent on purpose:
+    # that is where the problem solutions are kept, and the learner role has no
+    # privilege on it either, so this list is the second of two defences.
+    #
+    # information_schema is allowed, and that is a deliberate decision rather
+    # than an oversight. It is how the lessons teach a learner to ask the
+    # database about its own structure, which is a genuinely useful skill and
+    # not something to be taught by screenshot. It is safe here because
+    # PostgreSQL filters those views by privilege: the learner role sees only
+    # objects it already has access to, so `select * from
+    # information_schema.tables where table_schema = 'app'` returns no rows for
+    # it. pg_catalog is NOT allowed — it does not filter the same way.
+    allowed-schemas:
+      - learning
+      - learning_alt
+      - information_schema
+    max-concurrent: 8
+    rate-per-minute: 120
+
+  cors:
+    # The Vite dev server. In production the frontend is served as static files
+    # from the same origin and this list is irrelevant.
+    #
+    # Written as one comma-separated property rather than a YAML list so it can
+    # be overridden by a single environment variable. Spring's relaxed binding
+    # maps a list property to SQLMASTERY_CORS_ALLOWEDORIGINS, which is not a
+    # name anyone guesses; an explicit placeholder means the variable is called
+    # what it looks like it should be called.
+    allowed-origins: ${SQLMASTERY_CORS_ALLOWED_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}
+
+  curriculum:
+    # Reloaded into the database on every startup, so editing a JSON file and
+    # restarting is the whole content workflow.
+    location: classpath:curriculum/
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: alpha
+  api-docs:
+    path: /v3/api-docs
+
+logging:
+  level:
+    root: INFO
+    com.bhavesh.sqlmastery: INFO
+    # The playground logs statement text at DEBUG only. Learner SQL is not
+    # secret, but logging every keystroke-triggered query at INFO makes the
+    # log useless for anything else.
+    com.bhavesh.sqlmastery.playground: INFO

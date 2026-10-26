@@ -1,0 +1,501 @@
+id: p-query-patterns
+moduleId: performance
+position: 30
+title: Investigating a slow query
+slug: query-patterns
+difficulty: Advanced
+estimatedMinutes: 25
+summary: >-
+  A method for diagnosing slow SQL rather than a list of tips, plus the two
+  access patterns that cause most real-world database pain: deep OFFSET
+  pagination and N+1 queries.
+tags: [tuning, pagination, n-plus-one, pg-stat-statements, methodology]
+
+prerequisites:
+  - p-explain
+
+objectives:
+  - Follow a repeatable method for diagnosing a slow query
+  - Explain why OFFSET pagination degrades and how keyset pagination fixes it
+  - Recognise an N+1 pattern from the database side
+  - Decide between fixing the query, the index and the schema
+  - Name the tools that tell you which queries to look at
+
+concept: |
+  ## A method
+
+  **1. Find out which query is actually slow.** Not which one feels slow.
+  `pg_stat_statements` aggregates execution counts and total time per
+  normalised statement, and the query that matters is usually the one run ten
+  thousand times a minute rather than the one that takes four seconds once an
+  hour. Sort by `total_exec_time`, not by `mean_exec_time`.
+
+  **2. Reproduce it with `EXPLAIN (ANALYZE, BUFFERS)`** using realistic
+  parameters. A query is often fast for the parameters a developer tries and
+  slow for the ones production uses.
+
+  **3. Find the worst estimate.** The largest ratio between estimated and
+  actual rows, lowest in the tree. Fix that before anything else — a bad
+  estimate makes every decision above it arbitrary.
+
+  **4. Then look at the access method.** Sequential scan where an index should
+  serve? Check sargability first, then whether the index exists and matches.
+
+  **5. Change one thing and re-measure**, comparing buffer counts rather than
+  timings.
+
+  The ordering matters. Most "add an index" advice is applied at step 4 to a
+  problem that was at step 3.
+
+  ## Where to intervene
+
+  In increasing order of cost and effectiveness:
+
+  - **The query.** Rewrite a non-sargable predicate, remove a needless
+    `DISTINCT`, replace a correlated subquery with a join, stop selecting
+    columns you do not use.
+  - **The index.** Add, extend, or make partial. Cheap, reversible, and costs
+    write throughput.
+  - **The configuration.** `work_mem` for a spilling sort,
+    `random_page_cost` for SSDs, autovacuum settings for a bloated table.
+  - **The schema.** Denormalise a hot aggregate, partition a huge table,
+    change a data type. Expensive and hard to reverse.
+  - **The architecture.** Caching, read replicas, a separate analytics store.
+    Solves a class of problem and introduces a consistency one.
+
+  Work top down. An architectural change applied to a missing index is a large
+  amount of work that leaves the missing index in place.
+
+  ## Pattern one: deep OFFSET pagination
+
+  `LIMIT 20 OFFSET 10000` makes the database produce 10,020 rows in sorted
+  order and discard 10,000. Cost grows linearly with the page number, and it
+  is invisible in testing because nobody opens page 500.
+
+  It is also **incorrect under concurrency**: a row inserted before the offset
+  shifts everything, so a row can be skipped or repeated between page
+  requests.
+
+  Keyset pagination replaces the offset with a predicate on the sort keys:
+
+  ```sql
+  where (order_date, order_id) > (?, ?)
+  order by order_date, order_id
+  limit 20
+  ```
+
+  Constant cost per page with a matching index, and immune to concurrent
+  inserts. The trade is losing random page access, which infinite-scroll
+  interfaces do not need.
+
+  A related cost is `SELECT count(*)` for a total page count: it scans
+  everything matching the filter, every request. Options are to cache it, to
+  use an estimate from the planner, or to show "more results" rather than a
+  total.
+
+  ## Pattern two: N+1
+
+  One query returns N rows; the application then issues one query per row.
+  101 round trips where 2 would do, and each one carries network latency and
+  parse overhead that dwarf the actual work.
+
+  From the database side it looks like an enormous count of a simple,
+  fast, parameterised query — which is exactly why `pg_stat_statements`
+  sorted by **total** time finds it and sorted by **mean** time does not.
+
+  The fixes are a join, an `IN` with the collected ids, or in JPA a fetch join
+  or `@BatchSize`. The general shape is: **collect the keys, then make one
+  query.**
+
+  The same anti-pattern appears without an ORM, as a loop in application code
+  issuing queries. It is a round-trip problem, not a framework problem.
+
+  ## A few more worth recognising
+
+  - **`SELECT *` on a wide table** — moves columns nobody reads, and defeats
+    index-only scans.
+  - **`count(*)` on every page load** — see above.
+  - **A filter on a function of a column** — non-sargable, and the most
+    common single cause of an unused index.
+  - **Aggregating across two one-to-many joins** — fan-out multiplies the
+    totals. Aggregate each grain separately.
+  - **A transaction held open across an HTTP call** — holds locks and blocks
+    vacuum for the duration of someone else's latency.
+
+syntax:
+  - form: "EXPLAIN (ANALYZE, BUFFERS) query"
+    notes: The diagnostic starting point for any individual slow query.
+  - form: "SELECT * FROM pg_stat_statements ORDER BY total_exec_time DESC"
+    notes: >-
+      Requires the extension. Sort by total time to find what matters, not by
+      mean.
+  - form: "WHERE (a, b) > (?, ?) ORDER BY a, b LIMIT n"
+    notes: Keyset pagination. Constant cost per page with a matching index.
+  - form: "WHERE id = ANY($1)"
+    notes: >-
+      The N+1 fix in one statement, with an array parameter so the statement
+      text is constant and the plan can be cached.
+  - form: "SET LOCAL work_mem = '64MB'"
+    notes: >-
+      Raise it for one transaction rather than globally — it is per sort node,
+      per worker.
+
+sampleTables: [orders, order_items, customers, products, employees]
+
+examples:
+  - title: Keyset pagination versus OFFSET, same page
+    sql: |
+      select 'offset'  as method, order_id, order_date, status
+      from (select order_id, order_date, status
+            from orders
+            order by order_date, order_id
+            offset 20 limit 5) a
+      union all
+      select 'keyset', order_id, order_date, status
+      from (select order_id, order_date, status
+            from orders
+            where (order_date, order_id) > (date '2023-02-02', 1021)
+            order by order_date, order_id
+            limit 5) b
+      order by method, order_date, order_id
+    walkthrough: |
+      Both return the same five orders. The difference is entirely in what the
+      database did to produce them.
+
+      The `OFFSET` branch sorted the whole table and threw away twenty rows.
+      At offset 20 that is nothing; at offset 20,000 it is twenty thousand rows
+      produced and discarded, on every page request.
+
+      The keyset branch applied a predicate. With an index on `(order_date,
+      order_id)` it seeks directly to the position and reads five entries — the
+      same work regardless of how deep the page is.
+
+      Note what the keyset version needs from the caller: the sort keys of the
+      last row of the previous page. That is the cursor, and passing it instead
+      of a page number is the whole API change.
+
+  - title: What N+1 looks like when you collapse it
+    sql: |
+      select o.order_id,
+             o.order_date,
+             c.company_name,
+             count(oi.product_id)                                            as lines,
+             coalesce(round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2), 0) as revenue
+      from orders o
+      join customers c         on c.customer_id = o.customer_id
+      left join order_items oi on oi.order_id   = o.order_id
+      where o.order_date >= date '2024-05-01'
+      group by o.order_id, o.order_date, c.company_name
+      order by o.order_id
+    walkthrough: |
+      One query. The N+1 version is a query for the orders, then for each
+      order a query for its customer and another for its lines — around 2N+1
+      round trips.
+
+      Each of those extra queries is individually fast, which is exactly why
+      the problem survives code review and load testing on small data. The
+      cost is latency multiplied by count: at 0.5 ms round-trip and 200
+      orders, 200 ms spent waiting on the network for work that took
+      microseconds.
+
+      In JPA the cause is usually a lazy association touched inside a loop,
+      and the fixes are `join fetch`, an entity graph, or `@BatchSize`, which
+      turns N queries into N/size queries with an `IN` list.
+
+      The shape to look for in a log is the same statement repeated with
+      different parameters. It is also what `pg_stat_statements` shows as one
+      row with an enormous `calls` count.
+
+  - title: Fan-out across two one-to-many joins
+    sql: |
+      select 'naive: both joins at once'      as approach,
+             round(sum(oi.quantity * oi.unit_price * (1 - oi.discount)), 2) as revenue,
+             round(sum(p.amount), 2)                                        as paid,
+             count(*)                                                       as rows_produced
+      from orders o
+      left join order_items oi on oi.order_id = o.order_id
+      left join payments p     on p.order_id  = o.order_id
+      where o.order_id in (1005, 1006, 1011)
+      union all
+      select 'correct: aggregate each grain',
+             round(sum(t.revenue), 2),
+             round(sum(t.paid), 2),
+             count(*)
+      from (select o.order_id,
+                   (select sum(oi.quantity * oi.unit_price * (1 - oi.discount))
+                    from order_items oi where oi.order_id = o.order_id) as revenue,
+                   (select sum(p.amount)
+                    from payments p where p.order_id = o.order_id)      as paid
+            from orders o
+            where o.order_id in (1005, 1006, 1011)) t
+      order by approach
+    walkthrough: |
+      The first approach joins orders to both `order_items` and `payments` in
+      one query. Each order's lines are multiplied by its payments, so both
+      sums are inflated — revenue by the payment count and paid by the line
+      count.
+
+      The second computes each aggregate at its own grain and then sums. The
+      `rows_produced` column shows the mechanism: the naive version produced
+      many more rows than there are orders.
+
+      This is the most common cause of a report whose totals are wrong by a
+      plausible-looking factor. The rule: **one fan-out per query**. With two
+      one-to-many relationships, aggregate each in its own subquery or CTE.
+
+  - title: The cost of count(*) for a pagination footer
+    sql: |
+      select count(*)                                            as total_matching,
+             count(*) filter (where status = 'completed')        as completed,
+             min(order_date)                                     as earliest,
+             max(order_date)                                     as latest
+      from orders
+      where shipping_country in ('United Kingdom', 'Germany', 'Ireland')
+    walkthrough: |
+      Every page of a paginated list that shows "page 3 of 847" runs something
+      like this, and it scans every matching row — the same work whether the
+      user is on page 1 or page 847.
+
+      On 151 orders that is free. On 15 million it is the dominant cost of
+      the page, and it is pure overhead because nobody acts on the total.
+
+      Three ways out, in order of how often they are right: show "load more"
+      instead of a page count; cache the count with a short expiry, since an
+      approximate total is almost always acceptable; or use the planner's
+      estimate from `EXPLAIN (FORMAT JSON)`, which is instant and
+      approximately right.
+
+      The general principle: a number nobody acts on does not need to be
+      exact, and exactness is what makes it expensive.
+
+edgeCases:
+  - title: A DISTINCT hiding a fan-out
+    body: >-
+      Both counts are of customers who have ordered. The first joins and then
+      deduplicates, which works and does an unnecessary sort over every
+      matching order. The second asks the existence question directly. When you
+      see DISTINCT on an outer query over a join, the question to ask is
+      whether the join should have been a semi-join — DISTINCT repairs the
+      symptom and EXISTS avoids causing it.
+    sql: |
+      select (select count(*) from (select distinct c.customer_id
+                                    from customers c
+                                    join orders o on o.customer_id = c.customer_id) d) as with_distinct,
+             (select count(*) from customers c
+              where exists (select 1 from orders o
+                            where o.customer_id = c.customer_id))                      as with_exists
+
+  - title: Selecting columns you do not need
+    body: >-
+      The two queries return the same rows. The first reads the jsonb
+      attributes column for every product, which is TOASTed for the larger
+      documents and must be fetched and decompressed; the second reads two
+      narrow columns and could be answered from an index that covers them.
+      `SELECT *` is convenient at a prompt and a measurable cost in a query
+      that runs constantly.
+    sql: |
+      select 'all columns'   as variant, count(*) as rows, sum(length(p::text)) as approx_bytes
+      from products p
+      union all
+      select 'two columns', count(*), sum(length(product_id::text) + length(product_name))
+      from products
+      order by variant
+
+pitfalls:
+  - mistake: Optimising the query that feels slow
+    why: >-
+      Human perception of slowness is unreliable and biased towards whatever
+      was being watched. The query consuming the most database time is usually
+      a fast one executed constantly.
+    fix: >-
+      Measure with pg_stat_statements and sort by total_exec_time. Fix the top
+      of that list.
+
+  - mistake: Adding an index before checking the estimates
+    why: >-
+      If the planner's row estimate is wrong by three orders of magnitude, it
+      will make a poor choice with or without the new index — and may not use
+      it at all.
+    fix: >-
+      Compare estimated and actual rows first. ANALYZE, raise the statistics
+      target, or add multivariate statistics. Then consider the index.
+
+  - mistake: Using OFFSET for pagination in an infinite-scroll interface
+    why: >-
+      Cost grows with depth, and concurrent inserts cause rows to be skipped
+      or repeated between requests. Neither shows up in testing.
+    fix: >-
+      Keyset pagination with a row-value comparison on the sort keys, which
+      the interface already has from the last row it rendered.
+
+  - mistake: Aggregating across two one-to-many joins in one query
+    why: >-
+      Each join multiplies the other's rows, so both totals are inflated by a
+      plausible factor and look like real numbers.
+    fix: >-
+      One fan-out per query. Aggregate each grain in its own CTE or scalar
+      subquery and combine the results.
+
+performance: |
+  `pg_stat_statements` is the single most valuable extension for this work. It
+  normalises statements by replacing literals with placeholders, then records
+  calls, total and mean execution time, rows returned and buffer counts. The
+  usual starting query orders by `total_exec_time DESC LIMIT 20`, and the
+  answer is frequently a statement nobody suspected.
+
+  `auto_explain` logs the plan of any statement exceeding a duration
+  threshold, which catches the production-only slow case that cannot be
+  reproduced locally. `auto_explain.log_analyze` makes it far more useful and
+  noticeably more expensive, so it is usually enabled temporarily.
+
+  `pg_stat_user_tables` shows sequential scans versus index scans per table,
+  and `n_dead_tup` for bloat. A high `seq_scan` count on a large table is a
+  candidate for an index; a high dead-tuple count is a candidate for
+  autovacuum tuning.
+
+  `pg_stat_user_indexes` shows `idx_scan` per index. A long-lived index with
+  zero scans is costing write throughput for nothing, and dropping unused
+  indexes is one of the few optimisations that improves writes **and** frees
+  space with no downside.
+
+interviewQuestions:
+  - question: How do you approach a slow query?
+    answer: >-
+      Measure first — pg_stat_statements sorted by total execution time, since
+      the costly statement is usually a fast one run constantly rather than a
+      slow one run occasionally. Then reproduce with EXPLAIN (ANALYZE,
+      BUFFERS) using realistic parameters. Look for the largest divergence
+      between estimated and actual rows, lowest in the plan, and fix that
+      first, because every decision above a bad estimate is arbitrary. Only
+      then consider the access method and indexes. Change one thing at a time
+      and compare buffer counts rather than timings, since timings depend on
+      cache state.
+
+  - question: Why does OFFSET pagination get slow, and what do you use instead?
+    answer: >-
+      The database must produce every row up to the offset in sorted order and
+      discard it, so cost grows linearly with the page number. It is also
+      unstable under concurrent writes, because inserts before the offset shift
+      every subsequent row, allowing a row to be skipped or repeated between
+      requests. Keyset pagination replaces the offset with a predicate on the
+      sort keys — `WHERE (a, b) > (?, ?) ORDER BY a, b LIMIT n` — which an
+      index can seek to directly, giving constant cost per page and stability.
+      The cost is losing random page access.
+
+  - question: What is the N+1 query problem and how do you detect it?
+    answer: >-
+      One query returns N rows and the application then issues one query per
+      row, turning two round trips into N+1. Each individual query is fast, so
+      it survives review and small-data testing; the cost is network latency
+      multiplied by N. From the database side it appears as a single
+      normalised statement with an enormous call count, which is why
+      pg_stat_statements sorted by total time finds it and sorted by mean time
+      does not. The fix is to collect the keys and issue one query — a join, an
+      IN list, or in JPA a fetch join or @BatchSize.
+
+  - question: A report's totals are too large by a factor of about three. What do you check?
+    answer: >-
+      Fan-out from joining more than one one-to-many relationship in a single
+      query. Joining orders to both line items and payments multiplies each
+      order's lines by its payments, so every aggregate is inflated by the
+      other side's row count — and a factor near three suggests roughly three
+      rows on the duplicating side. The diagnosis is to count the rows the join
+      produces and compare with the count of the driving entity. The fix is one
+      fan-out per query: aggregate each grain in its own CTE and join the
+      aggregates.
+
+exercises:
+  - prompt: >-
+      Rewrite a deep-OFFSET page as keyset pagination. Return the 5 orders
+      immediately after order 1050 placed on 2023-07-18, sorted by order_date
+      then order_id. Columns order_id, order_date, status.
+    difficulty: Medium
+    hint: One row-value comparison and a matching ORDER BY.
+    solutionSql: |
+      select order_id, order_date, status
+      from orders
+      where (order_date, order_id) > (date '2023-07-18', 1050)
+      order by order_date, order_id
+      limit 5
+
+  - prompt: >-
+      Collapse an N+1 into one query: for every customer in Germany, return
+      their order count and total completed revenue, including those with no
+      orders. Columns company_name, orders, revenue.
+    difficulty: Medium
+    hint: >-
+      Aggregate order_items per order in a CTE first, then join, so the two
+      one-to-many relationships do not multiply.
+    solutionSql: |
+      with order_revenue as (
+          select o.order_id,
+                 o.customer_id,
+                 o.status,
+                 sum(oi.quantity * oi.unit_price * (1 - oi.discount)) as revenue
+          from orders o
+          join order_items oi on oi.order_id = o.order_id
+          group by o.order_id, o.customer_id, o.status
+      )
+      select c.company_name,
+             count(r.order_id)                                              as orders,
+             coalesce(round(sum(r.revenue) filter (where r.status = 'completed'), 2), 0) as revenue
+      from customers c
+      left join order_revenue r on r.customer_id = c.customer_id
+      where c.country = 'Germany'
+      group by c.company_name
+      order by revenue desc, c.company_name
+
+  - prompt: >-
+      Show the fan-out factor for each order with both line items and
+      payments: the number of rows a naive double join would produce versus
+      the one row it should. Columns order_id, lines, payments,
+      naive_row_count. Order by naive_row_count descending, limit 10.
+    difficulty: Hard
+    hint: >-
+      Count each side in its own subquery and multiply. The product is the
+      number of rows the double join would produce.
+    solutionSql: |
+      select o.order_id,
+             l.lines,
+             p.payments,
+             l.lines * p.payments as naive_row_count
+      from orders o
+      join lateral (select count(*) as lines from order_items oi
+                    where oi.order_id = o.order_id) l on true
+      join lateral (select count(*) as payments from payments pm
+                    where pm.order_id = o.order_id) p on true
+      where l.lines > 0 and p.payments > 0
+      order by naive_row_count desc, o.order_id
+      limit 10
+
+checklist:
+  - "Measure before optimising — pg_stat_statements sorted by total time, not mean"
+  - Fix the worst estimated-versus-actual row ratio before touching indexes
+  - "Intervene at the query, then the index, then config, then schema, then architecture"
+  - "OFFSET pagination grows with depth and is unstable under concurrent writes"
+  - "Keyset pagination costs the same on every page and needs a cursor, not a page number"
+  - "N+1 shows up as one statement with an enormous call count"
+  - One fan-out per query — aggregate each grain separately
+  - "count(*) for a page total scans everything; an estimate is usually enough"
+
+related:
+  - p-explain
+  - p-indexes
+  - f-sorting-paging
+  - pg-backend-integration
+
+dialect:
+  standard: >-
+    Query tuning is implementation work with no standard component. Keyset
+    pagination uses standard row-value comparisons; the FETCH FIRST syntax is
+    standard where LIMIT is not.
+  postgres: >-
+    pg_stat_statements, auto_explain, pg_stat_user_tables and
+    pg_stat_user_indexes are the standard diagnostic set. Row-value comparisons
+    work with indexes, which makes keyset pagination a single clean predicate.
+  mysql: >-
+    The performance_schema and the slow query log serve the role of
+    pg_stat_statements. MySQL also supports row-value comparisons for keyset
+    pagination, though older optimiser versions did not use an index for them,
+    which forced the longer nested-OR form. The N+1 problem is identical, being
+    an application pattern rather than a database one.

@@ -1,0 +1,445 @@
+id: j-self-cross
+moduleId: joins
+position: 20
+title: Self joins, cross joins and LATERAL
+slug: self-and-cross-joins
+difficulty: Intermediate
+estimatedMinutes: 25
+summary: >-
+  Joining a table to itself to compare two rows, deliberate Cartesian products
+  for building grids, and LATERAL — the join that can see the row it is being
+  joined to, which is how top-N-per-group is written without a window function.
+tags: [self-join, cross-join, lateral, hierarchy, cartesian-product]
+
+prerequisites:
+  - j-inner-outer
+
+objectives:
+  - Write a self join and explain why table aliases are mandatory
+  - Compare a row to its parent, its predecessor or its peers
+  - Use CROSS JOIN deliberately, and recognise an accidental one
+  - Explain what LATERAL adds that an ordinary subquery cannot do
+  - Use generate_series to build a complete calendar and fill gaps
+
+concept: |
+  ## Self joins
+
+  A self join is a table joined to itself under two aliases. The aliases are
+  not a convenience — without them, every column reference is ambiguous and the
+  query will not parse.
+
+  Self joins answer any question that compares one row to another row of the
+  same table:
+
+  - **Hierarchy**: an employee and their manager.
+  - **Comparison**: employees earning more than their manager.
+  - **Pairing**: two employees in the same department.
+  - **Sequence**: a day's sales and the previous day's.
+
+  The last two are worth a caveat. Pairing with `a.id < b.id` rather than
+  `a.id <> b.id` is how you get each pair once instead of twice. And
+  sequence comparisons — "the previous row" — are almost always better written
+  with `LAG()` from the window-functions module; a self join on
+  `date = date - 1` breaks the moment a day is missing.
+
+  ## Cross joins
+
+  `CROSS JOIN` pairs every row with every row: n × m. It has no `ON` clause,
+  because there is no condition.
+
+  Deliberate uses are real: building a grid of every (month, region) so that
+  missing combinations can be shown as zero; generating a date series;
+  producing test data. Accidental ones come from listing tables in `FROM` and
+  forgetting the join condition, which produces a result that is both enormous
+  and wrong.
+
+  The tell for an accidental cross join is a row count equal to a product of
+  table sizes, and an aggregate that is a suspiciously round multiple of the
+  expected value.
+
+  ## LATERAL
+
+  An ordinary subquery in `FROM` is evaluated independently of the rest of the
+  `FROM` clause — it cannot refer to columns of tables beside it. `LATERAL`
+  removes that restriction:
+
+  ```sql
+  from departments d
+  cross join lateral (
+        select e.first_name, e.salary
+        from employees e
+        where e.dept_id = d.dept_id      -- d is visible: this needs LATERAL
+        order by e.salary desc
+        limit 3) top3
+  ```
+
+  Conceptually it is a `for each row on the left, run this query` loop. That
+  makes it the natural way to express **top N per group**, and the reason it is
+  worth knowing alongside window functions is that it can carry a `LIMIT`,
+  which a window function cannot: `LATERAL` stops after 3 rows per department,
+  while `ROW_NUMBER() <= 3` computes a rank for every row and then filters.
+
+  `CROSS JOIN LATERAL` drops left rows whose subquery returns nothing;
+  `LEFT JOIN LATERAL ... ON true` keeps them. The `ON true` looks odd and is
+  required by the grammar.
+
+  A set-returning function in `FROM` — `generate_series`, `unnest`,
+  `jsonb_array_elements` — is implicitly lateral, which is why
+  `from orders o, generate_series(1, o.quantity)` works without the keyword.
+
+  ## generate_series
+
+  `generate_series(start, stop, step)` produces a row per value. Cross-joined
+  against a dimension it builds the complete grid that `GROUP BY` cannot
+  invent:
+
+  ```sql
+  from generate_series(date '2024-01-01', date '2024-03-01', interval '1 month') m
+  cross join (select distinct region from daily_sales) r
+  left join ...
+  ```
+
+  This is the standard answer to "my chart is missing the months with no
+  sales".
+
+syntax:
+  - form: "FROM t a JOIN t b ON condition"
+    notes: >-
+      A self join. Both aliases are required; column references must be
+      qualified.
+  - form: "FROM a CROSS JOIN b"
+    notes: "n × m rows, no ON clause. The comma form `FROM a, b` means the same."
+  - form: "FROM a CROSS JOIN LATERAL (subquery) alias"
+    notes: >-
+      The subquery may reference columns of `a`. Rows of `a` with an empty
+      subquery result are dropped.
+  - form: "FROM a LEFT JOIN LATERAL (subquery) alias ON true"
+    notes: >-
+      The same, but keeps rows of `a` whose subquery returned nothing. `ON true`
+      is required by the grammar.
+  - form: "generate_series(start, stop [, step])"
+    notes: >-
+      Works for integers, dates and timestamps. The date form needs an interval
+      step.
+
+sampleTables: [employees, departments, daily_sales, categories, orders]
+
+examples:
+  - title: A self join for hierarchy and comparison
+    sql: |
+      select e.emp_id,
+             e.first_name || ' ' || e.last_name  as employee,
+             e.salary                            as employee_salary,
+             m.first_name || ' ' || m.last_name  as manager,
+             m.salary                            as manager_salary,
+             e.salary - m.salary                 as difference
+      from employees e
+      join employees m on m.emp_id = e.manager_id
+      where e.salary > m.salary
+      order by difference desc
+    walkthrough: |
+      The same table twice: `e` is the employee and `m` is the manager, joined
+      on `m.emp_id = e.manager_id`. Without the aliases, `salary` would be
+      ambiguous and `emp_id = manager_id` would be a statement about one row.
+
+      The `WHERE` makes it the interview question: who out-earns their manager?
+      Daniel Fernandes at 251000 reports to Neha Kulkarni at 238000, and there
+      are a few others.
+
+      Note that an inner join is correct here. The CEO has no manager, and
+      "employees who out-earn their manager" cannot include someone with no
+      manager — the comparison is undefined, not false.
+
+  - title: Pairing rows of the same table, once each
+    sql: |
+      select a.dept_id,
+             a.first_name || ' ' || a.last_name as employee_a,
+             b.first_name || ' ' || b.last_name as employee_b,
+             a.salary,
+             b.salary as salary_b
+      from employees a
+      join employees b
+        on b.dept_id = a.dept_id
+       and b.emp_id  > a.emp_id
+       and b.salary  = a.salary
+      order by a.dept_id, a.emp_id
+    walkthrough: |
+      Pairs of colleagues in the same department on exactly the same salary.
+
+      `b.emp_id > a.emp_id` does two jobs in one condition. It stops a row
+      pairing with itself, and it returns each pair once rather than twice —
+      with `<>` you would get both (14, 15) and (15, 14). Using a strict
+      inequality on a unique column is the standard idiom for "distinct
+      unordered pairs".
+
+  - title: CROSS JOIN and generate_series to fill a calendar
+    sql: |
+      select to_char(m.month_start, 'YYYY-MM')          as month,
+             r.region,
+             coalesce(round(sum(s.revenue), 2), 0)      as revenue,
+             count(s.sale_date)                         as days_with_data
+      from generate_series(date '2024-01-01', date '2024-05-01', interval '1 month') as m(month_start)
+      cross join (select distinct region from daily_sales) r
+      left join daily_sales s
+             on s.region = r.region
+            and s.sale_date >= m.month_start
+            and s.sale_date <  m.month_start + interval '1 month'
+      group by m.month_start, r.region
+      order by m.month_start, r.region
+    walkthrough: |
+      `generate_series` produces five month starts; the cross join pairs each
+      with each of the two regions, giving a complete 10-row grid. The LEFT JOIN
+      then attaches whatever data exists.
+
+      April and May have no rows in `daily_sales`, which only runs to 29 March.
+      A plain `GROUP BY date_trunc('month', sale_date)` would omit them
+      entirely; here they appear with revenue 0 and `days_with_data = 0`, which
+      is the difference between a chart with a gap and a chart that lies by
+      omission.
+
+      `count(s.sale_date)` rather than `count(*)` for the usual outer-join
+      reason.
+
+  - title: Top N per group with LATERAL
+    sql: |
+      select d.dept_name,
+             top.first_name || ' ' || top.last_name as employee,
+             top.salary,
+             top.rn
+      from departments d
+      cross join lateral (
+            select e.first_name,
+                   e.last_name,
+                   e.salary,
+                   row_number() over (order by e.salary desc, e.emp_id) as rn
+            from employees e
+            where e.dept_id = d.dept_id
+            order by e.salary desc, e.emp_id
+            limit 2) top
+      order by d.dept_name, top.rn
+    walkthrough: |
+      For each department, run the inner query with `d.dept_id` bound to that
+      department's value. That reference to `d` from inside the subquery is
+      exactly what `LATERAL` permits and an ordinary `FROM` subquery forbids.
+
+      `LIMIT 2` applies **per department**, which is the thing a window function
+      cannot do — `ROW_NUMBER() ... <= 2` computes a number for all 38 employees
+      and then throws most away. With an index on `(dept_id, salary desc)`, the
+      LATERAL form reads two index entries per department and stops.
+
+      Research has no employees, and `CROSS JOIN LATERAL` therefore drops it. To
+      keep it with NULLs, use `LEFT JOIN LATERAL (...) top ON true`.
+
+edgeCases:
+  - title: An accidental cross join
+    body: >-
+      Two tables in FROM with no join condition produce every combination —
+      here 6 departments times 40 employees. The query is syntactically fine and
+      the number is enormous. In a report that aggregates, the symptom is a
+      total that is an exact multiple of the right answer, which is a useful
+      diagnostic: if your revenue figure is precisely six times too large, look
+      for a missing join condition.
+    sql: |
+      select count(*) as cartesian_rows,
+             (select count(*) from departments) * (select count(*) from employees) as expected
+      from departments d, employees e
+
+  - title: LEFT JOIN LATERAL keeps rows with no matches
+    body: >-
+      `CROSS JOIN LATERAL` behaves like an inner join and drops left rows whose
+      subquery returned nothing. `LEFT JOIN LATERAL ... ON true` keeps them with
+      NULLs. The `ON true` is not optional and not meaningful — the grammar
+      requires an ON clause for a LEFT JOIN, and a lateral subquery has already
+      expressed the correlation inside itself.
+    sql: |
+      select d.dept_name, top.employee, top.salary
+      from departments d
+      left join lateral (
+            select e.first_name || ' ' || e.last_name as employee, e.salary
+            from employees e
+            where e.dept_id = d.dept_id
+            order by e.salary desc, e.emp_id
+            limit 1) top on true
+      order by d.dept_name
+
+pitfalls:
+  - mistake: Forgetting the join condition between two tables in FROM
+    why: >-
+      The comma syntax `FROM a, b` is a cross join, and it looks like the start
+      of a join someone forgot to finish. The result is valid SQL.
+    fix: >-
+      Use explicit JOIN syntax everywhere. A missing ON is then a syntax error
+      rather than a silent Cartesian product.
+
+  - mistake: Pairing rows with `a.id <> b.id`
+    why: >-
+      It excludes the self-pair but returns each pair twice, in both orders. A
+      count of pairs is then double the real number.
+    fix: >-
+      `a.id < b.id`. One comparison, each unordered pair once.
+
+  - mistake: Self-joining on `date = date - 1` to get the previous row
+    why: >-
+      It works until a date is missing, and then the row silently has no
+      previous value and drops out of an inner join — or appears with NULLs in
+      an outer one. Gaps in a time series are the normal case, not the
+      exception.
+    fix: >-
+      `LAG()` with a window function, which takes the previous **row** rather
+      than a guessed previous key. If calendar-adjacency is genuinely required,
+      generate the complete calendar first.
+
+  - mistake: Using LATERAL where a plain subquery would do
+    why: >-
+      LATERAL is evaluated per outer row, so an uncorrelated subquery written
+      as LATERAL is executed repeatedly for no reason.
+    fix: >-
+      Use LATERAL only when the subquery references the outer row. If it does
+      not, an ordinary FROM subquery is evaluated once.
+
+performance: |
+  A self join is an ordinary join and uses the ordinary algorithms. The index
+  that matters is on the **join key**: for the manager hierarchy that is
+  `employees(manager_id)`, which this dataset has, because a nested loop over an
+  unindexed self join is quadratic.
+
+  `LATERAL` is executed once per outer row — that is its definition — so it is
+  fast when the outer side is small and the inner query is indexed, and slow
+  when the outer side is large. The top-N case is its sweet spot: with an index
+  on `(group_key, sort_key DESC)` each iteration is an index seek plus `n`
+  entries, so the total work is proportional to groups × n rather than to the
+  table size. The window-function alternative scans everything once. Which wins
+  depends on how many groups there are and how selective `n` is, and the honest
+  answer is to measure both.
+
+  An accidental cross join between large tables is one of the few ways to turn
+  a fast query into one that never finishes. The planner will not warn you,
+  because the query means exactly what it says.
+
+interviewQuestions:
+  - question: What is a self join and when do you need one?
+    answer: >-
+      A table joined to itself under two aliases, so that one row can be
+      compared with another row of the same table. It is needed for
+      self-referencing hierarchies — employee to manager, category to parent
+      category — and for row-to-row comparisons such as finding pairs on the
+      same salary. The aliases are mandatory, because every column reference
+      would otherwise be ambiguous. For "previous row" comparisons a window
+      function is usually better, since a self join on a computed adjacent key
+      breaks whenever the sequence has gaps.
+
+  - question: When would you deliberately write a CROSS JOIN?
+    answer: >-
+      To generate a complete grid of combinations that the data does not
+      contain — every month crossed with every region, so a report can show
+      zero for the empty cells, since GROUP BY can only produce groups from rows
+      that exist. Also for generating series and test data. The accidental
+      version, from listing tables in FROM without a condition, is one of the
+      classic causes of a runaway query, which is a good reason to use explicit
+      JOIN syntax so that a missing ON is a syntax error.
+
+  - question: What does LATERAL do that a normal subquery cannot?
+    answer: >-
+      It lets a subquery in the FROM clause reference columns from tables
+      appearing earlier in the same FROM clause, so it is evaluated once per
+      outer row. That makes it the natural expression of "for each X, get the
+      top N Ys", because the inner query can carry its own ORDER BY and LIMIT —
+      something a window function cannot do, since a window function must
+      compute over every row before filtering. Set-returning functions in FROM
+      are implicitly lateral.
+
+  - question: How do you show months with no data in a report?
+    answer: >-
+      Generate the complete set of periods and LEFT JOIN the data to it.
+      `generate_series(start, stop, interval '1 month')` produces the calendar;
+      cross-joining it with the distinct dimension values produces the full
+      grid; the data is then attached with a LEFT JOIN and the empty cells
+      become zero via COALESCE. GROUP BY alone cannot do this, because it builds
+      groups from rows and there are no rows for the empty periods.
+
+exercises:
+  - prompt: >-
+      List every employee together with their manager's name, including the
+      employees who have no manager. Columns employee, manager (NULL where
+      there is none), ordered by emp_id.
+    difficulty: Easy
+    hint: >-
+      A LEFT self join — the CEO has a NULL manager_id and must still appear.
+    solutionSql: |
+      select e.first_name || ' ' || e.last_name as employee,
+             m.first_name || ' ' || m.last_name as manager
+      from employees e
+      left join employees m on m.emp_id = e.manager_id
+      order by e.emp_id
+
+  - prompt: >-
+      For each category, show its name and its parent's name, plus how many
+      products are directly in it, including categories with no products.
+      Columns category_name, parent_name, products. Order by category_id.
+    difficulty: Medium
+    hint: >-
+      A LEFT self join on categories for the parent, and another LEFT JOIN to
+      products. Count a product column.
+    solutionSql: |
+      select c.category_name,
+             p.category_name     as parent_name,
+             count(pr.product_id) as products
+      from categories c
+      left join categories p  on p.category_id = c.parent_category_id
+      left join products pr   on pr.category_id = c.category_id
+      group by c.category_id, c.category_name, p.category_name
+      order by c.category_id
+
+  - prompt: >-
+      Using LATERAL, return the single most recent order for each of customers
+      301, 305 and 310. Columns customer_id, company_name, order_id,
+      order_date. Keep customers with no orders.
+    difficulty: Hard
+    hint: >-
+      LEFT JOIN LATERAL with ORDER BY order_date DESC, order_id DESC and LIMIT
+      1, closed with ON true.
+    solutionSql: |
+      select c.customer_id,
+             c.company_name,
+             last_order.order_id,
+             last_order.order_date
+      from customers c
+      left join lateral (
+            select o.order_id, o.order_date
+            from orders o
+            where o.customer_id = c.customer_id
+            order by o.order_date desc, o.order_id desc
+            limit 1) last_order on true
+      where c.customer_id in (301, 305, 310)
+      order by c.customer_id
+
+checklist:
+  - A self join needs two aliases; without them every column reference is ambiguous
+  - "`a.id < b.id` gives each unordered pair once; `<>` gives each twice"
+  - CROSS JOIN produces n × m rows and has no ON clause
+  - Use explicit JOIN syntax so a forgotten condition is a syntax error
+  - LATERAL lets a FROM subquery see the row it is joined to, and runs once per row
+  - "LATERAL can carry a per-group LIMIT; a window function cannot"
+  - "CROSS JOIN LATERAL drops empty results; LEFT JOIN LATERAL ... ON true keeps them"
+  - generate_series plus a cross join builds the complete grid GROUP BY cannot invent
+
+related:
+  - j-inner-outer
+  - w-top-n-per-group
+  - i-recursive-cte
+  - p04-employees-earning-more-than-manager
+
+dialect:
+  standard: >-
+    Self joins and CROSS JOIN are standard. LATERAL is standard SQL from
+    SQL:1999 and is spelled the same way in PostgreSQL, Oracle and SQL Server —
+    though SQL Server's older CROSS APPLY and OUTER APPLY are the same idea.
+  postgres: >-
+    Supports LATERAL on subqueries and treats set-returning functions in FROM as
+    implicitly lateral. generate_series works on integers, dates, timestamps and
+    numerics. `ON true` is required to close a LEFT JOIN LATERAL.
+  mysql: >-
+    LATERAL arrived in MySQL 8.0.14 and is spelled the same. MySQL has no
+    generate_series; the equivalents are a recursive CTE or a numbers table,
+    which is why older MySQL codebases often contain a permanent `numbers`
+    table with no obvious purpose.
